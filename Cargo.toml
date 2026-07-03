@@ -5,3 +5,9 @@ authors = ["Andrey Dyldin <and@cesbo.com>"]
 edition = "2021"
 
 [dependencies]
+tracing = "0.1"
+tokio = { version = "1.48", features = ["rt", "net", "time", "sync", "macros"] }
+socket2 = "0.6"
+
+[dev-dependencies]
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "io-util", "process"] }

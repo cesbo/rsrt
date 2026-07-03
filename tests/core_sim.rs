@@ -1,0 +1,783 @@
+//! Pure in-memory simulation of two `Connection`s (caller + listener-
+//! accepted) joined by a lossy/reordering channel.
+//!
+//! No tokio, no UDP, no sleeping: a fake clock advances in 1 ms steps and
+//! every protocol rule runs off the explicit `now` passed into the sans-I/O
+//! core. Timers are driven strictly through `next_deadline`, so these tests
+//! also verify that the advertised deadlines cover every duty (ACK/NAK
+//! ticks, TSBPD release, keepalive, EXP/peer-idle, handshake retransmits).
+//!
+//! Everything is deterministic: the channel PRNG is seeded per test.
+
+use std::{
+    net::{
+        Ipv4Addr,
+        SocketAddrV4,
+    },
+    time::{
+        Duration,
+        Instant,
+    },
+};
+
+use srt::{
+    core::{
+        ConnState,
+        Connection,
+        Listener,
+        ListenerAction,
+        Timebase,
+    },
+    packet::{
+        ControlPacket,
+        ControlType,
+        HandshakeCif,
+        HandshakeType,
+        Packet,
+        SeqNumber,
+        SocketId,
+    },
+    CloseReason,
+    SrtOptions,
+};
+
+const CALLER_ID: SocketId = SocketId(0x1111_2222);
+const ACCEPT_ID: SocketId = SocketId(0x0BAD_CAFE);
+const CALLER_ISN: SeqNumber = SeqNumber::new(0x0012_3456);
+/// Unused by design: the listener adopts the caller's ISN.
+const LISTENER_ISN: SeqNumber = SeqNumber::new(7);
+const STEP: Duration = Duration::from_millis(1);
+
+fn caller_addr() -> SocketAddrV4 {
+    SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 50_000)
+}
+
+fn listener_addr() -> SocketAddrV4 {
+    SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 9000)
+}
+
+/// xorshift64* — deterministic, seedable, no dependencies.
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Rng {
+        Rng(seed | 1)
+    }
+
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn chance(&mut self, pct: u32) -> bool {
+        self.next() % 100 < u64::from(pct)
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        if n == 0 {
+            0
+        } else {
+            self.next() % n
+        }
+    }
+}
+
+/// One direction of the simulated network path.
+struct Link {
+    rng: Rng,
+    delay: Duration,
+    /// Extra per-packet delay in `0..=jitter_us` µs (creates reordering).
+    jitter_us: u64,
+    /// Percentage of packets dropped at random.
+    loss_pct: u32,
+    /// Hard outage: everything pushed is discarded.
+    down: bool,
+    /// Drop the next N CONCLUSION handshake packets (targeted loss).
+    drop_conclusions: u32,
+    /// In flight: (arrival, insertion order, packet).
+    queue: Vec<(Instant, u64, Packet)>,
+    counter: u64,
+    // Wire observability for assertions (counted only when not lost).
+    dropreqs: u64,
+    naks: u64,
+}
+
+impl Link {
+    fn new(seed: u64, delay: Duration) -> Link {
+        Link {
+            rng: Rng::new(seed),
+            delay,
+            jitter_us: 0,
+            loss_pct: 0,
+            down: false,
+            drop_conclusions: 0,
+            queue: Vec::new(),
+            counter: 0,
+            dropreqs: 0,
+            naks: 0,
+        }
+    }
+
+    fn push(&mut self, now: Instant, pkt: Packet) {
+        if self.down {
+            return;
+        }
+        if self.drop_conclusions > 0 && is_conclusion(&pkt) {
+            self.drop_conclusions -= 1;
+            return;
+        }
+        if self.loss_pct > 0 && self.rng.chance(self.loss_pct) {
+            return;
+        }
+        if let Packet::Control(c) = &pkt {
+            match c.control_type {
+                ControlType::DropRequest { .. } => self.dropreqs += 1,
+                ControlType::Nak(_) => self.naks += 1,
+                _ => {}
+            }
+        }
+        let jitter = Duration::from_micros(self.rng.below(self.jitter_us + 1));
+        self.counter += 1;
+        self.queue
+            .push((now + self.delay + jitter, self.counter, pkt));
+    }
+
+    /// Removes and returns every arrived packet, in arrival order.
+    fn pop_due(&mut self, now: Instant) -> Vec<Packet> {
+        let mut due: Vec<(Instant, u64, Packet)> = Vec::new();
+        let mut i = 0;
+        while i < self.queue.len() {
+            if self.queue[i].0 <= now {
+                due.push(self.queue.swap_remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        due.sort_by_key(|(at, ord, _)| (*at, *ord));
+        due.into_iter().map(|(_, _, p)| p).collect()
+    }
+}
+
+fn is_conclusion(pkt: &Packet) -> bool {
+    matches!(
+        pkt,
+        Packet::Control(ControlPacket {
+            control_type: ControlType::Handshake(HandshakeCif {
+                handshake_type: HandshakeType::Conclusion,
+                ..
+            }),
+            ..
+        })
+    )
+}
+
+/// The two endpoints plus the channel between them.
+struct Sim {
+    now: Instant,
+    caller: Connection,
+    listener: Listener,
+    listener_opts: SrtOptions,
+    /// Timebase for the accepted connection (wrap tests); `None` = fresh.
+    accept_timebase: Option<Timebase>,
+    accepted: Option<Connection>,
+    /// caller → listener.
+    to_listener: Link,
+    /// listener → caller.
+    to_caller: Link,
+    /// Payloads delivered to each application, with delivery instants.
+    caller_rx: Vec<(Instant, Vec<u8>)>,
+    listener_rx: Vec<(Instant, Vec<u8>)>,
+}
+
+impl Sim {
+    fn new(now: Instant, caller_opts: SrtOptions, listener_opts: SrtOptions, seed: u64) -> Sim {
+        let caller = Connection::connect(now, listener_addr(), CALLER_ID, CALLER_ISN, caller_opts);
+        Sim::assemble(now, caller, listener_opts, seed, None)
+    }
+
+    /// Both connections share `timebase` (placed near the timestamp wrap).
+    fn new_with_timebase(
+        now: Instant,
+        caller_opts: SrtOptions,
+        listener_opts: SrtOptions,
+        seed: u64,
+        timebase: Timebase,
+    ) -> Sim {
+        let caller = Connection::connect_with_timebase(
+            now,
+            listener_addr(),
+            CALLER_ID,
+            CALLER_ISN,
+            caller_opts,
+            timebase,
+        );
+        Sim::assemble(now, caller, listener_opts, seed, Some(timebase))
+    }
+
+    fn assemble(
+        now: Instant,
+        caller: Connection,
+        listener_opts: SrtOptions,
+        seed: u64,
+        accept_timebase: Option<Timebase>,
+    ) -> Sim {
+        let listener_tb = accept_timebase.unwrap_or_else(|| Timebase::new(now));
+        Sim {
+            now,
+            caller,
+            listener: Listener::new(seed ^ 0x5EC2E7, listener_tb, listener_opts.clone()),
+            listener_opts,
+            accept_timebase,
+            accepted: None,
+            to_listener: Link::new(seed.wrapping_mul(3), Duration::from_millis(5)),
+            to_caller: Link::new(seed.wrapping_mul(5), Duration::from_millis(5)),
+            caller_rx: Vec::new(),
+            listener_rx: Vec::new(),
+        }
+    }
+
+    fn accepted_mut(&mut self) -> &mut Connection {
+        self.accepted
+            .as_mut()
+            .expect("listener has accepted a connection")
+    }
+
+    /// Submits one payload on the accepted (listener) side at `self.now`.
+    fn send_listener(&mut self, data: Vec<u8>) {
+        let now = self.now;
+        self.accepted_mut().send(now, data).unwrap();
+    }
+
+    /// Advances the fake clock by one step and runs the event loop once.
+    fn step(&mut self) {
+        self.now += STEP;
+        let now = self.now;
+
+        // 1. Deliver arrived packets.
+        for pkt in self.to_listener.pop_due(now) {
+            match &mut self.accepted {
+                Some(conn) => conn.handle_packet(now, pkt),
+                None => self.listener_handshake(pkt),
+            }
+        }
+        for pkt in self.to_caller.pop_due(now) {
+            self.caller.handle_packet(now, pkt);
+        }
+
+        // 2. Timers, strictly when the connection says one is due.
+        if timer_due(&self.caller, now) {
+            self.caller.handle_timer(now);
+        }
+        if let Some(conn) = &mut self.accepted {
+            if timer_due(conn, now) {
+                conn.handle_timer(now);
+            }
+        }
+
+        // 3. Drain outputs.
+        while let Some(p) = self.caller.poll_transmit(now) {
+            self.to_listener.push(now, p);
+        }
+        while let Some(d) = self.caller.poll_deliver(now) {
+            self.caller_rx.push((now, d));
+        }
+        if let Some(conn) = &mut self.accepted {
+            while let Some(p) = conn.poll_transmit(now) {
+                self.to_caller.push(now, p);
+            }
+            while let Some(d) = conn.poll_deliver(now) {
+                self.listener_rx.push((now, d));
+            }
+        }
+    }
+
+    /// Pre-accept path: handshake packets go to the stateless listener.
+    fn listener_handshake(&mut self, pkt: Packet) {
+        let Packet::Control(ControlPacket {
+            control_type: ControlType::Handshake(cif),
+            ..
+        }) = pkt
+        else {
+            return; // nothing but handshakes reaches an unaccepted listener
+        };
+        match self
+            .listener
+            .handle_handshake(self.now, caller_addr(), &cif, ACCEPT_ID, LISTENER_ISN)
+        {
+            ListenerAction::Reply(p) => self.to_caller.push(self.now, p),
+            ListenerAction::Accept { reply, negotiated } => {
+                // The accepted connection queues (and can replay) the reply.
+                let conn = match self.accept_timebase {
+                    Some(tb) => Connection::accepted_with_timebase(
+                        self.now,
+                        *negotiated,
+                        reply,
+                        self.listener_opts.clone(),
+                        tb,
+                    ),
+                    None => Connection::accepted(
+                        self.now,
+                        *negotiated,
+                        reply,
+                        self.listener_opts.clone(),
+                    ),
+                };
+                self.accepted = Some(conn);
+            }
+            ListenerAction::Drop => {}
+        }
+    }
+
+    fn run_for(&mut self, ms: u64) {
+        for _ in 0 .. ms {
+            self.step();
+        }
+    }
+
+    /// Steps until `cond` holds; panics after `cap_ms` steps.
+    fn run_until(&mut self, cap_ms: u64, what: &str, cond: impl Fn(&Sim) -> bool) {
+        for _ in 0 .. cap_ms {
+            if cond(self) {
+                return;
+            }
+            self.step();
+        }
+        assert!(
+            cond(self),
+            "condition not reached within {cap_ms} ms: {what}"
+        );
+    }
+
+    fn both_established(&self) -> bool {
+        self.caller.state() == ConnState::Established
+            && self
+                .accepted
+                .as_ref()
+                .is_some_and(|c| c.state() == ConnState::Established)
+    }
+}
+
+fn timer_due(conn: &Connection, now: Instant) -> bool {
+    conn.next_deadline(now).is_some_and(|d| d <= now)
+}
+
+/// Tagged, numbered payload; the index is recovered by `payload_index`.
+fn payload(tag: u8, index: u32) -> Vec<u8> {
+    let mut v = Vec::with_capacity(64);
+    v.push(tag);
+    v.extend_from_slice(&index.to_le_bytes());
+    v.resize(64, tag ^ 0x5A);
+    v
+}
+
+fn payload_index(data: &[u8], tag: u8) -> u32 {
+    assert_eq!(data[0], tag, "payload from the wrong direction");
+    u32::from_le_bytes([data[1], data[2], data[3], data[4]])
+}
+
+/// Asserts `rx` is exactly payloads `0..count` of `tag`, in order.
+fn assert_contiguous(rx: &[(Instant, Vec<u8>)], tag: u8, count: u32) {
+    assert!(
+        rx.len() >= count as usize,
+        "only {} of {count} payloads delivered (tag {tag:#x})",
+        rx.len()
+    );
+    for (i, (_, data)) in rx.iter().take(count as usize).enumerate() {
+        assert_eq!(
+            payload_index(data, tag),
+            i as u32,
+            "payload {i} out of order (tag {tag:#x})"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+
+/// Clean network: handshake, bidirectional data delivered in TSBPD order at
+/// the negotiated latency, then a clean shutdown.
+#[test]
+fn clean_handshake_data_and_shutdown() {
+    let t0 = Instant::now();
+    let mut sim = Sim::new(t0, SrtOptions::default(), SrtOptions::default(), 1);
+
+    sim.run_until(100, "handshake", Sim::both_established);
+    let setup = sim.now.duration_since(t0);
+    assert!(
+        setup < Duration::from_millis(50),
+        "handshake too slow: {setup:?}"
+    );
+    assert_eq!(sim.caller.remote(), listener_addr());
+    assert_eq!(sim.accepted_mut().remote(), caller_addr());
+
+    // 200 payloads in each direction, one every 2 ms.
+    let mut caller_sent = Vec::new();
+    let mut listener_sent = Vec::new();
+    for i in 0 .. 200u32 {
+        sim.caller.send(sim.now, payload(0xA, i)).unwrap();
+        caller_sent.push(sim.now);
+        sim.send_listener(payload(0xB, i));
+        listener_sent.push(sim.now);
+        sim.run_for(2);
+    }
+    sim.run_for(300); // 120 ms latency + margin
+
+    assert_eq!(sim.listener_rx.len(), 200);
+    assert_eq!(sim.caller_rx.len(), 200);
+    assert_contiguous(&sim.listener_rx, 0xA, 200);
+    assert_contiguous(&sim.caller_rx, 0xB, 200);
+
+    // TSBPD delivery time: anchor(first packet arrival = send + 5 ms one-way
+    // delay) + timestamp delta + 120 ms latency, polled on a 1 ms grid.
+    for (i, (at, _)) in sim.listener_rx.iter().enumerate() {
+        let lat = at.duration_since(caller_sent[i]);
+        assert!(
+            lat >= Duration::from_millis(120) && lat <= Duration::from_millis(135),
+            "payload {i} delivered at latency {lat:?}"
+        );
+    }
+    for (i, (at, _)) in sim.caller_rx.iter().enumerate() {
+        let lat = at.duration_since(listener_sent[i]);
+        assert!(
+            lat >= Duration::from_millis(120) && lat <= Duration::from_millis(135),
+            "payload {i} delivered at latency {lat:?}"
+        );
+    }
+
+    // Nothing was lost, dropped or retransmitted on a clean link.
+    for stats in [sim.caller.stats(), sim.accepted_mut().stats()] {
+        assert_eq!(stats.pkts_sent, 200);
+        assert_eq!(stats.pkts_recv, 200);
+        assert_eq!(stats.pkts_retransmitted, 0);
+        assert_eq!(stats.pkts_recv_lost, 0);
+        assert_eq!(stats.pkts_recv_dropped, 0);
+        assert_eq!(stats.pkts_send_dropped, 0);
+        assert!(
+            stats.rtt_us < 100_000,
+            "RTT must be measured: {}",
+            stats.rtt_us
+        );
+    }
+    assert_eq!(sim.to_listener.naks + sim.to_caller.naks, 0);
+
+    // Clean local close: SHUTDOWN reaches the peer.
+    sim.caller.close(sim.now);
+    sim.run_for(50);
+    assert_eq!(sim.caller.state(), ConnState::Closed(CloseReason::Local));
+    assert_eq!(
+        sim.accepted_mut().state(),
+        ConnState::Closed(CloseReason::Shutdown)
+    );
+}
+
+/// 5% random loss + reordering jitter in both directions: NAK/retransmit
+/// recovery delivers everything with zero receiver-side drops.
+#[test]
+fn five_percent_loss_recovers_everything() {
+    let t0 = Instant::now();
+    // Latency high enough to absorb NAK retry cycles (including the initial
+    // 300 ms periodic-NAK interval before the first RTT-based recompute).
+    let opts = SrtOptions::default().latency(Duration::from_millis(400));
+    let mut sim = Sim::new(t0, opts.clone(), opts, 0xBEEF);
+    sim.to_listener.loss_pct = 5;
+    sim.to_caller.loss_pct = 5;
+    sim.to_listener.jitter_us = 2_000;
+    sim.to_caller.jitter_us = 2_000;
+
+    sim.run_until(2_000, "handshake under loss", Sim::both_established);
+
+    const N: u32 = 400;
+    for i in 0 .. N {
+        sim.caller.send(sim.now, payload(0xA, i)).unwrap();
+        sim.send_listener(payload(0xB, i));
+        sim.run_for(2);
+    }
+    // Trailing traffic so a lost tail packet still gets its gap detected.
+    for i in N .. N + 10 {
+        sim.caller.send(sim.now, payload(0xA, i)).unwrap();
+        sim.send_listener(payload(0xB, i));
+        sim.run_for(20);
+    }
+    sim.run_for(1_500);
+
+    assert_contiguous(&sim.listener_rx, 0xA, N);
+    assert_contiguous(&sim.caller_rx, 0xB, N);
+
+    let cs = sim.caller.stats();
+    let ls = sim.accepted_mut().stats();
+    assert!(cs.pkts_retransmitted > 0, "caller must have retransmitted");
+    assert!(
+        ls.pkts_retransmitted > 0,
+        "listener must have retransmitted"
+    );
+    assert!(cs.pkts_recv_lost > 0, "losses must have been detected");
+    assert!(ls.pkts_recv_lost > 0, "losses must have been detected");
+    assert_eq!(cs.pkts_recv_dropped, 0, "recovery must beat every deadline");
+    assert_eq!(ls.pkts_recv_dropped, 0, "recovery must beat every deadline");
+    assert_eq!(cs.pkts_send_dropped, 0);
+    assert_eq!(ls.pkts_send_dropped, 0);
+    assert!(sim.to_listener.naks > 0 || sim.to_caller.naks > 0);
+    assert!(sim.both_established());
+}
+
+/// A total outage longer than the sender's TLPKTDROP threshold: the sender
+/// drops too-late packets and announces them with DROPREQ, the receiver
+/// skips the unrecoverable hole at its TSBPD deadline, and the stream then
+/// continues as if nothing happened.
+#[test]
+fn burst_loss_beyond_recovery_window() {
+    let t0 = Instant::now();
+    let mut sim = Sim::new(t0, SrtOptions::default(), SrtOptions::default(), 0xD00D);
+    sim.run_until(100, "handshake", Sim::both_established);
+
+    let mut i: u32 = 0;
+    let send_every_5ms = |sim: &mut Sim, ms: u64, i: &mut u32| {
+        for tick in 0 .. ms {
+            if tick.is_multiple_of(5) {
+                sim.caller.send(sim.now, payload(0xA, *i)).unwrap();
+                *i += 1;
+            }
+            sim.step();
+        }
+    };
+
+    // Phase 1: 1 s of clean flow.
+    send_every_5ms(&mut sim, 1_000, &mut i);
+    let delivered_before_outage = sim.listener_rx.len();
+    assert!(delivered_before_outage > 100);
+
+    // Phase 2: hard outage, longer than the 1020 ms TLPKTDROP threshold.
+    sim.to_listener.down = true;
+    sim.to_caller.down = true;
+    send_every_5ms(&mut sim, 1_600, &mut i);
+
+    // Phase 3: link restored; the stream must recover and keep going.
+    sim.to_listener.down = false;
+    sim.to_caller.down = false;
+    let dropreqs_before = sim.to_listener.dropreqs;
+    send_every_5ms(&mut sim, 2_000, &mut i);
+    let last_sent = i - 1;
+    sim.run_for(500);
+
+    assert!(
+        sim.both_established(),
+        "outage below peer-idle must not break"
+    );
+    let cs = sim.caller.stats();
+    let ls = sim.accepted_mut().stats();
+    assert!(cs.pkts_send_dropped > 0, "sender TLPKTDROP must have fired");
+    assert!(
+        ls.pkts_recv_dropped > 0,
+        "receiver must have skipped the hole"
+    );
+    assert!(
+        sim.to_listener.dropreqs > dropreqs_before,
+        "DROPREQs must reach the receiver after the outage"
+    );
+
+    // Delivery is strictly in order (skips allowed) and reaches the packets
+    // sent after the outage, including the very last one.
+    let indices: Vec<u32> = sim
+        .listener_rx
+        .iter()
+        .map(|(_, d)| payload_index(d, 0xA))
+        .collect();
+    assert!(indices.windows(2).all(|w| w[0] < w[1]), "must stay ordered");
+    assert_eq!(
+        *indices.last().unwrap(),
+        last_sent,
+        "stream must keep going"
+    );
+    assert!(
+        indices.len() < i as usize,
+        "the hole must not be resurrected"
+    );
+}
+
+/// The listener's CONCLUSION response is lost: the caller keeps
+/// retransmitting its CONCLUSION and the accepted connection replays the
+/// stored reply. Data sent by the listener meanwhile (racing the caller's
+/// establishment) is buffered and delivered.
+#[test]
+fn lost_conclusion_response_recovered_by_replay() {
+    let t0 = Instant::now();
+    let mut sim = Sim::new(t0, SrtOptions::default(), SrtOptions::default(), 0xACC);
+    sim.to_caller.drop_conclusions = 1; // the accept reply dies on the wire
+
+    // The listener side accepts promptly; the caller keeps waiting.
+    sim.run_until(100, "listener accept", |s| s.accepted.is_some());
+    let accepted_at = sim.now;
+    sim.run_until(1_000, "caller established", |s| {
+        s.caller.state() != ConnState::Connecting
+    });
+
+    // The caller must have needed the 250 ms CONCLUSION retransmission.
+    assert_eq!(sim.caller.state(), ConnState::Established);
+    let elapsed = sim.now.duration_since(accepted_at);
+    assert!(
+        elapsed >= Duration::from_millis(250),
+        "established after {elapsed:?}, i.e. without the retransmit?"
+    );
+    assert!(
+        elapsed < Duration::from_millis(600),
+        "took too long: {elapsed:?}"
+    );
+
+    // Bidirectional data flows after the recovery.
+    for j in 0 .. 50u32 {
+        sim.caller.send(sim.now, payload(0xA, j)).unwrap();
+        sim.send_listener(payload(0xB, j));
+        sim.run_for(2);
+    }
+    sim.run_for(300);
+    assert_contiguous(&sim.listener_rx, 0xA, 50);
+    assert_contiguous(&sim.caller_rx, 0xB, 50);
+    assert_eq!(sim.caller.stats().pkts_recv_dropped, 0);
+}
+
+/// Data racing ahead of a lost CONCLUSION response is buffered by the
+/// connecting caller and delivered once established.
+#[test]
+fn early_data_before_conclusion_response_is_delivered() {
+    let t0 = Instant::now();
+    let mut sim = Sim::new(t0, SrtOptions::default(), SrtOptions::default(), 0xEA51);
+    sim.to_caller.drop_conclusions = 1;
+
+    sim.run_until(100, "listener accept", |s| s.accepted.is_some());
+    // The listener streams while the caller is still connecting.
+    let mut sent: u32 = 0;
+    while sim.caller.state() == ConnState::Connecting {
+        if sent < 40 {
+            sim.send_listener(payload(0xB, sent));
+            sent += 1;
+        }
+        sim.step();
+        assert!(
+            sim.now.duration_since(t0) < Duration::from_secs(2),
+            "caller never established"
+        );
+    }
+    assert_eq!(sim.caller.state(), ConnState::Established);
+    sim.run_for(400); // let TSBPD release everything
+    assert_contiguous(&sim.caller_rx, 0xB, sent);
+    assert_eq!(sim.caller.stats().pkts_recv_dropped, 0);
+}
+
+/// The peer falls silent: the connection breaks with PeerIdle after the 5 s
+/// timeout (plus EXP escalation), and the closing side's best-effort
+/// SHUTDOWN tells the still-reachable peer.
+#[test]
+fn peer_goes_silent_peer_idle_close() {
+    let t0 = Instant::now();
+    let mut sim = Sim::new(t0, SrtOptions::default(), SrtOptions::default(), 0x51E7);
+    sim.run_until(100, "handshake", Sim::both_established);
+
+    // Steady bidirectional traffic, so the listener is actively talking
+    // right up to the moment it goes silent.
+    for j in 0 .. 40u32 {
+        sim.caller.send(sim.now, payload(0xA, j)).unwrap();
+        sim.send_listener(payload(0xB, j));
+        sim.run_for(5);
+    }
+
+    // The listener's packets stop reaching the caller. The caller keeps
+    // transmitting (data + keepalives), so the listener itself stays alive
+    // and the break can only come from receive-side idleness.
+    sim.to_caller.down = true;
+    let silence_start = sim.now;
+    let mut j = 100u32;
+    let mut steps = 0u64;
+    while sim.caller.state() == ConnState::Established {
+        if steps.is_multiple_of(10) {
+            let _ = sim.caller.send(sim.now, payload(0xA, j));
+            j += 1;
+        }
+        sim.step();
+        steps += 1;
+        assert!(steps < 8_000, "no PeerIdle close within 8 s");
+    }
+
+    assert_eq!(sim.caller.state(), ConnState::Closed(CloseReason::PeerIdle));
+    let idle = sim.now.duration_since(silence_start);
+    assert!(idle >= Duration::from_secs(5), "broke too early: {idle:?}");
+    assert!(
+        idle < Duration::from_millis(5_700),
+        "broke too late: {idle:?}"
+    );
+
+    // The best-effort SHUTDOWN still crosses the working direction.
+    sim.run_for(50);
+    assert_eq!(
+        sim.accepted_mut().state(),
+        ConnState::Closed(CloseReason::Shutdown)
+    );
+}
+
+/// Long-run wrap: the shared timebase starts ~71 minutes in the fake past,
+/// so wire timestamps cross the 32-bit µs wrap 30 s into the stream. The
+/// stream must cross the boundary without stalls, drops or reordering.
+#[test]
+fn timestamp_wrap_long_run() {
+    let base = Instant::now();
+    let wrap_period = Duration::from_micros(1u64 << 32); // ~71.6 min
+    let t0 = base + (wrap_period - Duration::from_secs(30));
+    let timebase = Timebase::new(base);
+
+    let mut sim = Sim::new_with_timebase(
+        t0,
+        SrtOptions::default(),
+        SrtOptions::default(),
+        0x14A9,
+        timebase,
+    );
+    sim.run_until(100, "handshake", Sim::both_established);
+
+    // Stream both directions, one payload per 5 ms, for 60 s of fake time —
+    // crossing the wrap at the 30 s mark.
+    let mut caller_sent = Vec::new();
+    let mut listener_sent = Vec::new();
+    let mut sent: u32 = 0;
+    for tick in 0 .. 60_000u64 {
+        if tick.is_multiple_of(5) && tick < 59_000 {
+            sim.caller.send(sim.now, payload(0xA, sent)).unwrap();
+            caller_sent.push(sim.now);
+            sim.send_listener(payload(0xB, sent));
+            listener_sent.push(sim.now);
+            sent += 1;
+        }
+        sim.step();
+    }
+
+    assert!(sim.both_established());
+    assert_eq!(sim.listener_rx.len(), sent as usize);
+    assert_eq!(sim.caller_rx.len(), sent as usize);
+    assert_contiguous(&sim.listener_rx, 0xA, sent);
+    assert_contiguous(&sim.caller_rx, 0xB, sent);
+
+    // No stalls: every payload was released right at its TSBPD deadline
+    // (send + 5 ms one-way + 120 ms latency), including across the wrap.
+    for (i, (at, _)) in sim.listener_rx.iter().enumerate() {
+        let lat = at.duration_since(caller_sent[i]);
+        assert!(
+            lat >= Duration::from_millis(120) && lat <= Duration::from_millis(140),
+            "payload {i}: latency {lat:?} across the wrap"
+        );
+    }
+    for (i, (at, _)) in sim.caller_rx.iter().enumerate() {
+        let lat = at.duration_since(listener_sent[i]);
+        assert!(
+            lat >= Duration::from_millis(120) && lat <= Duration::from_millis(140),
+            "payload {i}: latency {lat:?} across the wrap"
+        );
+    }
+
+    for stats in [sim.caller.stats(), sim.accepted_mut().stats()] {
+        assert_eq!(stats.pkts_recv_dropped, 0);
+        assert_eq!(stats.pkts_send_dropped, 0);
+        assert_eq!(stats.pkts_recv_lost, 0);
+        assert_eq!(stats.pkts_recv, u64::from(sent));
+    }
+}
