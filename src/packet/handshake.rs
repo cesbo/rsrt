@@ -879,6 +879,67 @@ mod tests {
     }
 
     #[test]
+    fn km_content_is_raw_bytes_not_word_swapped() {
+        // encryption.md §5 [wire-verified]: the KM blob is a natural-order
+        // byte string on the wire (libsrt pre-swaps it so the channel's
+        // per-word swap cancels out). It must appear byte-identical and
+        // contiguous in the encoded CIF — never per-word reversed the way
+        // StreamID content is (§15 trap: mixing these up shifts every KM
+        // field by a reversal).
+        let mut km = vec![
+            0x12, 0x20, 0x29, 0x01, // KM header: even key (encryption.md §3)
+            0x00, 0x00, 0x00, 0x00, // KEKI
+            0x02, 0x00, 0x02, 0x00, // AES-CTR, no auth, TSSRT
+            0x00, 0x00, 0x04, 0x04, // SLen/4 = 4, KLen/4 = 4
+        ];
+        km.extend(0xA0 .. 0xB0); // salt
+        km.extend(0x30 .. 0x48); // wrap: 8 B ICV + 16 B key
+        assert_eq!(km.len(), 56);
+        let swapped: Vec<u8> = km
+            .chunks(4)
+            .flat_map(|word| word.iter().rev().copied())
+            .collect();
+        assert_ne!(swapped, km, "test vector must not be reversal-invariant");
+
+        for ext in [
+            HsExtension::KmReq(km.clone()),
+            HsExtension::KmRsp(km.clone()),
+        ] {
+            let cmd = match ext {
+                HsExtension::KmReq(_) => SRT_CMD_KMREQ,
+                _ => SRT_CMD_KMRSP,
+            };
+            let cif = HandshakeCif {
+                extensions: vec![
+                    HsExtension::HsReq(HsExtFields {
+                        srt_version: SRT_VERSION,
+                        flags: HsFlags::live_defaults(),
+                        recv_latency_ms: 120,
+                        send_latency_ms: 0,
+                    }),
+                    ext.clone(),
+                ],
+                ..conclusion_request()
+            };
+            let out = encoded(&cif);
+            // TLV header after the 48-byte CIF + 16-byte HSREQ block.
+            assert_eq!(out.len(), 124, "cmd {cmd}");
+            assert_eq!(&out[64 .. 66], &cmd.to_be_bytes(), "cmd {cmd}");
+            assert_eq!(&out[66 .. 68], &[0x00, 0x0E], "cmd {cmd}"); // 14 words
+            // The blob's exact bytes, contiguous and in natural order.
+            assert_eq!(&out[68 .. 124], &km[..], "cmd {cmd}");
+            // The word-swapped form appears nowhere in the encoding.
+            assert!(
+                !out.windows(swapped.len()).any(|w| w == &swapped[..]),
+                "cmd {cmd}: KM content was per-word swapped"
+            );
+            // Parse hands the same bytes back unchanged.
+            let parsed = HandshakeCif::parse_cif(&out).unwrap();
+            assert_eq!(parsed.extensions[1], ext, "cmd {cmd}");
+        }
+    }
+
+    #[test]
     fn unknown_extension_preserved() {
         let cif = HandshakeCif {
             extensions: vec![

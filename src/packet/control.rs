@@ -6,7 +6,11 @@ use tracing::{
 };
 
 use super::{
-    handshake::HandshakeCif,
+    handshake::{
+        HandshakeCif,
+        SRT_CMD_KMREQ,
+        SRT_CMD_KMRSP,
+    },
     put_u32,
     read_u32,
     types::{
@@ -33,9 +37,12 @@ pub struct ControlPacket {
 /// ACK 0x0002, NAK 0x0003, CONGESTION-WARNING 0x0004, SHUTDOWN 0x0005,
 /// ACKACK 0x0006, DROPREQ 0x0007, PEERERROR 0x0008.
 ///
-/// USER-DEFINED (0x7FFF) and unknown types surface as
-/// `PacketError::UnknownControlType` and are dropped (and logged) by the
-/// connection layer — they never break a live-mode connection.
+/// USER-DEFINED (0x7FFF) with subtype KMREQ/KMRSP parses to
+/// [`ControlType::KmReq`]/[`ControlType::KmRsp`] (in-stream key refresh,
+/// docs/spec/encryption.md §11). Other 0x7FFF subtypes and unknown types
+/// surface as `PacketError::UnknownControlType` and are dropped (and
+/// logged) by the connection layer — they never break a live-mode
+/// connection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ControlType {
     Handshake(HandshakeCif),
@@ -62,6 +69,15 @@ pub enum ControlType {
     PeerError {
         code: u32,
     },
+    /// In-stream KM refresh request (`UMSG_EXT` 0x7FFF, subtype
+    /// `SRT_CMD_KMREQ`). The CIF is the opaque KM blob in natural
+    /// hcrypt_msg.h byte order — libsrt's KM pre-swap cancels the per-word
+    /// control swap, so raw wire bytes are passed through unchanged
+    /// (docs/spec/encryption.md §5).
+    KmReq(Vec<u8>),
+    /// In-stream KM response (subtype `SRT_CMD_KMRSP`): a byte echo of the
+    /// KMREQ, or a single status word (docs/spec/encryption.md §5.1).
+    KmRsp(Vec<u8>),
 }
 
 /// ACK Control Information Field.
@@ -111,6 +127,17 @@ impl ControlType {
             ControlType::AckAck { .. } => 0x0006,
             ControlType::DropRequest { .. } => 0x0007,
             ControlType::PeerError { .. } => 0x0008,
+            ControlType::KmReq(_) | ControlType::KmRsp(_) => 0x7FFF,
+        }
+    }
+
+    /// 16-bit wire subtype: the extended message type for UMSG_EXT (KM),
+    /// 0 for standard types.
+    fn subtype(&self) -> u32 {
+        match self {
+            ControlType::KmReq(_) => SRT_CMD_KMREQ as u32,
+            ControlType::KmRsp(_) => SRT_CMD_KMRSP as u32,
+            _ => 0,
         }
     }
 
@@ -168,8 +195,15 @@ impl ControlPacket {
             }
             0x0008 => ControlType::PeerError { code: info },
             // User-defined/extended (UMSG_EXT): the subtype is the extended
-            // type; none are implemented (HSv5-only, unencrypted).
-            0x7FFF => return Err(PacketError::UnknownControlType(subtype)),
+            // type. KMREQ/KMRSP carry the in-stream key refresh
+            // (docs/spec/encryption.md §11); the KM blob is passed through
+            // as raw wire bytes (§5 double-swap cancellation). Anything
+            // else (HSREQ-over-EXT, packet filter) is dropped upstream.
+            0x7FFF => match subtype {
+                SRT_CMD_KMREQ => ControlType::KmReq(cif.to_vec()),
+                SRT_CMD_KMRSP => ControlType::KmRsp(cif.to_vec()),
+                other => return Err(PacketError::UnknownControlType(other)),
+            },
             other => return Err(PacketError::UnknownControlType(other)),
         };
         trace!(type_code, cif_len = cif.len(), "control packet parsed");
@@ -182,7 +216,10 @@ impl ControlPacket {
 
     /// Appends the encoded packet (header + CIF) to `out`.
     pub fn encode(&self, out: &mut Vec<u8>) {
-        put_u32(out, 0x8000_0000 | (self.control_type.type_code() << 16));
+        put_u32(
+            out,
+            0x8000_0000 | (self.control_type.type_code() << 16) | self.control_type.subtype(),
+        );
         put_u32(out, self.control_type.type_specific_info());
         put_u32(out, self.timestamp.0);
         put_u32(out, self.dst_socket_id.0);
@@ -193,6 +230,10 @@ impl ControlPacket {
             ControlType::DropRequest { first, last, .. } => {
                 put_u32(out, first.value());
                 put_u32(out, last.value());
+            }
+            // KM blobs go out as raw bytes (already wire order, §5); no pad.
+            ControlType::KmReq(blob) | ControlType::KmRsp(blob) => {
+                out.extend_from_slice(blob);
             }
             // Nominally CIF-less packets carry libsrt's 4-byte zero pad
             // (m_extra_pad) → 20-byte packets, matching the wire exactly.
@@ -699,14 +740,33 @@ mod tests {
 
     #[test]
     fn user_defined_type_reports_subtype() {
+        // Non-KM UMSG_EXT subtypes are still rejected with the subtype.
         let mut bytes = header(0x7FFF, 0);
         bytes[2] = 0x00;
-        bytes[3] = 0x03; // subtype = SRT_CMD_KMREQ
+        bytes[3] = 0x05; // subtype = 5 (not KMREQ/KMRSP)
         bytes.extend_from_slice(&[0, 0, 0, 0]);
         assert_eq!(
             ControlPacket::parse(&bytes),
-            Err(PacketError::UnknownControlType(0x0003))
+            Err(PacketError::UnknownControlType(0x0005))
         );
+    }
+
+    #[test]
+    fn km_control_round_trip_and_exact_bytes() {
+        // UMSG_EXT subtype KMREQ/KMRSP (docs/spec/encryption.md §11.1):
+        // word0 = F|0x7FFF|subtype, info word 0, CIF = raw KM blob, no pad.
+        let blob = vec![0x12, 0x20, 0x29, 0x01, 0xAA, 0xBB, 0xCC, 0xDD];
+        let p = pkt(ControlType::KmReq(blob.clone()));
+        let bytes = encode(&p);
+        assert_eq!(&bytes[.. 4], &[0xFF, 0xFF, 0x00, 0x03]);
+        assert_eq!(&bytes[4 .. 8], &[0, 0, 0, 0]); // Additional Info = 0
+        assert_eq!(&bytes[16 ..], &blob[..]); // raw bytes, unswapped
+        round_trip(&p);
+
+        let rsp = pkt(ControlType::KmRsp(vec![4, 0, 0, 0]));
+        let bytes = encode(&rsp);
+        assert_eq!(&bytes[.. 4], &[0xFF, 0xFF, 0x00, 0x04]);
+        round_trip(&rsp);
     }
 
     #[test]

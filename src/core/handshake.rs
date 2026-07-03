@@ -10,6 +10,14 @@
 //! Listener: stateless until a valid CONCLUSION arrives — INDUCTION requests
 //! are answered with a SYN-cookie reply that encodes (peer address, minute).
 //! A valid CONCLUSION (cookie matches, ±1 minute) yields a [`Negotiated`].
+//!
+//! KMX (docs/spec/encryption.md §6): the caller is always the initiator —
+//! with a passphrase it attaches its KMREQ to the CONCLUSION request and
+//! judges the KMRSP in the response; the listener (responder) unwraps the
+//! KMREQ and echoes it in the same CONCLUSION response. Encryption is
+//! always enforced (§8): every mismatch or KMX failure rejects the
+//! handshake — the §8 non-enforced rows are not implemented; a secured
+//! handshake puts the engine in [`Negotiated::crypto`].
 
 use std::{
     net::SocketAddrV4,
@@ -27,6 +35,13 @@ use tracing::{
 
 use super::time::Timebase;
 use crate::{
+    crypto::{
+        Crypto,
+        CryptoConfig,
+        KeyLength,
+        KmRspOutcome,
+        KmState,
+    },
     error::SrtError,
     options::SrtOptions,
     packet::{
@@ -67,7 +82,9 @@ const SRT_VERSION_FEAT_HSV5: u32 = 0x0001_0300;
 const UDT_DGRAM: u16 = 2;
 
 /// Everything the established connection needs from the handshake.
-#[derive(Clone, Debug)]
+///
+/// Not `Clone`: [`Negotiated::crypto`] owns key material.
+#[derive(Debug)]
 pub struct Negotiated {
     pub remote: SocketAddrV4,
     pub local_socket_id: SocketId,
@@ -86,6 +103,14 @@ pub struct Negotiated {
     pub mss: u32,
     /// Peer's maximum flow window.
     pub flow_window: u32,
+    /// Encryption engine seeded by the handshake KMX (encryption.md §6):
+    /// `Some` when key material was exchanged; `None` for an unencrypted
+    /// connection. Encryption is always enforced (§8): KMX mismatches and
+    /// failures reject the handshake instead of producing a degraded
+    /// context — the one exception is the §6.3 1-word UNSECURED report,
+    /// after which even libsrt's enforced caller connects (the engine
+    /// keeps the failure states and gates its own traffic on them).
+    pub crypto: Option<Crypto>,
 }
 
 enum CallerState {
@@ -112,6 +137,18 @@ pub struct CallerHandshake {
     next_send: Instant,
     /// Overall connect deadline (`opts.connect_timeout` after start).
     deadline: Instant,
+    /// Resolved crypto options; consumed at the induction→conclusion
+    /// transition (after the §7 PBKEYLEN adoption) to seed `crypto`.
+    crypto_cfg: Option<CryptoConfig>,
+    /// KMX engine — the caller is always the initiator (encryption.md §1).
+    /// Created before the first CONCLUSION request (§6.1); moves into
+    /// [`Negotiated`] at establishment.
+    crypto: Option<Crypto>,
+    /// Encryption Field advert for the CONCLUSION request (§7): the raw
+    /// configured PBKEYLEN (0 = unset) after the induction-time adoption,
+    /// mirroring `m_config.iSndCryptoKeyLen` (`core.cpp:1454`) — never
+    /// the resolved key length of the key material.
+    enc_advert: u16,
 }
 
 impl CallerHandshake {
@@ -126,15 +163,29 @@ impl CallerHandshake {
         opts: &SrtOptions,
     ) -> Self {
         debug!(%remote, id = ?local_socket_id, isn = %initial_seq, "caller handshake started");
+        // Crypto options are validated by the runtime before connecting
+        // (like the StreamID length). If an invalid set reaches the FSM
+        // anyway, fail closed: never handshake unencrypted when the user
+        // asked for encryption — the Failed state transmits nothing.
+        let (crypto_cfg, state) = match opts.crypto_config() {
+            Ok(cfg) => (cfg, CallerState::Induction),
+            Err(err) => {
+                warn!(%err, "invalid crypto options; caller handshake aborted");
+                (None, CallerState::Failed)
+            }
+        };
         CallerHandshake {
             remote,
             local_socket_id,
             initial_seq,
             timebase,
             opts: opts.clone(),
-            state: CallerState::Induction,
+            state,
             next_send: now,
             deadline: now + opts.connect_timeout,
+            crypto_cfg,
+            crypto: None,
+            enc_advert: 0,
         }
     }
 
@@ -155,7 +206,8 @@ impl CallerHandshake {
         }
         if let HandshakeType::Rejection(code) = cif.handshake_type {
             warn!(code, "connection rejected by peer");
-            return self.fail(reject_error(code));
+            let encrypting = self.crypto.is_some() || self.crypto_cfg.is_some();
+            return self.fail(reject_error(code, encrypting));
         }
         match self.state {
             CallerState::Induction => self.on_induction_response(now, cif),
@@ -235,6 +287,23 @@ impl CallerHandshake {
             cookie = cif.cookie,
             "induction response: adopting cookie, sending CONCLUSION"
         );
+        // §7: adopt the listener's PBKEYLEN advert (Encryption Field of the
+        // induction response), then generate the key material that rides in
+        // the CONCLUSION request (§6.1) — the caller is the KMX initiator.
+        if let Some(cfg) = self.crypto_cfg.as_mut() {
+            adopt_peer_pbkeylen(cfg, cif.encryption, self.opts.pbkeylen.is_some());
+        }
+        // `checkUpdateCryptoKeyLen` writes the adoption back into the raw
+        // config value (`m_config.iSndCryptoKeyLen`, core.cpp:4744/4757),
+        // passphrase or not, and the CONCLUSION advert carries exactly that
+        // raw value (core.cpp:1454) — 0 when PBKEYLEN stays unset on both
+        // ends; the 0→16 default is confined to the crypto engine (§7
+        // "unset→0", crypto.cpp:596-599).
+        if let Some(peer) = pbkeylen_from_bits(cif.encryption) {
+            self.opts.pbkeylen = Some(peer);
+        }
+        self.enc_advert = self.opts.pbkeylen.map_or(0, pbkeylen_bits);
+        self.crypto = self.crypto_cfg.take().map(Crypto::new_initiator);
         self.state = CallerState::Conclusion { cookie: cif.cookie };
         self.next_send = now; // do not wait for the 250 ms tick
         Ok(None)
@@ -279,16 +348,6 @@ impl CallerHandshake {
             warn!(got = %cif.initial_seq, want = %self.initial_seq, "ISN echo mismatch; aborting");
             return self.fail(SrtError::Rejected(reject::ROGUE));
         }
-        if cif
-            .extensions
-            .iter()
-            .any(|e| matches!(e, HsExtension::KmReq(_) | HsExtension::KmRsp(_)))
-        {
-            // A non-enforced encrypted listener answers with a KMRSP error
-            // block; an unencrypted endpoint must abort (spec §9 B).
-            warn!("conclusion response carries key material; encryption unsupported");
-            return self.fail(SrtError::EncryptionUnsupported);
-        }
         // Spec §5.4 step 5: the response must carry Extension Field bit 0x1
         // and an HSRSP (type 2) block. The decoder parses blocks regardless
         // of the bits, so check the bit explicitly (libsrt rejects
@@ -326,6 +385,48 @@ impl CallerHandshake {
                 "HSRSP lacks TSBPD flags; adopting latencies anyway"
             );
         }
+        // -- KMX outcome (encryption.md §6.1, §6.3, §8) --
+        let km_rsp = cif.extensions.iter().find_map(|e| match e {
+            HsExtension::KmRsp(data) => Some(data.as_slice()),
+            _ => None,
+        });
+        if let Some(crypto) = self.crypto.as_mut() {
+            match km_rsp.map(|payload| crypto.handle_kmrsp(payload)) {
+                // §6.3: the byte-exact echo of our KMREQ — both directions
+                // are SECURED with the one SEK (§1).
+                Some(KmRspOutcome::Confirmed) => {
+                    debug!("handshake KMX confirmed; connection secured");
+                }
+                // §6.3: a 1-word UNSECURED report returns 0 — even an
+                // enforced caller connects. The engine keeps the states and
+                // gates its own KM traffic on the UNSECURED snd state.
+                Some(KmRspOutcome::Failed(KmState::Unsecured)) => {
+                    warn!("peer reports no crypto; continuing");
+                }
+                // Failure status, mismatched echo or no KMRSP at all —
+                // libsrt's processSrtMsg_KMRSP −1 class. §6.1: the caller
+                // aborts LOCALLY, always with UNSECURE (even for a bad
+                // secret), and sends nothing — the listener's accepted
+                // socket dies by its own timeout. §8 rows 4/11 (non-enforced
+                // continue-with-own-SEK) are not implemented —
+                // always-enforced library, the connection is rejected
+                // instead.
+                outcome => {
+                    warn!(?outcome, "handshake KMX failed; aborting (enforced encryption)");
+                    return self.fail(SrtError::Rejected(reject::UNSECURE));
+                }
+            }
+        } else if cif
+            .extensions
+            .iter()
+            .any(|e| matches!(e, HsExtension::KmReq(_) | HsExtension::KmRsp(_)))
+        {
+            // §8 row 6: the peer runs encryption, we have no passphrase.
+            // Row 7 (non-enforced ignore-and-connect) is not implemented —
+            // always-enforced library, the connection is rejected instead.
+            warn!("conclusion response carries key material; aborting (enforced encryption)");
+            return self.fail(SrtError::EncryptionUnsupported);
+        }
         let negotiated = Negotiated {
             remote: self.remote,
             local_socket_id: self.local_socket_id,
@@ -342,12 +443,14 @@ impl CallerHandshake {
             streamid: self.opts.streamid.clone(),
             mss: cif.mss,
             flow_window: cif.flow_window,
+            crypto: self.crypto.take(),
         };
         debug!(
             peer = ?negotiated.peer_socket_id,
             mss = negotiated.mss,
             rcv_latency = ?negotiated.rcv_latency,
             snd_latency = ?negotiated.snd_latency,
+            secured = negotiated.crypto.is_some(),
             "handshake established (caller)"
         );
         self.state = CallerState::Established;
@@ -391,8 +494,16 @@ impl CallerHandshake {
                 );
             }
         }
+        // §6.1: the initial KM message rides in the CONCLUSION request and
+        // is re-attached byte-identically on every handshake retransmission
+        // (wire order HSREQ, SID, KMREQ — docs/spec/handshake.md §5.3).
+        if let Some(kmreq) = self.crypto.as_ref().and_then(Crypto::kmreq) {
+            extension_field |= HS_EXT_KMREQ;
+            extensions.push(HsExtension::KmReq(kmreq));
+        }
         HandshakeCif {
             version: HS_VERSION_SRT1,
+            encryption: self.enc_advert, // §7 PBKEYLEN advert
             extension_field,
             handshake_type: HandshakeType::Conclusion,
             cookie, // the induction cookie, echoed verbatim (opaque to us)
@@ -414,11 +525,18 @@ impl CallerHandshake {
 }
 
 /// Listener-side handshake responder. Stateless per peer: everything a
-/// conclusion needs to be validated is carried in the SYN cookie.
+/// conclusion needs to be validated is carried in the SYN cookie (a
+/// repeated CONCLUSION re-derives the identical KMX answer from the
+/// caller's KMREQ, encryption.md §6.2).
 pub struct Listener {
     secret: u64,
     timebase: Timebase,
     opts: SrtOptions,
+    /// Crypto options resolved once (encryption.md §2); `Err(())` = the
+    /// set is locally invalid — the runtime validates up front, and if a
+    /// bad set reaches this far every conclusion is rejected (fail
+    /// closed: never accept a connection the user meant to secure).
+    crypto_cfg: Result<Option<CryptoConfig>, ()>,
 }
 
 /// Outcome of feeding one handshake packet to the listener.
@@ -440,10 +558,14 @@ pub enum ListenerAction {
 impl Listener {
     /// `secret` seeds the SYN cookie; `timebase` stamps reply packets.
     pub fn new(secret: u64, timebase: Timebase, opts: SrtOptions) -> Self {
+        let crypto_cfg = opts.crypto_config().map_err(|err| {
+            warn!(%err, "invalid crypto options; listener will reject all conclusions");
+        });
         Listener {
             secret,
             timebase,
             opts,
+            crypto_cfg,
         }
     }
 
@@ -453,9 +575,14 @@ impl Listener {
     /// this packet completes a connection (the runtime provides fresh random
     /// values on every call; they are only consumed on `Accept`).
     ///
-    /// Encryption requests are rejected with `reject::UNSECURE`; rendezvous
-    /// (WAVEAHAND) is dropped; HSv4 conclusions are rejected with
-    /// `reject::VERSION`.
+    /// KMX follows the encryption.md §8 matrix, always enforced: with a
+    /// local passphrase a valid KMREQ is unwrapped and echoed (KMRSP) and
+    /// `Negotiated.crypto` is populated; mismatches reject
+    /// (`reject::UNSECURE` / `reject::BADSECRET`). The §8 non-enforced
+    /// rows (1-word status KMRSP + fake TX context) are not implemented —
+    /// always-enforced library, the connection is rejected instead.
+    /// Rendezvous (WAVEAHAND) is dropped; HSv4 conclusions are rejected
+    /// with `reject::VERSION`.
     pub fn handle_handshake(
         &mut self,
         now: Instant,
@@ -495,7 +622,9 @@ impl Listener {
         // stays the *caller's* id — no libsrt caller reads it.
         let mut reply = cif.clone();
         reply.version = HS_VERSION_SRT1;
-        reply.encryption = 0; // no cipher advertised
+        // §7: the listener advertises its configured PBKEYLEN here (raw
+        // option value — 0 when unset, even with a passphrase).
+        reply.encryption = self.opts.pbkeylen.map_or(0, pbkeylen_bits);
         reply.extension_field = SRT_MAGIC;
         reply.cookie = self.cookie(now, from);
         reply.extensions = Vec::new();
@@ -548,17 +677,10 @@ impl Listener {
             warn!(%from, ext, has_hs, has_km, "extension field / block mismatch");
             return self.rejection(now, cif, reject::ROGUE);
         }
-        // Unencrypted implementation with enforced-encryption semantics: a
-        // peer attaching key material (KMREQ) is rejected with UNSECURE
-        // (spec §9 A). The advertised-PBKEYLEN half of the type word alone
-        // is ignored (§2: an unencrypted implementation ignores the received
-        // Encryption Field; libsrt merely records it via
-        // checkUpdateCryptoKeyLen) — pbkeylen without a passphrase is legal.
-        if has_km {
-            warn!(%from, encryption = cif.encryption, "peer requires encryption; rejecting");
-            return self.rejection(now, cif, reject::UNSECURE);
-        }
-        if cif.encryption != 0 {
+        // The advertised-PBKEYLEN half of the type word alone is never a
+        // problem: a responder adopts the KMREQ's key length anyway
+        // (encryption.md §7) — pbkeylen without a passphrase is legal.
+        if cif.encryption != 0 && !has_km {
             debug!(%from, encryption = cif.encryption, "advertised PBKEYLEN ignored (no KMREQ)");
         }
         let hs = cif.hs_ext().expect("HSREQ presence checked above");
@@ -601,6 +723,63 @@ impl Listener {
                 _ => {}
             }
         }
+        // -- KMX (encryption.md §6.2, §8) --
+        let Ok(crypto_cfg) = &self.crypto_cfg else {
+            // Locally invalid crypto options: fail closed (see field doc).
+            warn!(%from, "invalid local crypto options; rejecting");
+            return self.rejection(now, cif, reject::UNSECURE);
+        };
+        let kmreq = cif.extensions.iter().find_map(|e| match e {
+            HsExtension::KmReq(data) => Some(data.as_slice()),
+            _ => None,
+        });
+        let (crypto, km_rsp): (Option<Crypto>, Option<Vec<u8>>) = match (crypto_cfg, kmreq) {
+            // §8 row 1: no encryption anywhere — the KMRSP block is
+            // omitted entirely (§6.2).
+            (None, None) => (None, None),
+            // §8 row 2 [wire-verified]: KMREQ without a local
+            // passphrase. Rows 3/4 (non-enforced 1-word NOSECRET KMRSP)
+            // are not implemented — always-enforced library, the
+            // connection is rejected instead.
+            (None, Some(_)) => {
+                warn!(%from, "caller requires encryption, no local passphrase; rejecting");
+                return self.rejection(now, cif, reject::UNSECURE);
+            }
+            // §8 row 5: local passphrase but no KMX from the caller —
+            // the "Agent declares encryption, but Peer does not" check.
+            // Rows 6/7 (non-enforced 1-word UNSECURED KMRSP + §6.2
+            // step 6 fake TX context) are not implemented —
+            // always-enforced library, the connection is rejected
+            // instead.
+            (Some(_), None) => {
+                warn!(%from, "local passphrase but caller sent no KMREQ; rejecting");
+                return self.rejection(now, cif, reject::UNSECURE);
+            }
+            (Some(cfg), Some(km)) => match Crypto::new_responder(cfg.clone(), km) {
+                // §8 row 8: echo the received KM message byte-for-byte
+                // (§6.2 step 4); the caller's one SEK now secures both
+                // directions (§1).
+                Ok((crypto, echo)) => {
+                    debug!(%from, kmreq_len = km.len(), "handshake KMX succeeded");
+                    (Some(crypto), Some(echo))
+                }
+                // §8 row 9 [wire-verified]: BADSECRET only when the
+                // failure was BADSECRET class (pre-checks / unwrap ICV
+                // = wrong passphrase), UNSECURE for the NOSECRET class.
+                // Rows 10/11 (non-enforced 1-word failure-status KMRSP +
+                // fake TX context) are not implemented — always-enforced
+                // library, the connection is rejected instead.
+                Err(state) => {
+                    warn!(%from, ?state, "handshake KMX failed; rejecting");
+                    let code = if state == KmState::BadSecret {
+                        reject::BADSECRET
+                    } else {
+                        reject::UNSECURE
+                    };
+                    return self.rejection(now, cif, code);
+                }
+            },
+        };
         // Latency negotiation (§4.2): each direction is the max of the
         // receiver's own setting and the sender's proposal.
         let rcv_latency = self.opts.latency.max(ms_dur(hs.send_latency_ms));
@@ -618,11 +797,29 @@ impl Listener {
             streamid: cif.stream_id().map(str::to_owned),
             mss,
             flow_window: cif.flow_window,
+            crypto,
         };
+        let mut extensions = vec![HsExtension::HsRsp(HsExtFields {
+            srt_version: SRT_VERSION,
+            flags: HsFlags::live_defaults(),
+            recv_latency_ms: ms_u16(rcv_latency),
+            send_latency_ms: ms_u16(snd_latency),
+        })];
+        let mut extension_field = HS_EXT_HSREQ;
+        if let Some(payload) = km_rsp {
+            // The KMRSP rides in the same CONCLUSION response as the HSRSP
+            // (§6.2, timing §13), after it on the wire (handshake.md §5.4).
+            extension_field |= HS_EXT_KMREQ;
+            extensions.push(HsExtension::KmRsp(payload));
+        }
         let reply_cif = HandshakeCif {
             version: HS_VERSION_SRT1,
-            encryption: 0,
-            extension_field: HS_EXT_HSREQ,
+            // §7 / core.cpp:1454: the raw configured PBKEYLEN (0 = unset),
+            // exactly like the induction response — never the KMREQ-adopted
+            // key length (`checkUpdateCryptoKeyLen` never runs on the
+            // listener's conclusion path).
+            encryption: self.opts.pbkeylen.map_or(0, pbkeylen_bits),
+            extension_field,
             initial_seq: cif.initial_seq, // echoed: the caller aborts on mismatch
             mss,
             flow_window: self.opts.flow_window,
@@ -630,12 +827,7 @@ impl Listener {
             socket_id: new_socket_id, // becomes the caller's peer id
             cookie: cif.cookie,       // echoed like libsrt; callers ignore it
             peer_ip: HandshakeCif::encode_peer_ip(*from.ip()),
-            extensions: vec![HsExtension::HsRsp(HsExtFields {
-                srt_version: SRT_VERSION,
-                flags: HsFlags::live_defaults(),
-                recv_latency_ms: ms_u16(rcv_latency),
-                send_latency_ms: ms_u16(snd_latency),
-            })],
+            extensions,
         };
         debug!(
             %from,
@@ -644,6 +836,7 @@ impl Listener {
             ?rcv_latency,
             ?snd_latency,
             mss,
+            secured = negotiated.crypto.is_some(),
             "conclusion accepted"
         );
         ListenerAction::Accept {
@@ -711,12 +904,58 @@ fn cif_valid(cif: &HandshakeCif) -> bool {
     cif.version >= HS_VERSION_UDT4 && cif.mss >= 32 && cif.flow_window >= 2
 }
 
-/// Maps a wire rejection code to the public error.
-fn reject_error(code: u32) -> SrtError {
-    if code == reject::UNSECURE {
+/// Maps a wire rejection code to the public error. Without a local
+/// passphrase an UNSECURE rejection means "the listener demands
+/// encryption"; with one it means the listener could not do encryption
+/// (§8 rows 2/9) and surfaces as a plain rejection.
+fn reject_error(code: u32, encrypting: bool) -> SrtError {
+    if code == reject::UNSECURE && !encrypting {
         SrtError::EncryptionUnsupported
     } else {
         SrtError::Rejected(code)
+    }
+}
+
+/// CIF Encryption Field advert for a PBKEYLEN (encryption.md §7,
+/// `handshake.h:SrtHSRequest::wrapFlags`): 16 → 2, 24 → 3, 32 → 4.
+fn pbkeylen_bits(len: KeyLength) -> u16 {
+    match len {
+        KeyLength::Aes128 => 2,
+        KeyLength::Aes192 => 3,
+        KeyLength::Aes256 => 4,
+    }
+}
+
+/// Inverse of [`pbkeylen_bits`]: `None` for 0 (unset) and for the 1/5/6/7
+/// values libsrt ignores as IPE (§7).
+fn pbkeylen_from_bits(bits: u16) -> Option<KeyLength> {
+    match bits {
+        2 => Some(KeyLength::Aes128),
+        3 => Some(KeyLength::Aes192),
+        4 => Some(KeyLength::Aes256),
+        _ => None,
+    }
+}
+
+/// §7 caller-side adoption (`core.cpp:checkUpdateCryptoKeyLen`): a 2/3/4
+/// advert in the listener's induction response replaces the local
+/// PBKEYLEN — adopted outright when ours is unset, peer-wins when both
+/// are set and differ (this library has no SRTO_SENDER, matching libsrt's
+/// default); 0 keeps our value; anything else is ignored (libsrt logs an
+/// IPE).
+fn adopt_peer_pbkeylen(cfg: &mut CryptoConfig, advert: u16, own_set: bool) {
+    match pbkeylen_from_bits(advert) {
+        Some(peer) if peer != cfg.key_len => {
+            if own_set {
+                warn!(?peer, local = ?cfg.key_len, "peer advertises a different PBKEYLEN; peer wins");
+            } else {
+                debug!(?peer, "adopting the listener's advertised PBKEYLEN");
+            }
+            cfg.key_len = peer;
+        }
+        Some(_) => {}
+        None if advert == 0 => {}
+        None => warn!(advert, "invalid PBKEYLEN advert ignored"),
     }
 }
 
@@ -791,15 +1030,84 @@ mod tests {
         }
     }
 
+    fn accept_of(action: ListenerAction) -> (Packet, Negotiated) {
+        match action {
+            ListenerAction::Accept { reply, negotiated } => (reply, *negotiated),
+            ListenerAction::Reply(p) => {
+                panic!("expected Accept, got Reply({:?})", hs_cif(&p).handshake_type)
+            }
+            ListenerAction::Drop => panic!("expected Accept, got Drop"),
+        }
+    }
+
+    fn km_req_of(cif: &HandshakeCif) -> &[u8] {
+        cif.extensions
+            .iter()
+            .find_map(|e| match e {
+                HsExtension::KmReq(data) => Some(data.as_slice()),
+                _ => None,
+            })
+            .expect("KMREQ attached")
+    }
+
+    fn km_rsp_of(cif: &HandshakeCif) -> &[u8] {
+        cif.extensions
+            .iter()
+            .find_map(|e| match e {
+                HsExtension::KmRsp(data) => Some(data.as_slice()),
+                _ => None,
+            })
+            .expect("KMRSP attached")
+    }
+
+    const PASSPHRASE: &str = "correct horse battery";
+    const WRONG_PASSPHRASE: &str = "wrong horse battery";
+
+    fn secure_opts() -> SrtOptions {
+        SrtOptions::default().passphrase(PASSPHRASE)
+    }
+
+    /// Drives a real caller/listener pair up to the caller's CONCLUSION
+    /// request (KMREQ attached if `caller_opts` has a passphrase); the
+    /// test then decides what the listener/caller does with it.
+    fn exchange_to_conclusion(
+        caller_opts: SrtOptions,
+        listener_opts: SrtOptions,
+    ) -> (Instant, CallerHandshake, Listener, HandshakeCif) {
+        let t0 = Instant::now();
+        let mut c = caller(t0, &caller_opts);
+        let mut l = listener(t0, listener_opts);
+        let ind = c.poll_transmit(t0).expect("induction request");
+        let rsp = reply_of(l.handle_handshake(t0, caller_addr(), hs_cif(&ind), ACCEPT_ID, UNUSED_ISN));
+        assert!(c
+            .handle_handshake(t0, hs_cif(&rsp))
+            .expect("induction ok")
+            .is_none());
+        let conc = c.poll_transmit(t0).expect("conclusion request");
+        let cif = hs_cif(&conc).clone();
+        (t0, c, l, cif)
+    }
+
     /// Runs the full caller<->listener exchange, asserting the wire-visible
     /// invariants along the way, and returns both `Negotiated`.
+    ///
+    /// Only for option sets that connect (§8 rows 1/8 — the only
+    /// connecting rows of an always-enforced library); rejection rows get
+    /// dedicated tests.
     fn run_exchange(
         caller_opts: SrtOptions,
         listener_opts: SrtOptions,
     ) -> (Negotiated, Negotiated) {
         let t0 = Instant::now();
         let mut c = caller(t0, &caller_opts);
-        let mut l = listener(t0, listener_opts);
+        let mut l = listener(t0, listener_opts.clone());
+        // Expected caller-side key length after the §7 adoption: a 2/3/4
+        // advert from the listener wins, otherwise the caller's own
+        // (resolved) setting stands.
+        let c_cfg = caller_opts.crypto_config().expect("valid crypto options");
+        let expect_klen = c_cfg
+            .as_ref()
+            .map(|cfg| listener_opts.pbkeylen.unwrap_or(cfg.key_len));
 
         // -- INDUCTION request --
         let ind_req = c.poll_transmit(t0).expect("induction request queued");
@@ -825,6 +1133,8 @@ mod tests {
         let rsp = hs_cif(&ind_rsp);
         assert_eq!(rsp.version, 5);
         assert_eq!(rsp.extension_field, SRT_MAGIC);
+        // §7: the listener advertises its configured PBKEYLEN (0 = unset).
+        assert_eq!(rsp.encryption, listener_opts.pbkeylen.map_or(0, pbkeylen_bits));
         assert_ne!(rsp.cookie, 0);
         assert_eq!(rsp.handshake_type, HandshakeType::Induction);
         // Everything else echoed verbatim — including the caller's own
@@ -841,16 +1151,23 @@ mod tests {
         assert_eq!(conc_req.dst_socket_id(), SocketId::HANDSHAKE);
         let req = hs_cif(&conc_req);
         assert_eq!(req.version, 5);
-        assert_eq!(req.encryption, 0);
+        // §7 "unset→0" / core.cpp:1454: the CONCLUSION advert is the RAW
+        // configured PBKEYLEN after the induction-time adoption (a 2/3/4
+        // listener advert replaces the local value) — never the resolved
+        // key length of the key material.
+        let expect_advert = listener_opts.pbkeylen.or(caller_opts.pbkeylen);
+        assert_eq!(req.encryption, expect_advert.map_or(0, pbkeylen_bits));
         assert_eq!(req.handshake_type, HandshakeType::Conclusion);
         assert_eq!(req.cookie, cookie); // echoed verbatim
         assert_eq!(req.socket_id, CALLER_ID);
         assert_eq!(req.initial_seq, CALLER_ISN);
-        let expect_ext = if caller_opts.streamid.is_some() {
-            HS_EXT_HSREQ | HS_EXT_CONFIG
-        } else {
-            HS_EXT_HSREQ
-        };
+        let mut expect_ext = HS_EXT_HSREQ;
+        if caller_opts.streamid.is_some() {
+            expect_ext |= HS_EXT_CONFIG;
+        }
+        if expect_klen.is_some() {
+            expect_ext |= HS_EXT_KMREQ;
+        }
         assert_eq!(req.extension_field, expect_ext);
         let hsreq = req.hs_ext().expect("HSREQ attached");
         assert_eq!(hsreq.srt_version, SRT_VERSION);
@@ -858,6 +1175,14 @@ mod tests {
         assert_eq!(hsreq.recv_latency_ms, ms_u16(caller_opts.latency));
         assert_eq!(hsreq.send_latency_ms, ms_u16(caller_opts.peer_latency));
         assert_eq!(req.stream_id(), caller_opts.streamid.as_deref());
+        match expect_klen {
+            // §3: single-key KM message length pins the SEK length.
+            Some(klen) => assert_eq!(km_req_of(req).len(), 16 + 16 + 8 + klen.bytes()),
+            None => assert!(!req
+                .extensions
+                .iter()
+                .any(|e| matches!(e, HsExtension::KmReq(_)))),
+        }
 
         // -- CONCLUSION response / accept --
         let action = l.handle_handshake(t0, caller_addr(), req, ACCEPT_ID, UNUSED_ISN);
@@ -869,9 +1194,30 @@ mod tests {
         let rsp = hs_cif(&conc_rsp);
         assert_eq!(rsp.version, 5);
         assert_eq!(rsp.handshake_type, HandshakeType::Conclusion);
+        // The response advert is the listener's raw option too (its
+        // `m_config` is never mutated on this path — core.cpp:1454).
+        assert_eq!(rsp.encryption, listener_opts.pbkeylen.map_or(0, pbkeylen_bits));
         assert_eq!(rsp.initial_seq, CALLER_ISN); // adopted + echoed
         assert_eq!(rsp.socket_id, ACCEPT_ID);
-        assert_eq!(rsp.extension_field, HS_EXT_HSREQ);
+        // §6.2: a KMRSP block (echo or 1-word status) is attached whenever
+        // either side runs encryption; omitted only when neither does.
+        let expect_kmrsp = c_cfg.is_some()
+            || listener_opts
+                .crypto_config()
+                .expect("valid crypto options")
+                .is_some();
+        let expect_ext = if expect_kmrsp {
+            HS_EXT_HSREQ | HS_EXT_KMREQ
+        } else {
+            HS_EXT_HSREQ
+        };
+        assert_eq!(rsp.extension_field, expect_ext);
+        assert_eq!(
+            rsp.extensions
+                .iter()
+                .any(|e| matches!(e, HsExtension::KmRsp(_))),
+            expect_kmrsp
+        );
         assert_eq!(
             rsp.peer_ip,
             HandshakeCif::encode_peer_ip(*caller_addr().ip())
@@ -924,6 +1270,9 @@ mod tests {
         assert_eq!(l_neg.flow_window, 8192);
         assert_eq!(c_neg.streamid, None);
         assert_eq!(l_neg.streamid, None);
+        // §8 row 1: no KMX blocks, no crypto anywhere.
+        assert!(c_neg.crypto.is_none());
+        assert!(l_neg.crypto.is_none());
     }
 
     #[test]
@@ -1086,8 +1435,13 @@ mod tests {
     /// Puts a caller into the Conclusion state via a synthetic induction
     /// response (cookie 0x5EED_C00C), transitioning at t0 + 100 ms.
     fn caller_in_conclusion(t0: Instant) -> (CallerHandshake, u32) {
+        caller_in_conclusion_with(t0, SrtOptions::default())
+    }
+
+    /// [`caller_in_conclusion`] with explicit options.
+    fn caller_in_conclusion_with(t0: Instant, opts: SrtOptions) -> (CallerHandshake, u32) {
         let cookie = 0x5EED_C00C;
-        let mut c = caller(t0, &SrtOptions::default());
+        let mut c = caller(t0, &opts);
         let _ = c.poll_transmit(t0).expect("induction");
         let rsp = HandshakeCif {
             version: 5,
@@ -1156,7 +1510,8 @@ mod tests {
 
     #[test]
     fn caller_maps_unsecure_to_encryption_unsupported() {
-        // Direction B of spec §9: listener demands crypto → wire code 1011.
+        // An UNSECURE (1011) rejection while we have no passphrase means
+        // "the listener demands crypto" (§8 row 5, caller side).
         let t0 = Instant::now();
         let (mut c, _) = caller_in_conclusion(t0);
         let rsp = HandshakeCif {
@@ -1202,6 +1557,10 @@ mod tests {
 
     #[test]
     fn caller_aborts_on_km_in_response() {
+        // §8 rows 6/7 shape: KM material in the response while we have no
+        // passphrase — the caller aborts locally (row 7's non-enforced
+        // ignore-and-connect is not implemented — always-enforced
+        // library, the connection is rejected instead).
         let t0 = Instant::now();
         let (mut c, _) = caller_in_conclusion(t0);
         let mut rsp = conclusion_response();
@@ -1211,6 +1570,8 @@ mod tests {
             c.handle_handshake(t0, &rsp),
             Err(SrtError::EncryptionUnsupported)
         ));
+        // §6.1: local abort — nothing is sent to the listener.
+        assert!(c.poll_transmit(t0 + HS_RETRY_INTERVAL).is_none());
     }
 
     #[test]
@@ -1403,6 +1764,8 @@ mod tests {
 
     #[test]
     fn listener_rejects_km_extension_as_unsecure() {
+        // §8 row 2 [wire-verified]: KMREQ arrives, no local passphrase —
+        // UNSECURE regardless of the KM content.
         let t0 = Instant::now();
         let mut l = listener(t0, SrtOptions::default());
         let mut cif = valid_conclusion(&l, t0);
@@ -1705,5 +2068,408 @@ mod tests {
         assert_eq!(neg.send_initial_seq, CALLER_ISN);
         assert_eq!(neg.recv_initial_seq, CALLER_ISN);
         assert_eq!(neg.flow_window, 8192);
+    }
+
+    // -- KMX: §8 enforcement matrix ------------------------------------------
+
+    /// Encrypts on `tx`, decrypts on `rx`, asserting the payload survives.
+    fn crypto_roundtrip(tx: &mut Crypto, rx: &mut Crypto, n: u32) {
+        let clear: Vec<u8> = (0 .. 64).map(|i| i as u8 ^ n as u8).collect();
+        let mut buf = clear.clone();
+        let flags = tx.encrypt(SeqNumber::new(n), &mut buf);
+        assert_ne!(buf, clear, "payload must be transformed");
+        rx.decrypt(SeqNumber::new(n), flags, &mut buf)
+            .expect("decrypt must succeed");
+        assert_eq!(buf, clear, "payload must survive the roundtrip");
+    }
+
+    #[test]
+    fn matrix_row8_kmx_secures_both_directions() {
+        let (c_neg, l_neg) = run_exchange(secure_opts(), secure_opts());
+        let mut c = c_neg.crypto.expect("caller secured");
+        let mut l = l_neg.crypto.expect("listener secured");
+        for crypto in [&c, &l] {
+            assert_eq!(crypto.snd_km_state(), KmState::Secured);
+            assert_eq!(crypto.rcv_km_state(), KmState::Secured);
+        }
+        // §1: the caller's one SEK serves both directions.
+        crypto_roundtrip(&mut c, &mut l, 42);
+        crypto_roundtrip(&mut l, &mut c, 43);
+        // Confirmed by the handshake KMRSP: nothing left to retry.
+        assert!(c.kmreq().is_none());
+    }
+
+    #[test]
+    fn matrix_row8_kmrsp_echoes_kmreq_bytes() {
+        // §6.2 step 4 / §6.3 trap: the success KMRSP is the received KMREQ
+        // byte-for-byte; the caller validates it by memcmp.
+        let (t0, mut c, mut l, req) = exchange_to_conclusion(secure_opts(), secure_opts());
+        let kmreq = km_req_of(&req).to_vec();
+        let (reply, l_neg) = accept_of(handle(&mut l, t0, &req));
+        let rcif = hs_cif(&reply);
+        assert_eq!(km_rsp_of(rcif), &kmreq[..]);
+        assert_eq!(rcif.extension_field, HS_EXT_HSREQ | HS_EXT_KMREQ);
+        assert_eq!(rcif.encryption, 0); // §7: raw PBKEYLEN (unset), core.cpp:1454
+        assert!(l_neg.crypto.is_some());
+        let c_neg = c
+            .handle_handshake(t0, rcif)
+            .expect("conclusion ok")
+            .expect("established");
+        assert!(c_neg.crypto.is_some());
+    }
+
+    #[test]
+    fn matrix_row2_enforced_listener_without_passphrase_rejects() {
+        let (t0, mut c, mut l, req) = exchange_to_conclusion(secure_opts(), SrtOptions::default());
+        let reply = reply_of(l.handle_handshake(t0, caller_addr(), &req, ACCEPT_ID, UNUSED_ISN));
+        let rcif = hs_cif(&reply);
+        // §8.1 [wire-verified]: UNSECURE = handshake type 1011.
+        assert_eq!(rcif.handshake_type, HandshakeType::Rejection(reject::UNSECURE));
+        // With a passphrase the caller surfaces the plain wire code (the
+        // listener cannot do encryption — not "encryption unsupported").
+        assert!(matches!(
+            c.handle_handshake(t0, rcif),
+            Err(SrtError::Rejected(code)) if code == reject::UNSECURE
+        ));
+    }
+
+    #[test]
+    fn matrix_rows3_4_nosecret_kmrsp_from_permissive_peer_aborts() {
+        // §8 rows 3/4, caller side: a permissive no-passphrase peer (not
+        // this library — the non-enforced rows are not implemented; e.g.
+        // libsrt with SRTO_ENFORCEDENCRYPTION=false) answers our KMREQ
+        // with the 1-word NOSECRET(3) status (§6.2 step 3; LE per §5.1).
+        // §6.1: the caller aborts LOCALLY, always with UNSECURE, and
+        // sends nothing — the peer's socket times out.
+        let t0 = Instant::now();
+        let (mut c, _) = caller_in_conclusion_with(t0, secure_opts());
+        let mut rsp = conclusion_response();
+        rsp.extensions.push(HsExtension::KmRsp(vec![3, 0, 0, 0]));
+        rsp.extension_field = HS_EXT_HSREQ | HS_EXT_KMREQ;
+        assert!(matches!(
+            c.handle_handshake(t0, &rsp),
+            Err(SrtError::Rejected(code)) if code == reject::UNSECURE
+        ));
+        assert!(c.poll_transmit(t0 + HS_RETRY_INTERVAL).is_none());
+    }
+
+    #[test]
+    fn matrix_row5_enforced_listener_with_passphrase_rejects_plain_caller() {
+        // "Agent declares encryption, but Peer does not" (§6.2 post-check).
+        let t0 = Instant::now();
+        let mut l = listener(t0, secure_opts());
+        let cif = valid_conclusion(&l, t0);
+        assert_eq!(rejection_code(handle(&mut l, t0, &cif)), reject::UNSECURE);
+    }
+
+    #[test]
+    fn matrix_rows6_7_plain_caller_secured_listener_rejected_end_to_end() {
+        // §8 rows 6/7 (non-enforced 1-word UNSECURED KMRSP + §6.2 step 6
+        // fake TX context) are not implemented — always-enforced library:
+        // the listener rejects the KMREQ-less caller with UNSECURE
+        // (row 5) and the passphrase-less caller surfaces it as
+        // "the peer demands encryption".
+        let (t0, mut c, mut l, req) = exchange_to_conclusion(SrtOptions::default(), secure_opts());
+        assert!(!req.extensions.iter().any(|e| matches!(e, HsExtension::KmReq(_))));
+        let reply = reply_of(handle(&mut l, t0, &req));
+        let rcif = hs_cif(&reply);
+        assert_eq!(rcif.handshake_type, HandshakeType::Rejection(reject::UNSECURE));
+        assert!(matches!(
+            c.handle_handshake(t0, rcif),
+            Err(SrtError::EncryptionUnsupported)
+        ));
+    }
+
+    #[test]
+    fn matrix_row9_wrong_passphrase_rejected_badsecret() {
+        let lopts = SrtOptions::default().passphrase(WRONG_PASSPHRASE);
+        let (t0, mut c, mut l, req) = exchange_to_conclusion(secure_opts(), lopts);
+        let reply = reply_of(l.handle_handshake(t0, caller_addr(), &req, ACCEPT_ID, UNUSED_ISN));
+        let rcif = hs_cif(&reply);
+        // §8.1 [wire-verified]: BADSECRET = handshake type 1010.
+        assert_eq!(rcif.handshake_type, HandshakeType::Rejection(reject::BADSECRET));
+        assert!(matches!(
+            c.handle_handshake(t0, rcif),
+            Err(SrtError::Rejected(code)) if code == reject::BADSECRET
+        ));
+    }
+
+    #[test]
+    fn matrix_rows10_11_badsecret_kmrsp_from_permissive_peer_aborts() {
+        // §8 rows 10/11, caller side: a permissive peer whose unwrap
+        // failed (not this library — the non-enforced rows are not
+        // implemented) answers with the 1-word BADSECRET status (§5.1
+        // trap [wire-verified]: `04 00 00 00` LE). The caller aborts
+        // LOCALLY with UNSECURE — not BADSECRET — and sends nothing.
+        let t0 = Instant::now();
+        let (mut c, _) = caller_in_conclusion_with(t0, secure_opts());
+        let mut rsp = conclusion_response();
+        rsp.extensions.push(HsExtension::KmRsp(vec![4, 0, 0, 0]));
+        rsp.extension_field = HS_EXT_HSREQ | HS_EXT_KMREQ;
+        assert!(matches!(
+            c.handle_handshake(t0, &rsp),
+            Err(SrtError::Rejected(code)) if code == reject::UNSECURE
+        ));
+        assert!(c.poll_transmit(t0 + HS_RETRY_INTERVAL).is_none());
+    }
+
+    // -- KMX: caller details ----------------------------------------------------
+
+    #[test]
+    fn conclusion_kmreq_shape_and_retransmission() {
+        let (t0, mut c, _l, req) = exchange_to_conclusion(secure_opts(), SrtOptions::default());
+        assert_eq!(req.extension_field, HS_EXT_HSREQ | HS_EXT_KMREQ);
+        assert_eq!(req.encryption, 0); // §7: raw PBKEYLEN (unset), not the default
+        let km = km_req_of(&req).to_vec();
+        assert_eq!(km.len(), 56); // §3: single key, KLen 16
+        assert_eq!(km[0], 0x12); // Vers 1, PT KM
+        assert_eq!(&km[1 .. 3], &[0x20, 0x29]); // 'HAI' sign
+        assert_eq!(km[3], 0x01); // §9.1 trap: the first SEK is EVEN
+        // §6.1: retransmissions re-attach the KMREQ byte-identically.
+        let retry = c.poll_transmit(t0 + HS_RETRY_INTERVAL).expect("retransmit");
+        assert_eq!(km_req_of(hs_cif(&retry)), &km[..]);
+    }
+
+    #[test]
+    fn caller_with_passphrase_requires_kmrsp() {
+        // A conclusion response with no KMRSP while our KMREQ is
+        // outstanding (no libsrt listener does this): mirror of the
+        // "Agent declares encryption, but Peer does not" check.
+        let t0 = Instant::now();
+        let (mut c, _) = caller_in_conclusion_with(t0, secure_opts());
+        assert!(matches!(
+            c.handle_handshake(t0, &conclusion_response()),
+            Err(SrtError::Rejected(code)) if code == reject::UNSECURE
+        ));
+    }
+
+    #[test]
+    fn caller_kmrsp_echo_mismatch_aborts() {
+        // A corrupted echo is libsrt's −1 class (§6.3): the caller
+        // aborts with UNSECURE.
+        let (t0, mut c, mut l, req) = exchange_to_conclusion(secure_opts(), secure_opts());
+        let (reply, _) = accept_of(handle(&mut l, t0, &req));
+        let mut rcif = hs_cif(&reply).clone();
+        for ext in &mut rcif.extensions {
+            if let HsExtension::KmRsp(data) = ext {
+                data[20] ^= 0x01;
+            }
+        }
+        assert!(matches!(
+            c.handle_handshake(t0, &rcif),
+            Err(SrtError::Rejected(code)) if code == reject::UNSECURE
+        ));
+    }
+
+    // -- KMX: listener details ----------------------------------------------------
+
+    #[test]
+    fn listener_kmreq_failure_reject_codes() {
+        // §6.2 [wire-verified]: BADSECRET only for the BADSECRET class
+        // (srtcore pre-checks, unwrap ICV), UNSECURE for NOSECRET class.
+        let t0 = Instant::now();
+        let mut l = listener(t0, secure_opts());
+
+        // Truncated KM (not longer than its header): pre-check ⇒ BADSECRET.
+        let mut cif = valid_conclusion(&l, t0);
+        cif.extensions.push(HsExtension::KmReq(vec![0x12; 16]));
+        cif.extension_field = HS_EXT_HSREQ | HS_EXT_KMREQ;
+        assert_eq!(rejection_code(handle(&mut l, t0, &cif)), reject::BADSECRET);
+
+        // Structurally broken KM (bad sign): NOSECRET class ⇒ UNSECURE.
+        let (t0, _c, mut l, mut req) = exchange_to_conclusion(secure_opts(), secure_opts());
+        for ext in &mut req.extensions {
+            if let HsExtension::KmReq(data) = ext {
+                data[1] ^= 0xFF;
+            }
+        }
+        assert_eq!(rejection_code(handle(&mut l, t0, &req)), reject::UNSECURE);
+    }
+
+    #[test]
+    fn repeated_conclusion_kmx_is_reanswered_identically() {
+        // §6.2/§10.4: repeated CONCLUSIONs are re-answered; the stateless
+        // listener re-derives the identical echo and the identical SEK
+        // from the caller's (byte-identical) KMREQ.
+        let (t0, _c, mut l, req) = exchange_to_conclusion(secure_opts(), secure_opts());
+        let (r1, n1) = accept_of(handle(&mut l, t0, &req));
+        let (r2, n2) = accept_of(handle(&mut l, t0, &req));
+        assert_eq!(km_rsp_of(hs_cif(&r1)), km_rsp_of(hs_cif(&r2)));
+        let mut a = n1.crypto.expect("secured");
+        let mut b = n2.crypto.expect("secured");
+        crypto_roundtrip(&mut a, &mut b, 7);
+    }
+
+    // -- KMX: PBKEYLEN negotiation (§7) -----------------------------------------
+
+    #[test]
+    fn listener_advertises_configured_pbkeylen_in_induction() {
+        let t0 = Instant::now();
+        let mut l = listener(t0, secure_opts().pbkeylen(KeyLength::Aes192));
+        let mut req = valid_conclusion(&l, t0);
+        req.handshake_type = HandshakeType::Induction;
+        req.version = 4;
+        req.extension_field = 2;
+        req.cookie = 0;
+        req.extensions = vec![];
+        let reply = reply_of(handle(&mut l, t0, &req));
+        assert_eq!(hs_cif(&reply).encryption, 3); // 24-byte keys
+    }
+
+    #[test]
+    fn caller_adopts_advertised_pbkeylen() {
+        // Local PBKEYLEN unset → adopt the listener's induction advert.
+        let lopts = secure_opts().pbkeylen(KeyLength::Aes256);
+        let (_t0, _c, _l, req) = exchange_to_conclusion(secure_opts(), lopts);
+        assert_eq!(req.encryption, 4);
+        assert_eq!(km_req_of(&req)[15], 8); // KLen/4 = 8 → 32-byte SEK
+    }
+
+    #[test]
+    fn caller_pbkeylen_peer_wins_on_conflict() {
+        // Both set and different → the peer's advert wins (libsrt's
+        // default; this library has no SRTO_SENDER).
+        let copts = secure_opts().pbkeylen(KeyLength::Aes256);
+        let lopts = secure_opts().pbkeylen(KeyLength::Aes128);
+        let (_t0, _c, _l, req) = exchange_to_conclusion(copts, lopts);
+        assert_eq!(req.encryption, 2);
+        assert_eq!(km_req_of(&req)[15], 4);
+    }
+
+    #[test]
+    fn caller_keeps_own_pbkeylen_on_zero_advert() {
+        // Advertised 0 → keep our own setting.
+        let copts = secure_opts().pbkeylen(KeyLength::Aes192);
+        let (_t0, _c, _l, req) = exchange_to_conclusion(copts, secure_opts());
+        assert_eq!(req.encryption, 3);
+        assert_eq!(km_req_of(&req)[15], 6);
+    }
+
+    #[test]
+    fn caller_ignores_junk_pbkeylen_advert() {
+        // Advertised 1/5/6/7 → ignored like libsrt (logged IPE).
+        let t0 = Instant::now();
+        let mut c = caller(t0, &secure_opts());
+        let _ = c.poll_transmit(t0).expect("induction");
+        let rsp = HandshakeCif {
+            version: 5,
+            encryption: 5,
+            extension_field: SRT_MAGIC,
+            handshake_type: HandshakeType::Induction,
+            cookie: 0x0C00_C1E5,
+            extensions: vec![],
+            ..conclusion_response()
+        };
+        assert!(c.handle_handshake(t0, &rsp).expect("continue").is_none());
+        let conc = c.poll_transmit(t0).expect("conclusion");
+        assert_eq!(hs_cif(&conc).encryption, 0); // raw PBKEYLEN stays unset
+        assert_eq!(km_req_of(hs_cif(&conc))[15], 4); // key material: default 128
+    }
+
+    #[test]
+    fn conclusion_advert_is_raw_pbkeylen_not_resolved() {
+        // §7 "unset→0" / core.cpp:1454 [most common encrypted config]:
+        // passphrases set, PBKEYLEN unset on both ends. libsrt puts the
+        // raw config value (0) in the CONCLUSION type-word upper half in
+        // BOTH directions — the 0→16 default lives only inside the crypto
+        // engine (crypto.cpp:596-599) and is never written back.
+        let (t0, _c, mut l, req) = exchange_to_conclusion(secure_opts(), secure_opts());
+        assert_eq!(req.encryption, 0, "caller advert must be the raw option");
+        assert_eq!(km_req_of(&req)[15], 4); // key material still AES-128
+        let (reply, l_neg) = accept_of(handle(&mut l, t0, &req));
+        assert_eq!(
+            hs_cif(&reply).encryption,
+            0,
+            "listener advert must be the raw option, not the adopted KLen"
+        );
+        assert!(l_neg.crypto.is_some());
+    }
+
+    #[test]
+    fn plain_caller_echoes_adopted_pbkeylen_advert() {
+        // `checkUpdateCryptoKeyLen` runs on every HSv5 induction response,
+        // passphrase or not (core.cpp:4439), and mutates the raw config:
+        // a 2/3/4 advert is echoed back in the caller's CONCLUSION type
+        // word even though no KMREQ is attached.
+        let t0 = Instant::now();
+        let mut c = caller(t0, &SrtOptions::default());
+        let _ = c.poll_transmit(t0).expect("induction");
+        let rsp = HandshakeCif {
+            version: 5,
+            encryption: 3, // listener configured with AES-192
+            extension_field: SRT_MAGIC,
+            handshake_type: HandshakeType::Induction,
+            cookie: 0x0C00_C1E5,
+            extensions: vec![],
+            ..conclusion_response()
+        };
+        assert!(c.handle_handshake(t0, &rsp).expect("continue").is_none());
+        let conc = c.poll_transmit(t0).expect("conclusion");
+        assert_eq!(hs_cif(&conc).encryption, 3);
+        assert!(!hs_cif(&conc)
+            .extensions
+            .iter()
+            .any(|e| matches!(e, HsExtension::KmReq(_))));
+    }
+
+    #[test]
+    fn listener_conclusion_advert_is_raw_option_when_set() {
+        // A listener with an explicit PBKEYLEN adverts it in the
+        // CONCLUSION response even when the KMX adopted a different key
+        // length from the KMREQ (core.cpp:1454 uses m_config, which the
+        // listener path never mutates).
+        let t0 = Instant::now();
+        let mut l = listener(t0, secure_opts().pbkeylen(KeyLength::Aes192));
+        let mut cif = valid_conclusion(&l, t0);
+        // A hand-rolled AES-128 KMREQ (the §7 induction adoption bypassed).
+        let cfg = secure_opts()
+            .crypto_config()
+            .expect("valid crypto options")
+            .expect("passphrase set");
+        cif.extensions
+            .push(HsExtension::KmReq(Crypto::new_initiator(cfg).kmreq().unwrap()));
+        cif.extension_field = HS_EXT_HSREQ | HS_EXT_KMREQ;
+        let (reply, l_neg) = accept_of(handle(&mut l, t0, &cif));
+        assert_eq!(hs_cif(&reply).encryption, 3, "raw option, not adopted KLen 16");
+        assert!(l_neg.crypto.is_some());
+    }
+
+    #[test]
+    fn listener_adopts_kmreq_key_length_over_local_pbkeylen() {
+        // §7 trap: the KMREQ's KLen silently overrides the responder's
+        // PBKEYLEN — never a rejection. Advert 0 from the listener keeps
+        // the caller's 32-byte choice; the listener adopts and echoes it.
+        let copts = secure_opts().pbkeylen(KeyLength::Aes256);
+        let (t0, mut c, mut l, req) = exchange_to_conclusion(copts, secure_opts());
+        assert_eq!(km_req_of(&req)[15], 8);
+        let (reply, l_neg) = accept_of(handle(&mut l, t0, &req));
+        // core.cpp:1454: the response adverts the listener's raw option
+        // (unset → 0), never the KLen adopted from the KMREQ.
+        assert_eq!(hs_cif(&reply).encryption, 0);
+        let mut l_crypto = l_neg.crypto.expect("secured");
+        let c_neg = c
+            .handle_handshake(t0, hs_cif(&reply))
+            .expect("conclusion ok")
+            .expect("established");
+        let mut c_crypto = c_neg.crypto.expect("secured");
+        crypto_roundtrip(&mut c_crypto, &mut l_crypto, 11);
+        crypto_roundtrip(&mut l_crypto, &mut c_crypto, 12);
+    }
+
+    // -- KMX: invalid local options fail closed ----------------------------------
+
+    #[test]
+    fn invalid_crypto_options_fail_closed() {
+        // The runtime validates crypto options up front; if an invalid set
+        // reaches the FSM anyway, nothing must ever go out unencrypted.
+        let t0 = Instant::now();
+        let bad = SrtOptions::default().passphrase("short");
+        let mut c = caller(t0, &bad);
+        assert!(c.poll_transmit(t0).is_none(), "caller transmits nothing");
+        assert_eq!(c.next_deadline(), None);
+
+        let mut l = listener(t0, bad);
+        let cif = valid_conclusion(&l, t0);
+        assert_eq!(rejection_code(handle(&mut l, t0, &cif)), reject::UNSECURE);
     }
 }

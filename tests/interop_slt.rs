@@ -11,6 +11,10 @@
 //! 3. our caller   -> slt listener   (slt writes what it receives to stdout)
 //! 4. our listener -> slt caller     (slt pulls to stdout)
 //!
+//! Directions 2 and 3 are additionally run with a shared passphrase, pinning
+//! the HaiCrypt wire format (docs/spec/encryption.md) against the reference
+//! implementation in both the encrypt and decrypt directions.
+//!
 //! Every test skips cleanly (eprintln "SKIP" + return) when the binary is
 //! missing, uses unique free ports, enforces a hard 30 s outer timeout, and
 //! never leaks the child: `SltProcess` is kill-on-drop and the success paths
@@ -293,6 +297,121 @@ async fn listener_sends_to_slt_caller() {
             out.len(),
             TOTAL,
             "slt wrote {} of {TOTAL} bytes (data lost listener->slt); slt stderr: {:?}",
+            out.len(),
+            slt.drain_stderr(),
+        );
+        verify_prefix(SEED, &out).unwrap_or_else(|e| panic!("slt output diverged: {e}"));
+
+        assert_eq!(
+            stats.pkts_send_dropped, 0,
+            "sender dropped packets on a loss-free path: {stats:?}"
+        );
+        assert!(stats.pkts_sent as usize >= MESSAGES, "{stats:?}");
+        slt.kill().await.ok();
+    })
+    .await;
+}
+
+/// Shared secret for the encrypted directions below.
+const PASSPHRASE: &str = "interop 5uP3r-secret";
+
+/// Encrypted direction 2: slt calls into our listener with a passphrase and
+/// pushes its stdin; our listener must run the §6 handshake KMX against a
+/// real libsrt 1.4.4 KMREQ (KEK derivation, AES keywrap unwrap, KMRSP echo)
+/// and then decrypt real HaiCrypt AES-CTR ciphertext byte-for-byte
+/// (docs/spec/encryption.md §9.2) — the RX half of the wire format that a
+/// same-stack loopback cannot pin down (symmetric bugs cancel out).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn encrypted_listener_receives_from_slt_caller() {
+    let binary = require_slt!();
+    const SEED: u64 = 0x51A7_0005;
+    within_timeout(async {
+        let opts = SrtOptions::default().passphrase(PASSPHRASE);
+        let mut listener = SrtListener::bind("127.0.0.1:0", opts)
+            .await
+            .expect("bind listener");
+        let port = listener.local_addr().port();
+
+        let pw_param = format!("passphrase={PASSPHRASE}");
+        let mut slt = SltProcess::spawn_send(
+            &binary,
+            &caller_uri(port, &["latency=120", &pw_param, "pbkeylen=16"]),
+            &[LOG, "-c:1316", "-a:no"],
+        )
+        .expect("spawn srt-live-transmit");
+
+        let (mut sock, _peer) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+            .await
+            .expect("slt caller never connected")
+            .expect("accept");
+        // Our listener is established on sending the conclusion response;
+        // give slt a moment to process it before data flows.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let data = PayloadGen::stream_prefix(SEED, TOTAL);
+        let (fed, ()) = tokio::join!(
+            slt.feed_stdin(&data, MESSAGE_SIZE, PACE),
+            recv_and_verify(&mut sock, SEED),
+        );
+        fed.expect("feed slt stdin");
+
+        let stats = sock.stats();
+        assert_eq!(
+            stats.undecrypted_pkts, 0,
+            "every packet must decrypt with the shared passphrase: {stats:?}"
+        );
+        assert_eq!(
+            stats.pkts_recv_dropped, 0,
+            "unrecovered drops on a loss-free path: {stats:?}"
+        );
+        assert!(stats.pkts_recv as usize >= MESSAGES, "{stats:?}");
+        sock.close().await.expect("close");
+        slt.kill().await.ok();
+    })
+    .await;
+}
+
+/// Encrypted direction 3: our caller connects to an slt listener with the
+/// same passphrase and sends; slt's stdout must equal our stream, proving
+/// real libsrt accepts our KMREQ (docs/spec/encryption.md §5/§6) and
+/// decrypts our AES-CTR ciphertext — the TX half of the wire format.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn encrypted_caller_sends_to_slt_listener() {
+    let binary = require_slt!();
+    const SEED: u64 = 0x51A7_0006;
+    within_timeout(async {
+        let port = free_udp_port().expect("free port");
+        let pw_param = format!("passphrase={PASSPHRASE}");
+        // srt://:port -> stdout.
+        let mut slt = SltProcess::spawn_receive(
+            &binary,
+            &listener_uri(port, &["latency=120", &pw_param]),
+            &[LOG, "-a:no"],
+        )
+        .expect("spawn srt-live-transmit");
+        tokio::time::sleep(Duration::from_millis(300)).await; // let it bind
+
+        let opts = SrtOptions::default().passphrase(PASSPHRASE);
+        let sock = SrtSocket::connect(("127.0.0.1", port), opts)
+            .await
+            .expect("connect to slt listener");
+        tokio::time::sleep(Duration::from_millis(200)).await; // slt sees the accept
+
+        // Same shape as direction 3: collect concurrently, then close our
+        // socket so slt exits and flushes its block-buffered stdout tail.
+        let (out, stats) =
+            tokio::join!(slt.collect_stdout(TOTAL, Duration::from_secs(25)), async {
+                send_stream(&sock, SEED).await;
+                tokio::time::sleep(Duration::from_millis(800)).await;
+                let stats = sock.stats();
+                sock.close().await.expect("close");
+                stats
+            },);
+        let out = out.expect("collect slt stdout");
+        assert_eq!(
+            out.len(),
+            TOTAL,
+            "slt wrote {} of {TOTAL} bytes (data lost sender->slt); slt stderr: {:?}",
             out.len(),
             slt.drain_stderr(),
         );

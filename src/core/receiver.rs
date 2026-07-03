@@ -16,7 +16,10 @@
 //! - TSBPD: release a buffered packet when `anchor_local + (extended_ts - anchor_ts) + rcv_latency`
 //!   is reached; missing packets whose deadline passed are skipped (counted dropped). Peer
 //!   timestamps go through [`super::time::TimestampExtender`] — mandatory for streams longer than
-//!   ~71.6 minutes.
+//!   ~71.6 minutes;
+//! - undecryptable data (encryption.md §9.4): the packet occupies its sequence slot and is ACKed
+//!   like any arrival, but is freed undelivered at its TSBPD deadline; a gap it reveals is never
+//!   NAKed.
 
 use std::{
     collections::VecDeque,
@@ -104,7 +107,9 @@ pub struct ReceiverStats {
     pub bytes_recv: u64,
     /// Gaps detected (packets that entered the loss list).
     pub pkts_lost: u64,
-    /// Missing packets skipped by TSBPD deadline (never recovered).
+    /// Missing packets skipped by TSBPD deadline (never recovered), plus
+    /// undecryptable packets freed at play time (libsrt folds
+    /// `pktRcvUndecrypt` into the drop count too, encryption.md §9.4).
     pub pkts_dropped: u64,
     /// Belated packets discarded (already delivered past them).
     pub pkts_belated: u64,
@@ -128,6 +133,10 @@ struct Slot {
     msg_number: MsgNumber,
     /// TSBPD release deadline (anchor + timestamp delta + latency).
     deadline: Instant,
+    /// Payload could not be decrypted (encryption.md §9.4): the slot is
+    /// freed at its deadline instead of delivered — the application sees
+    /// a sequence gap exactly like a TSBPD drop.
+    undecryptable: bool,
 }
 
 /// ACK journal entry: lets an ACKACK be matched back to its send time.
@@ -188,6 +197,11 @@ pub struct Receiver {
     /// (mirrors `Sender::protocol_violation`).
     discrepancy: bool,
 
+    /// Undecryptable data packets received (encryption.md §9.4; libsrt
+    /// `pktRcvUndecrypt`). Monotonic; read via
+    /// [`Receiver::undecrypted_count`].
+    undecrypted: u64,
+
     control_q: VecDeque<ControlType>,
     stats: ReceiverStats,
 }
@@ -216,6 +230,7 @@ impl Receiver {
             rtt_first: true,
             max_payload: DEFAULT_MAX_PAYLOAD,
             discrepancy: false,
+            undecrypted: 0,
             control_q: VecDeque::new(),
             stats: ReceiverStats::default(),
             cfg,
@@ -261,6 +276,37 @@ impl Receiver {
     /// Buffers an arriving data packet, updating the loss list. May queue an
     /// immediate NAK (fetched via `poll_control`).
     pub fn handle_data(&mut self, now: Instant, pkt: DataPacket) {
+        self.ingest(now, pkt, false);
+    }
+
+    /// Buffers a data packet whose payload could not be decrypted
+    /// (encryption.md §9.4). The packet occupies its sequence slot exactly
+    /// like [`Receiver::handle_data`] — it is ACKed, advances the receive
+    /// cursor, and fills (stops re-NAKs of) any loss entry covering it —
+    /// but the payload is never delivered: the slot is freed undelivered
+    /// when its TSBPD deadline arrives, counted as dropped. A sequence gap
+    /// the packet reveals is never NAKed (§9.4: loss detection is gated on
+    /// decrypt success while the receive cursor advances unconditionally,
+    /// so the gap is silently skipped at delivery time — no LOSSREPORT).
+    /// No KM or connection action is taken here.
+    pub fn handle_undecryptable(&mut self, now: Instant, pkt: DataPacket) {
+        self.ingest(now, pkt, true);
+    }
+
+    /// Data packets received that could not be decrypted (encryption.md
+    /// §9.4; libsrt `pktRcvUndecrypt`). Ticks only when the undecryptable
+    /// packet actually occupies a receive-buffer slot: arrivals discarded
+    /// as belated, duplicate, or beyond capacity are not counted, matching
+    /// libsrt, where decrypt (and this counter) runs only after a
+    /// successful buffer insert (core.cpp `processData`). Never decreases.
+    pub fn undecrypted_count(&self) -> u64 {
+        self.undecrypted
+    }
+
+    /// Common arrival path for decryptable and undecryptable data: stats,
+    /// timestamp extension / TSBPD anchoring, buffering, light-ACK
+    /// self-clocking.
+    fn ingest(&mut self, now: Instant, pkt: DataPacket, undecryptable: bool) {
         self.stats.pkts_recv += 1;
         self.stats.bytes_recv += pkt.payload.len() as u64;
         self.pkt_count += 1;
@@ -284,7 +330,7 @@ impl Receiver {
             }
         };
 
-        self.store_data(pkt, anchor, ext_us);
+        self.store_data(pkt, anchor, ext_us, undecryptable);
 
         // Light ACK after 64, 128, 192… packets within one full-ACK period
         // (the counter is reset only by the timer ACK, not by light ACKs).
@@ -294,7 +340,7 @@ impl Receiver {
         }
     }
 
-    fn store_data(&mut self, pkt: DataPacket, anchor: Anchor, ext_us: u64) {
+    fn store_data(&mut self, pkt: DataPacket, anchor: Anchor, ext_us: u64, undecryptable: bool) {
         let seq = pkt.seq;
         trace!(
             seq = seq.value(),
@@ -355,20 +401,33 @@ impl Receiver {
         // is newly missing → loss list + immediate NAK (SRTO_LOSSMAXTTL = 0).
         let expected = self.rcv_curr_seq.next();
         if seq.diff(expected) > 0 {
-            let range = LossRange {
-                first: expected,
-                last: seq.prev(),
-            };
-            let lost = range.last.diff(range.first) as u64 + 1;
-            self.stats.pkts_lost += lost;
-            self.loss.push(range);
-            debug!(
-                first = range.first.value(),
-                last = range.last.value(),
-                lost,
-                "gap detected; sending NAK"
-            );
-            self.queue_nak(vec![range]);
+            if undecryptable {
+                // encryption.md §9.4: loss detection is gated on decrypt
+                // success — a gap revealed by an undecryptable packet
+                // never enters the loss list and is never NAKed, while
+                // the receive cursor still advances past it (below), so
+                // TSBPD later skips the hole like any other drop.
+                debug!(
+                    first = expected.value(),
+                    last = seq.prev().value(),
+                    "gap revealed by undecryptable packet; loss detection suppressed"
+                );
+            } else {
+                let range = LossRange {
+                    first: expected,
+                    last: seq.prev(),
+                };
+                let lost = range.last.diff(range.first) as u64 + 1;
+                self.stats.pkts_lost += lost;
+                self.loss.push(range);
+                debug!(
+                    first = range.first.value(),
+                    last = range.last.value(),
+                    lost,
+                    "gap detected; sending NAK"
+                );
+                self.queue_nak(vec![range]);
+            }
         }
         if seq.diff(self.rcv_curr_seq) > 0 {
             self.rcv_curr_seq = seq;
@@ -382,7 +441,15 @@ impl Receiver {
             payload: pkt.payload,
             msg_number: pkt.msg_number,
             deadline,
+            undecryptable,
         });
+        if undecryptable {
+            // Counted only once the packet occupies its slot, so belated,
+            // duplicate and overflow-dropped arrivals (all rejected above)
+            // never tick the counter — libsrt increments pktRcvUndecrypt
+            // only after a successful buffer insert (core.cpp processData).
+            self.undecrypted += 1;
+        }
     }
 
     /// Matches an ACKACK to a sent ACK and updates the RTT estimate.
@@ -511,37 +578,55 @@ impl Receiver {
     }
 
     /// Next payload whose TSBPD deadline has been reached, in sequence
-    /// order. Skips over lost packets once their deadline passes.
+    /// order. Skips over lost packets once their deadline passes, and
+    /// frees undecryptable packets at their play time without delivering
+    /// them (encryption.md §9.4).
     pub fn poll_deliver(&mut self, now: Instant) -> Option<Vec<u8>> {
-        let first = self.slots.iter().position(|s| s.is_some())?;
-        let deadline = self.slots[first].as_ref().expect("occupied").deadline;
-        if deadline > now {
-            return None;
-        }
-        if first > 0 {
-            // TLPKTDROP: the first available packet is due but preceded by
-            // a hole whose recovery window has closed — skip the hole.
-            let lo = self.base_seq;
-            let hi = self.base_seq.add(first as i32 - 1);
-            warn!(
-                first = lo.value(),
-                last = hi.value(),
-                skipped = first,
-                "TSBPD deadline passed; skipping missing packets"
+        loop {
+            let first = self.slots.iter().position(|s| s.is_some())?;
+            let deadline = self.slots[first].as_ref().expect("occupied").deadline;
+            if deadline > now {
+                return None;
+            }
+            if first > 0 {
+                // TLPKTDROP: the first available packet is due but preceded by
+                // a hole whose recovery window has closed — skip the hole.
+                let lo = self.base_seq;
+                let hi = self.base_seq.add(first as i32 - 1);
+                warn!(
+                    first = lo.value(),
+                    last = hi.value(),
+                    skipped = first,
+                    "TSBPD deadline passed; skipping missing packets"
+                );
+                self.remove_loss_range(lo, hi);
+                self.stats.pkts_dropped += first as u64;
+                self.slots.drain(.. first);
+                self.base_seq = self.base_seq.add(first as i32);
+            }
+            let slot = self.slots.pop_front().flatten().expect("occupied");
+            if slot.undecryptable {
+                // encryption.md §9.4: an undecryptable unit is freed when
+                // its play time arrives, never delivered — the application
+                // sees a gap exactly like a TSBPD drop (libsrt also folds
+                // it into the drop counter). Keep scanning: the next slot
+                // may be due as well.
+                debug!(
+                    seq = self.base_seq.value(),
+                    "undecryptable packet freed at play time"
+                );
+                self.stats.pkts_dropped += 1;
+                self.base_seq = self.base_seq.next();
+                continue;
+            }
+            trace!(
+                seq = self.base_seq.value(),
+                len = slot.payload.len(),
+                "TSBPD release"
             );
-            self.remove_loss_range(lo, hi);
-            self.stats.pkts_dropped += first as u64;
-            self.slots.drain(.. first);
-            self.base_seq = self.base_seq.add(first as i32);
+            self.base_seq = self.base_seq.next();
+            return Some(slot.payload);
         }
-        let slot = self.slots.pop_front().flatten().expect("occupied");
-        trace!(
-            seq = self.base_seq.value(),
-            len = slot.payload.len(),
-            "TSBPD release"
-        );
-        self.base_seq = self.base_seq.next();
-        Some(slot.payload)
     }
 
     /// Earliest instant the receiver needs waking (ACK tick, NAK tick, or
@@ -1558,5 +1643,248 @@ mod tests {
         assert_eq!(r.stats().pkts_dropped, 1);
         // Loss list emptied by the skip → back to the ACK tick.
         assert_eq!(r.next_deadline(t0 + ms(122)), Some(t0 + ms(125)));
+    }
+
+    // ---- undecryptable packets (encryption.md §9.4) ----
+
+    fn undec(seq: u32, ts_us: u32) -> DataPacket {
+        DataPacket {
+            encryption: EncryptionFlags::Even,
+            ..data(seq, ts_us)
+        }
+    }
+
+    #[test]
+    fn undecryptable_is_acked_and_skipped_at_delivery() {
+        let t0 = Instant::now();
+        let mut r = rx(t0);
+        r.handle_data(t0, data(ISN, 0));
+        r.handle_undecryptable(t0 + ms(1), undec(ISN + 1, 1_000));
+        r.handle_data(t0 + ms(2), data(ISN + 2, 2_000));
+
+        // Contiguous arrivals: nothing enters the loss list, no NAK.
+        assert!(naks(&drain(&mut r, t0 + ms(2))).is_empty());
+        assert_eq!(r.stats().pkts_lost, 0);
+
+        // The undecryptable packet occupies its slot and is ACKed like any
+        // other arrival: the full ACK covers the whole run.
+        r.on_timer(t0 + ms(10));
+        assert_eq!(
+            acks(&drain(&mut r, t0 + ms(10)))[0].1.last_ack_seq,
+            SeqNumber::new(ISN + 3)
+        );
+
+        // ISN delivers on time; ISN+1 is freed (never delivered) at its
+        // own deadline; ISN+2 still delivers exactly at its deadline.
+        assert_eq!(r.poll_deliver(t0 + LATENCY), Some(vec![ISN as u8]));
+        assert_eq!(r.poll_deliver(t0 + LATENCY + ms(1)), None);
+        assert_eq!(
+            r.poll_deliver(t0 + LATENCY + ms(2)),
+            Some(vec![(ISN + 2) as u8])
+        );
+        assert_eq!(r.undecrypted_count(), 1);
+        assert_eq!(r.stats().pkts_dropped, 1); // folded into the drop count
+        assert_eq!(r.stats().pkts_recv, 3);
+    }
+
+    #[test]
+    fn mixed_decryptable_undecryptable_interleave() {
+        let t0 = Instant::now();
+        let mut r = rx(t0);
+        // Even offsets decrypt, odd ones do not (e.g. wrong-key bursts).
+        for i in 0 .. 6u32 {
+            if i % 2 == 0 {
+                r.handle_data(t0, data(ISN + i, i * 1_000));
+            } else {
+                r.handle_undecryptable(t0, undec(ISN + i, i * 1_000));
+            }
+        }
+        assert!(naks(&drain(&mut r, t0)).is_empty());
+        assert_eq!(r.stats().pkts_lost, 0);
+        assert_eq!(r.undecrypted_count(), 3);
+
+        // Full ACK covers the whole contiguous run.
+        r.on_timer(t0 + ms(10));
+        assert_eq!(
+            acks(&drain(&mut r, t0 + ms(10)))[0].1.last_ack_seq,
+            SeqNumber::new(ISN + 6)
+        );
+
+        // Only decryptable payloads come out, each at its own deadline;
+        // undecryptable ones are freed as their play time passes.
+        let mut out = Vec::new();
+        for i in 0 .. 6u64 {
+            if let Some(p) = r.poll_deliver(t0 + LATENCY + ms(i)) {
+                out.push(p);
+            }
+        }
+        assert_eq!(
+            out,
+            vec![vec![ISN as u8], vec![(ISN + 2) as u8], vec![(ISN + 4) as u8]]
+        );
+        assert_eq!(r.stats().pkts_dropped, 3);
+    }
+
+    #[test]
+    fn undecrypted_counter_is_monotonic() {
+        let t0 = Instant::now();
+        let mut r = rx(t0);
+        assert_eq!(r.undecrypted_count(), 0);
+        r.handle_undecryptable(t0, undec(ISN, 0));
+        assert_eq!(r.undecrypted_count(), 1);
+        // A duplicate undecryptable arrival is discarded before it can
+        // occupy a slot and does not count (libsrt pktRcvUndecrypt ticks
+        // only after a successful buffer insert).
+        r.handle_undecryptable(t0 + ms(1), undec(ISN, 0));
+        assert_eq!(r.undecrypted_count(), 1);
+        r.handle_undecryptable(t0 + ms(2), undec(ISN + 1, 1_000));
+        assert_eq!(r.undecrypted_count(), 2);
+        // Decryptable traffic never touches the counter.
+        r.handle_data(t0 + ms(3), data(ISN + 2, 2_000));
+        assert_eq!(r.undecrypted_count(), 2);
+    }
+
+    /// libsrt increments `pktRcvUndecrypt` only after the unit is
+    /// successfully inserted into the receive buffer (core.cpp
+    /// `processData`): belated packets, duplicates and overflow drops are
+    /// rejected before decrypt is ever attempted. The counter must match —
+    /// a duplicating network path or a very late arrival during a
+    /// key-mismatch window (§8 rows 4/11) must not inflate
+    /// `undecrypted_count` past the sequence slots actually affected.
+    #[test]
+    fn undecrypted_ignores_belated_duplicate_and_overflow_arrivals() {
+        let t0 = Instant::now();
+        let mut r = Receiver::new(
+            t0,
+            ReceiverConfig {
+                initial_seq: SeqNumber::new(ISN),
+                rcv_latency: LATENCY,
+                buffer_pkts: 4,
+            },
+        );
+        // Occupies its slot: counts.
+        r.handle_undecryptable(t0, undec(ISN, 0));
+        assert_eq!(r.undecrypted_count(), 1);
+        // Duplicate of an occupied slot: discarded, not counted.
+        r.handle_undecryptable(t0 + ms(1), undec(ISN, 0));
+        assert_eq!(r.undecrypted_count(), 1);
+        // Beyond capacity while the buffer is non-empty: dropped, not
+        // counted (and no sequence discrepancy — a slot is occupied).
+        r.handle_undecryptable(t0 + ms(2), undec(ISN + 7, 7_000));
+        assert_eq!(r.undecrypted_count(), 1);
+        assert!(!r.sequence_discrepancy());
+        // Free the slot at its play time (dropped undelivered), then the
+        // same sequence arrives again: belated, not counted.
+        assert_eq!(r.poll_deliver(t0 + LATENCY + ms(1)), None);
+        assert_eq!(r.stats().pkts_dropped, 1);
+        r.handle_undecryptable(t0 + LATENCY + ms(2), undec(ISN, 0));
+        assert_eq!(r.undecrypted_count(), 1);
+        assert_eq!(r.stats().pkts_belated, 1);
+        // Every arrival still counts as received; only the undecrypt
+        // counter is gated on occupying a slot.
+        assert_eq!(r.stats().pkts_recv, 4);
+    }
+
+    #[test]
+    fn rexmit_arriving_undecryptable_fills_loss_list() {
+        let t0 = Instant::now();
+        let mut r = rx(t0);
+        r.handle_data(t0, data(ISN, 0));
+        r.handle_data(t0, data(ISN + 2, 2_000)); // hole: ISN+1
+        assert_eq!(
+            naks(&drain(&mut r, t0)),
+            vec![vec![range(ISN + 1, ISN + 1)]]
+        );
+
+        // The retransmission arrives but does not decrypt (e.g. sent under
+        // a refresh SEK this receiver never got): it must still fill the
+        // loss — the hole is occupied now and never NAKed again.
+        let mut pkt = undec(ISN + 1, 1_000);
+        pkt.retransmitted = true;
+        r.handle_undecryptable(t0 + ms(5), pkt);
+        assert_eq!(r.undecrypted_count(), 1);
+
+        // No periodic NAK ever again; the ACK moves past everything.
+        let mut all_acks = Vec::new();
+        for k in 1 ..= 60 {
+            let t = t0 + ms(k * 10);
+            r.on_timer(t);
+            let ctl = drain(&mut r, t);
+            assert!(
+                naks(&ctl).is_empty(),
+                "NAK after undecryptable fill at {}ms",
+                k * 10
+            );
+            all_acks.extend(acks(&ctl));
+        }
+        assert_eq!(all_acks[0].1.last_ack_seq, SeqNumber::new(ISN + 3));
+
+        // Delivery: ISN and ISN+2 only; the filled-but-undecryptable slot
+        // is freed as a drop in the same scan.
+        let t = t0 + ms(700);
+        assert_eq!(r.poll_deliver(t), Some(vec![ISN as u8]));
+        assert_eq!(r.poll_deliver(t), Some(vec![(ISN + 2) as u8]));
+        assert_eq!(r.poll_deliver(t), None);
+        assert_eq!(r.stats().pkts_dropped, 1);
+    }
+
+    #[test]
+    fn gap_revealed_by_undecryptable_is_never_naked() {
+        let t0 = Instant::now();
+        let mut r = rx(t0);
+        r.handle_data(t0, data(ISN, 0));
+        // ISN+1..ISN+2 never arrive and the packet revealing the gap does
+        // not decrypt → loss detection is suppressed (§9.4): no loss
+        // entry, no immediate NAK, no periodic NAK later — the receive
+        // cursor advances past the gap unconditionally.
+        r.handle_undecryptable(t0 + ms(3), undec(ISN + 3, 3_000));
+        assert!(naks(&drain(&mut r, t0 + ms(3))).is_empty());
+        assert_eq!(r.stats().pkts_lost, 0);
+
+        let mut all_acks = Vec::new();
+        for k in 1 ..= 45 {
+            let t = t0 + ms(k * 10);
+            r.on_timer(t);
+            let ctl = drain(&mut r, t);
+            assert!(naks(&ctl).is_empty(), "NAK at {}ms", k * 10);
+            all_acks.extend(acks(&ctl));
+        }
+        // The ACK covers the suppressed gap immediately.
+        assert_eq!(all_acks[0].1.last_ack_seq, SeqNumber::new(ISN + 4));
+
+        // Delivery: ISN, then the two-hole gap and the undecryptable
+        // packet are all skipped in one scan at its play time.
+        assert_eq!(r.poll_deliver(t0 + LATENCY), Some(vec![ISN as u8]));
+        assert_eq!(r.poll_deliver(t0 + LATENCY + ms(3)), None);
+        assert_eq!(r.stats().pkts_dropped, 3);
+        assert_eq!(r.undecrypted_count(), 1);
+    }
+
+    #[test]
+    fn undecryptable_only_stream_drains_without_discrepancy() {
+        let t0 = Instant::now();
+        let mut r = Receiver::new(
+            t0,
+            ReceiverConfig {
+                initial_seq: SeqNumber::new(ISN),
+                rcv_latency: LATENCY,
+                buffer_pkts: 4,
+            },
+        );
+        // Wrong-passphrase survivors (§8 rows 4/7/11): every packet is
+        // undecryptable, forever. Slots must be freed at play time so the
+        // buffer drains, the ACK position keeps advancing, and the
+        // connection never wedges into a sequence discrepancy.
+        for i in 0 .. 16u32 {
+            let t = t0 + ms(i as u64 * 40);
+            r.handle_undecryptable(t, undec(ISN + i, i * 40_000));
+            assert_eq!(r.poll_deliver(t), None); // frees everything due
+            assert!(!r.sequence_discrepancy(), "wedged at packet {i}");
+        }
+        assert_eq!(r.undecrypted_count(), 16);
+        // Packets 0..=12 were due (latency 120 ms = 3 packet intervals)
+        // and freed as drops; the last three are still buffered.
+        assert_eq!(r.stats().pkts_dropped, 13);
+        assert_eq!(r.stats().pkts_lost, 0);
     }
 }

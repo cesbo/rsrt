@@ -1,12 +1,14 @@
 //! SRT (Secure Reliable Transport) protocol library.
 //!
 //! Live transmission mode over UDP with TSBPD, ARQ and too-late packet
-//! drop; caller and listener modes; HSv5 handshake; interoperable with
-//! libsrt 1.4.4 (`srt-live-transmit`). No rendezvous mode, no
-//! file/messaging mode, no encryption (encrypted peers are rejected).
+//! drop; caller and listener modes; HSv5 handshake; AES-128/192/256-CTR
+//! encryption (HaiCrypt) with passphrase key material and in-stream key
+//! refresh; interoperable with libsrt 1.4.4 (`srt-live-transmit`). No
+//! rendezvous mode, no file/messaging mode.
 //!
 //! Layering (see ARCHITECTURE.md):
 //! - [`packet`] — pure wire codec;
+//! - [`crypto`] — sans-I/O HaiCrypt engine (keys, KM messages, AES-CTR);
 //! - [`core`] — sans-I/O connection state machine;
 //! - crate root — tokio-based runtime and public API.
 //!
@@ -34,6 +36,7 @@
 #![deny(unsafe_code)]
 
 pub mod core;
+pub mod crypto;
 pub mod packet;
 
 mod error;
@@ -44,6 +47,7 @@ mod socket;
 
 pub use self::{
     core::Stats,
+    crypto::KeyLength,
     error::{
         CloseReason,
         SrtError,

@@ -344,6 +344,11 @@ fn load<T: Copy>(slot: &Mutex<T>) -> T {
 fn connect_error(reason: CloseReason) -> SrtError {
     match reason {
         CloseReason::ConnectTimeout => SrtError::ConnectTimeout,
+        // Encryption mismatch rejections (encryption.md §8.1): BADSECRET =
+        // wrong passphrase (from the listener), UNSECURE = a passphrase
+        // on one side only — also the caller's local abort code, even for
+        // a bad secret (§6.1).
+        CloseReason::Rejected(reject::BADSECRET) => SrtError::WrongPassphrase,
         CloseReason::Rejected(reject::UNSECURE) => SrtError::EncryptionUnsupported,
         CloseReason::Rejected(code) => SrtError::Rejected(code),
         other => SrtError::Closed(other),
@@ -373,8 +378,10 @@ impl SrtSocket {
     /// returns an established socket.
     ///
     /// Errors: [`SrtError::ConnectTimeout`], [`SrtError::Rejected`],
-    /// [`SrtError::EncryptionUnsupported`], [`SrtError::NoIpv4Address`],
-    /// [`SrtError::StreamIdTooLong`], [`SrtError::Io`].
+    /// [`SrtError::EncryptionUnsupported`], [`SrtError::WrongPassphrase`],
+    /// [`SrtError::InvalidPassphrase`], [`SrtError::InvalidKmParameters`],
+    /// [`SrtError::NoIpv4Address`], [`SrtError::StreamIdTooLong`],
+    /// [`SrtError::Io`].
     pub async fn connect(
         addr: impl ToSocketAddrs,
         opts: SrtOptions,
@@ -382,6 +389,11 @@ impl SrtSocket {
         if opts.streamid.as_ref().is_some_and(|s| s.len() > 512) {
             return Err(SrtError::StreamIdTooLong);
         }
+        // Fail fast on invalid encryption options (encryption.md §2),
+        // before any I/O: the handshake FSM consumes `crypto_config()`
+        // internally and would otherwise fail closed without a
+        // user-visible reason.
+        opts.crypto_config()?;
         let remote = net::resolve_v4(addr).await?;
         let udp = net::bind_udp(
             SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
@@ -566,9 +578,16 @@ mod tests {
             connect_error(CloseReason::ConnectTimeout),
             SrtError::ConnectTimeout
         ));
+        // Encryption mismatches map to their own errors (encryption.md
+        // §8.1): UNSECURE (1011) = passphrase on one side only, BADSECRET
+        // (1010) = wrong passphrase.
         assert!(matches!(
             connect_error(CloseReason::Rejected(reject::UNSECURE)),
             SrtError::EncryptionUnsupported
+        ));
+        assert!(matches!(
+            connect_error(CloseReason::Rejected(reject::BADSECRET)),
+            SrtError::WrongPassphrase
         ));
         assert!(matches!(
             connect_error(CloseReason::Rejected(reject::BACKLOG)),
@@ -578,6 +597,30 @@ mod tests {
             connect_error(CloseReason::PeerIdle),
             SrtError::Closed(CloseReason::PeerIdle)
         ));
+    }
+
+    /// Invalid encryption options fail `connect` before any I/O: the
+    /// target here cannot resolve, so reaching resolution would surface
+    /// an [`SrtError::Io`] instead of the validation error.
+    #[tokio::test]
+    async fn connect_validates_crypto_options_before_io() {
+        // Passphrase below the 10-byte minimum (encryption.md §2).
+        let opts = SrtOptions::default().passphrase("short");
+        let e = SrtSocket::connect(("host.invalid.", 1), opts)
+            .await
+            .err()
+            .expect("invalid passphrase must fail connect");
+        assert!(matches!(e, SrtError::InvalidPassphrase), "{e:?}");
+
+        // km_preannounce > (km_refresh_rate - 1) / 2 (encryption.md §2).
+        let mut opts = SrtOptions::default().passphrase("0123456789");
+        opts.km_refresh_rate = Some(10);
+        opts.km_preannounce = Some(9);
+        let e = SrtSocket::connect(("host.invalid.", 1), opts)
+            .await
+            .err()
+            .expect("invalid km parameters must fail connect");
+        assert!(matches!(e, SrtError::InvalidKmParameters(_)), "{e:?}");
     }
 
     #[test]

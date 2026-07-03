@@ -10,6 +10,8 @@
 //! Query parameters:
 //!   ?latency=<ms>      TSBPD latency, milliseconds (default 120)
 //!   ?streamid=<s>      StreamID to announce when calling (ignored when listening)
+//!   ?passphrase=<pw>   enable AES encryption, 10..80 characters (default off)
+//!   ?pbkeylen=<n>      AES key length, bytes: 16, 24 or 32 (default 16)
 //! ```
 //!
 //! Payloads go to `output-file` (stdout if omitted); a stats line goes to
@@ -37,6 +39,7 @@ use std::{
 };
 
 use srt::{
+    KeyLength,
     SrtListener,
     SrtOptions,
     SrtSocket,
@@ -77,6 +80,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 opts.peer_latency = Duration::from_millis(ms);
             }
             "streamid" => opts.streamid = Some(value.clone()),
+            // Length is validated by connect/bind (10..80 bytes).
+            "passphrase" => opts.passphrase = Some(value.clone().into()),
+            "pbkeylen" => {
+                // Bytes, like SRTO_PBKEYLEN: 16, 24 or 32.
+                let n: usize = value
+                    .parse()
+                    .map_err(|_| format!("invalid pbkeylen {value:?}"))?;
+                let len = KeyLength::from_bytes(n)
+                    .ok_or_else(|| format!("pbkeylen must be 16, 24 or 32, got {value:?}"))?;
+                opts.pbkeylen = Some(len);
+            }
             other => eprintln!("recv: ignoring unknown parameter {other:?}"),
         }
     }
@@ -183,6 +197,7 @@ fn usage() -> ! {
     eprintln!("usage: recv <srt-url> [output-file]");
     eprintln!("  srt://host:port[?latency=<ms>][&streamid=<s>]   connect (caller)");
     eprintln!("  srt://:port  or  srt://0.0.0.0:port             listen, accept one");
+    eprintln!("  encryption:  [&passphrase=<pw>][&pbkeylen=<16|24|32>]");
     std::process::exit(2);
 }
 

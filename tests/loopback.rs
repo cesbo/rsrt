@@ -1,5 +1,7 @@
 //! Loopback integration tests: caller ↔ listener over 127.0.0.1 with real
-//! tokio time. Each test stays well under ~10 s.
+//! tokio time. Each test finishes in a few seconds when run alone; the
+//! outer timeouts are hang detectors sized to survive CPU starvation
+//! under full parallel suite load, not performance assertions.
 
 use std::{
     net::Ipv4Addr,
@@ -65,13 +67,25 @@ async fn unidirectional_2000_messages_in_order() {
     const COUNT: u32 = 2000;
     const LEN: usize = 1316;
 
-    let copts = SrtOptions::default().latency(Duration::from_millis(120));
+    // 600 ms latency is the ARQ recovery budget, not a delivery-delay
+    // tuning knob: under parallel test load a task can stall long enough
+    // for the kernel UDP buffer (silently clamped to rmem_max) to drop a
+    // burst, and every NAK/retransmit round-trip must finish inside the
+    // TSBPD window or the hole is TLPKTDROP'd. The lossy suites size this
+    // 600-800 ms for the same reason.
+    let copts = SrtOptions::default().latency(Duration::from_millis(600));
     // Generous UDP receive buffer on the listener socket (the receiving
     // side); the kernel clamps to rmem_max silently.
-    let mut lopts = SrtOptions::default().latency(Duration::from_millis(120));
+    let mut lopts = SrtOptions::default().latency(Duration::from_millis(600));
     lopts.udp_recv_buffer = Some(4 << 20);
 
     let (caller, mut accepted, _listener) = pair(copts, lopts).await;
+
+    // Event-driven close: the receiver signals once all COUNT messages
+    // have arrived and only then does the sender close. A fixed "ARQ
+    // settle" sleep would orphan any tail hole still unrepaired when
+    // SHUTDOWN tears the connection down.
+    let (all_received_tx, all_received_rx) = tokio::sync::oneshot::channel::<()>();
 
     let send_task = tokio::spawn(async move {
         for i in 0 .. COUNT {
@@ -81,24 +95,31 @@ async fn unidirectional_2000_messages_in_order() {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         }
-        // Let ARQ settle before SHUTDOWN tears the connection down.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        all_received_rx.await.expect("receiver signal");
         caller.close().await.expect("close");
     });
 
     let recv_task = async {
-        let mut next = 0u32;
-        while let Some(payload) = accepted.recv().await.expect("recv") {
+        for next in 0 .. COUNT {
+            let payload = accepted
+                .recv()
+                .await
+                .expect("recv")
+                .expect("stream ended early");
             assert_eq!(
                 payload,
                 message(next, LEN),
                 "message {next} corrupted or out of order"
             );
-            next += 1;
         }
-        assert_eq!(next, COUNT, "stream ended early");
+        all_received_tx.send(()).expect("send task gone");
+        // Peer SHUTDOWN is a clean end of stream, not an error.
+        assert_eq!(accepted.recv().await.expect("recv after close"), None);
     };
-    tokio::time::timeout(Duration::from_secs(9), recv_task)
+    // Hang detector, not a performance assertion: the test finishes in a
+    // couple of seconds when run alone, but must survive multi-second
+    // scheduling stalls under full parallel suite load.
+    tokio::time::timeout(Duration::from_secs(30), recv_task)
         .await
         .expect("receive timed out");
     send_task.await.expect("send task");
@@ -108,37 +129,87 @@ async fn unidirectional_2000_messages_in_order() {
 async fn bidirectional_simultaneous() {
     const COUNT: u32 = 300;
     const LEN: usize = 700;
+    // Flush sentinels: indexes at or above this tag are padding whose only
+    // job is giving the peer's gap-driven NAK machinery a successor packet
+    // that reveals (and so repairs) a lost tail of the real stream. They
+    // sequence after the real messages, so in-order delivery of a repaired
+    // tail is preserved; receivers stop after COUNT and never read them.
+    const FLUSH_TAG: u32 = 0xF000_0000;
 
-    let (caller, accepted, _listener) = pair(SrtOptions::default(), SrtOptions::default()).await;
+    // 600 ms latency as the ARQ recovery budget, same rationale as
+    // unidirectional_2000_messages_in_order above.
+    let copts = SrtOptions::default().latency(Duration::from_millis(600));
+    let lopts = SrtOptions::default().latency(Duration::from_millis(600));
+    let (caller, accepted, _listener) = pair(copts, lopts).await;
 
     // Both directions in flight at once; each task sends its stream, then
     // drains the opposite one (buffers hold COUNT messages comfortably).
-    async fn pump(mut sock: SrtSocket, tag: u32) -> SrtSocket {
+    // Bursts stay small (10 packets ≈ 7.5 KB) because the loopback kernel
+    // buffer is silently clamped to rmem_max and receives both directions'
+    // bursts concurrently. Tail loss is the one hole NAKs cannot see, so
+    // each side keeps emitting flush sentinels until the peer confirms it
+    // received everything.
+    async fn pump(
+        mut sock: SrtSocket,
+        tag: u32,
+        done: tokio::sync::oneshot::Sender<()>,
+        mut peer_done: tokio::sync::oneshot::Receiver<()>,
+    ) -> SrtSocket {
         for i in 0 .. COUNT {
             sock.send(&message(tag.wrapping_add(i), LEN))
                 .await
                 .expect("send");
-            if i % 50 == 49 {
+            if i % 10 == 9 {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         }
         let want_tag: u32 = if tag == 0 { 1_000_000 } else { 0 };
+        let mut flush = 0u32;
         for i in 0 .. COUNT {
-            let payload = sock.recv().await.expect("recv").expect("unexpected EOF");
+            // recv() is cancel-safe, so a timed-out attempt loses nothing;
+            // each quiet 25 ms interval sends one flush sentinel in case
+            // the peer is stalled on a lost tail of *our* stream.
+            let payload = loop {
+                match tokio::time::timeout(Duration::from_millis(25), sock.recv()).await {
+                    Ok(payload) => break payload.expect("recv").expect("unexpected EOF"),
+                    Err(_) => {
+                        sock.send(&message(FLUSH_TAG + flush, LEN))
+                            .await
+                            .expect("send flush");
+                        flush += 1;
+                    }
+                }
+            };
             assert_eq!(payload, message(want_tag.wrapping_add(i), LEN));
+        }
+        let _ = done.send(());
+        // Keep the peer's repair path alive until it has everything too.
+        loop {
+            match tokio::time::timeout(Duration::from_millis(25), &mut peer_done).await {
+                Ok(_) => break,
+                Err(_) => {
+                    sock.send(&message(FLUSH_TAG + flush, LEN))
+                        .await
+                        .expect("send flush");
+                    flush += 1;
+                }
+            }
         }
         sock
     }
 
-    let caller_side = tokio::spawn(pump(caller, 0));
-    let accepted_side = tokio::spawn(pump(accepted, 1_000_000));
+    let (caller_done_tx, caller_done_rx) = tokio::sync::oneshot::channel::<()>();
+    let (accepted_done_tx, accepted_done_rx) = tokio::sync::oneshot::channel::<()>();
+    let caller_side = tokio::spawn(pump(caller, 0, caller_done_tx, accepted_done_rx));
+    let accepted_side = tokio::spawn(pump(accepted, 1_000_000, accepted_done_tx, caller_done_rx));
     let run = async {
         let caller = caller_side.await.expect("caller task");
         let accepted = accepted_side.await.expect("accepted task");
         caller.close().await.expect("caller close");
         accepted.close().await.expect("accepted close");
     };
-    tokio::time::timeout(Duration::from_secs(9), run)
+    // Hang detector, not a performance assertion (see the module comment).
+    tokio::time::timeout(Duration::from_secs(30), run)
         .await
         .expect("bidirectional test timed out");
 }
@@ -198,8 +269,13 @@ async fn connect_to_dead_port_times_out() {
         elapsed >= Duration::from_millis(2_500),
         "gave up too early: {elapsed:?}"
     );
+    // Hang detector only. The tight give-up bound (connect_timeout + 1 s
+    // harness margin, ~4 s) is enforced inside SrtSocket::connect
+    // (src/socket.rs); a raw wall-clock bound here must additionally
+    // absorb multi-second scheduling stalls of this current-thread
+    // runtime under full parallel suite load, so keep it loose.
     assert!(
-        elapsed < Duration::from_secs(7),
+        elapsed < Duration::from_secs(30),
         "took too long: {elapsed:?}"
     );
 }

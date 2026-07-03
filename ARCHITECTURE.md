@@ -1,25 +1,31 @@
 # srt - SRT (Secure Reliable Transport) protocol library for Rust
 
 **Scope**: caller and listener modes, HSv5 handshake, live transmission mode with
-TSBPD (timestamp-based packet delivery), ARQ (ACK/NAK/retransmission), TLPKTDROP.
+TSBPD (timestamp-based packet delivery), ARQ (ACK/NAK/retransmission), TLPKTDROP,
+AES-CTR encryption (HaiCrypt: passphrase key exchange in the handshake, in-stream
+key refresh).
 
-**Out of scope**: rendezvous mode, file/messaging mode, encryption (connections
-requiring crypto are rejected cleanly), bonding/groups, packet filter/FEC.
+**Out of scope**: rendezvous mode, file/messaging mode, AES-GCM, bonding/groups,
+packet filter/FEC.
 
 Protocol reference: `docs/spec/*.md` (condensed from the IETF draft and libsrt docs).
 
 ## Layer model
 
-The crate is split into three layers. Lower layers never depend on higher ones.
+The crate is split into four layers. Lower layers never depend on higher ones.
 
 ```
 ┌───────────────────────────────────────────────────────────┐
-│ 3. runtime (tokio)          src/socket.rs  src/listener.rs │
+│ 4. runtime (tokio)          src/socket.rs  src/listener.rs │
 │    UDP I/O, driver tasks, timers, channels, public API     │
 ├───────────────────────────────────────────────────────────┤
-│ 2. core (sans-I/O)          src/core/                      │
-│    connection state machine, handshake FSM, sender,        │
-│    receiver (TSBPD/loss/ACK-NAK), time base                │
+│ 3. core (sans-I/O)          src/core/                      │
+│    connection state machine, handshake FSM + KMX policy,   │
+│    sender, receiver (TSBPD/loss/ACK-NAK), time base        │
+├───────────────────────────────────────────────────────────┤
+│ 2. crypto (sans-I/O)        src/crypto/                    │
+│    HaiCrypt engine: key material, KM message codec,        │
+│    AES-CTR payload cipher, key-refresh state machine       │
 ├───────────────────────────────────────────────────────────┤
 │ 1. packet codec (pure)      src/packet/                    │
 │    wire (de)serialization of data & control packets,       │
@@ -41,15 +47,44 @@ Pure functions and types; **no I/O, no `Instant`, no allocation-free ambition**
 - `data.rs` — `DataPacket` (all header flags + payload).
 - `control.rs` — `ControlPacket` = timestamp + dst socket id + `ControlType`
   enum (Handshake, KeepAlive, Ack, Nak, Shutdown, AckAck, DropRequest,
-  PeerError, CongestionWarning). CIF codecs for ACK (full/light/small), NAK
-  (singles + MSB ranges), DROPREQ.
+  PeerError, CongestionWarning, KmReq/KmRsp for in-stream key refresh). CIF
+  codecs for ACK (full/light/small), NAK (singles + MSB ranges), DROPREQ.
 - `handshake.rs` — `HandshakeCif` and extension list codec (HSREQ/HSRSP flags,
   StreamID with its per-word byte reversal, KM passthrough as opaque bytes).
 - `mod.rs` — `Packet` enum, top-level `parse`/`encode`, `PacketError`.
 
-All multi-byte fields are network byte order (big-endian) on the wire.
+All multi-byte fields are network byte order (big-endian) on the wire — with
+one deliberate exception: KM blobs are raw byte strings, passed through
+without the per-word swap (docs/spec/encryption.md §5). The packet layer
+stays crypto-agnostic: it carries KK bits and opaque KM bytes, nothing more.
 
-### Layer 2 — core (`src/core/`)
+### Layer 2 — crypto (`src/crypto/`)
+
+The HaiCrypt encryption engine, between the codec and the connection logic:
+`core` composes it, `packet` knows nothing about it. Sans-I/O like `core` —
+no sockets, no clock of its own (refresh pacing takes `now: Instant` from
+the caller), fully unit-testable with fixed keys and a fake clock. Protocol
+reference: `docs/spec/encryption.md`.
+
+- `keys.rs` — SEK/KEK key material (zeroized on drop), PBKDF2-HMAC-SHA1 KEK
+  derivation from the passphrase, RFC 3394 AES key wrap/unwrap (the unwrap
+  integrity check is the protocol's only wrong-passphrase detector).
+- `km.rs` — KM message codec (the §3 byte layout) and the 1-word failure
+  KMRSP (little-endian on the wire, encryption.md §5.1).
+- `ctr.rs` — per-packet AES-CTR keystream; IV built from the KM salt XOR
+  the packet sequence number (encryption.md §9.2).
+- `context.rs` — `Crypto`, the per-connection engine: initiator/responder
+  KMX, even/odd SEK slots with KK-bit routing, ACK-driven TX key refresh
+  (pre-announce → switch → decommission), payload encrypt/decrypt.
+
+**Policy stays in core.** `crypto` reports outcomes (unwrap ok / wrong
+secret / malformed, the resulting KM states) but never decides to reject or
+keep a connection: the encryption.md §8 enforcement matrix is applied by
+`core::handshake` (reject vs continue-unsecured at KMX time) and
+`core::Connection` (in-stream refresh handling, undecryptable-packet
+accounting). Key material never appears in logs — lengths and states only.
+
+### Layer 3 — core (`src/core/`)
 
 Sans-I/O: driven entirely by explicit inputs — incoming packets, the current
 `Instant`, and API calls. Produces outputs via poll methods. Never sleeps,
@@ -62,9 +97,13 @@ This makes every protocol rule unit-testable with a fake clock.
 - `handshake.rs` — `CallerHandshake` FSM (induction → conclusion → established,
   250 ms retransmit, 3 s overall timeout) and `Listener` responder (stateless
   SYN-cookie induction replies; on valid conclusion produces a `Negotiated`).
+  Both run KMX per the encryption.md §8 matrix: the caller attaches its KMREQ
+  to the conclusion and judges the KMRSP; the listener unwraps and echoes.
   `Negotiated` carries everything the established connection needs: peer socket
   id, initial seqs both directions, effective snd/rcv latency, peer idle
-  timeout, stream id, agreed MSS/flow window.
+  timeout, stream id, agreed MSS/flow window, and the seeded `crypto::Crypto`
+  engine (`None` for unencrypted connections; the struct is intentionally not
+  `Clone` — it owns key material).
 - `sender.rs` — `Sender`: send buffer (seq-indexed), seq/msg-number assignment,
   ACK release + ACKACK reply, NAK-driven retransmission (REXMIT flag),
   too-late packet drop (emits DROPREQ), in-flight window limiting.
@@ -73,16 +112,18 @@ This makes every protocol rule unit-testable with a fake clock.
   RTT estimation (7/8 smoothing), DROPREQ handling, TSBPD release queue with
   too-late skip, timestamp-wrap handling via `TimestampExtender`.
 - `mod.rs` — `Connection`: owns the state (Connecting/Established/Closed),
-  composes handshake+sender+receiver, dispatches packets, runs timers
-  (keepalive 1 s, peer idle 5 s), handles Shutdown. Interface pattern
-  (quinn-proto style):
+  composes handshake+sender+receiver (plus the `Negotiated` crypto engine:
+  encrypt once at first transmission, decrypt by KK bits, drop-and-count
+  undecryptable packets without NAKing, drive ACK-paced key refresh),
+  dispatches packets, runs timers (keepalive 1 s, peer idle 5 s), handles
+  Shutdown. Interface pattern (quinn-proto style):
   - inputs: `handle_packet(now, pkt)`, `handle_timer(now)`, `send(now, &[u8])`,
     `close(now)`
   - outputs: `poll_transmit() -> Option<Packet>` (drain queue),
     `poll_deliver(now) -> Option<Vec<u8>>` (TSBPD-released payloads),
   - scheduling: `next_deadline(now) -> Option<Instant>` (min over all timers).
 
-### Layer 3 — runtime (`src/socket.rs`, `src/listener.rs`)
+### Layer 4 — runtime (`src/socket.rs`, `src/listener.rs`)
 
 tokio integration and the public API. One **driver task** per connection loops:
 
@@ -109,8 +150,11 @@ then: drain poll_transmit -> socket.send_to, drain poll_deliver -> data mpsc
 
 ## Conventions
 
-- Zero new external dependencies. `tracing` for logs (`trace!` per packet,
-  `debug!` for state transitions, `warn!` for protocol anomalies).
+- No new external dependencies beyond the pure-Rust RustCrypto stack that
+  backs `src/crypto/` (`aes`, `ctr`, `aes-kw`, `pbkdf2`, `sha1`, `zeroize`,
+  `getrandom`). `tracing` for logs (`trace!` per packet, `debug!` for state
+  transitions, `warn!` for protocol anomalies) — never key material,
+  passphrases, salts or KM blob contents.
 - No `unsafe`.
 - Errors: one public `SrtError` in `src/error.rs`.
 - Every module carries unit tests in-file (`#[cfg(test)] mod tests`).

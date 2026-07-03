@@ -196,3 +196,41 @@ each other everywhere they overlap. Findings below.
 - **Flags `0x2005`-style mistakes:** in the CONCLUSION Extension Field, set only
   bits for blocks actually attached (HSREQ `0x1` mandatory; `ext_flags == 0` and
   bit-without-block are both ROGUE rejections).
+
+## 5. Encryption traps
+
+Full normative encryption spec: `encryption.md` (KM wire format, PBKDF2/key wrap,
+CTR IV, KMX handshake flows, enforcement matrix, refresh state machine, traps).
+Pointers only — details live there:
+
+- **1-word error KMRSP is little-endian on the wire** (sender host order;
+  BADSECRET = `04 00 00 00`) — `encryption.md` §5.1. This *corrects* §1.2 above
+  and `packets.md` §5.10, which say "big-endian" (wire-verified against a real
+  1.4.4 listener; `UNSECURED = 0` masks the difference).
+- KM blob rides as raw natural-order bytes on both carriers; success-KMRSP is a
+  byte-exact echo validated by `memcmp` — `encryption.md` §5, §6.3.
+- PBKDF2 uses only the **last 8 bytes** of the 16-byte salt; dual-SEK wrap is
+  even-key-first — `encryption.md` §4.
+- IV = salt[0..13] with the BE seqno word XORed at bytes 10..13 — `encryption.md`
+  §9.2.
+- Encrypt once / retransmit ciphertext; undecryptable packets are ACKed then
+  dropped at delivery (and sequence gaps they reveal are **never loss-detected
+  or NAKed** — libsrt gates loss detection on decrypt success); KK=0 always
+  delivered — `encryption.md` §9.3–9.4.
+- A permissive failed-KMX responder with a passphrase sends an **unsolicited
+  in-stream KMREQ** (fake KM) on the first ACK it receives, retried ×10 —
+  `encryption.md` §6.2 step 6.
+- Refresh: pre-announce at RR−PA (dual-SEK KMREQ), switch at RR, decommission at
+  +PA, all evaluated on ACK receipt; mid-stream KMREQ applies to RX only; failed
+  in-stream KMREQ gets **no reply** under default enforcement — `encryption.md`
+  §10–11.
+- Responder silently adopts the KMREQ's key length (never a KLen-mismatch
+  reject); passphrase length is 10..**80** per code (docs say 79) —
+  `encryption.md` §7, §2.
+- **This implementation is always-enforced**: `SRTO_ENFORCEDENCRYPTION=false`
+  (the `encryption.md` §8 permissive rows — 1-word status KMRSPs, fake TX
+  contexts, unsecured connections on mismatch) is intentionally not
+  implemented; every encryption mismatch rejects the connection at handshake
+  time and a failed in-stream KMREQ gets total silence. Permissive peers
+  still interop: the rejection happens before any data flows.
+- Full checklist: `encryption.md` §15 "Traps".

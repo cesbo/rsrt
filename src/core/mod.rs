@@ -56,6 +56,10 @@ pub use self::{
     },
 };
 use crate::{
+    crypto::{
+        Crypto,
+        KmReqOutcome,
+    },
     error::{
         CloseReason,
         SrtError,
@@ -117,6 +121,12 @@ pub struct Stats {
     pub pkts_recv_dropped: u64,
     /// Gaps detected on the receive path.
     pub pkts_recv_lost: u64,
+    /// Undecryptable data packets received (docs/spec/encryption.md §9.4):
+    /// each occupied its sequence slot and was ACKed, but is never delivered.
+    pub undecrypted_pkts: u64,
+    /// Completed TX key switches (docs/spec/encryption.md §10.1): how many
+    /// times the send direction rotated to a refreshed SEK.
+    pub km_refreshes: u64,
     pub rtt_us: u32,
     pub rtt_var_us: u32,
 }
@@ -136,6 +146,9 @@ enum State {
     Established {
         sender: Sender,
         receiver: Receiver,
+        /// Encryption engine seeded by the handshake KMX
+        /// ([`Negotiated::crypto`]); `None` on an unencrypted connection.
+        crypto: Option<Crypto>,
     },
     Closed {
         reason: CloseReason,
@@ -155,9 +168,14 @@ enum State {
 ///   → receiver; SHUTDOWN → close; KEEPALIVE / CONGESTION-WARNING / PEERERROR → refresh liveness,
 ///   log; duplicate CONCLUSION handshake (listener side) → re-send the stored handshake reply;
 ///   undecodable datagrams → log, drop;
-/// - encrypted data packets (KK ≠ None) → drop the packet, connection stays up (packets.md §3.2:
-///   without a crypto context the receiver MUST drop it; libsrt counts it in `rcvUndecrypt` and
-///   discards);
+/// - data decryption (docs/spec/encryption.md §9.4): with a crypto context, payloads are decrypted
+///   in place before the receiver sees them; an undecryptable packet (unkeyed SEK slot, or
+///   KK ≠ None without any crypto context — packets.md §5.10) still occupies its sequence slot and
+///   is ACKed, but is never delivered and never NAK-repaired — the connection stays up;
+/// - key refresh (docs/spec/encryption.md §10, §11): `Crypto::on_ack` runs on the ACK-processing
+///   path and its KMREQs go out as `UMSG_EXT`; incoming in-stream KMREQ/KMRSP feed the crypto
+///   engine, failures answered per the §11.3 policy with total silence (encryption is always
+///   enforced);
 /// - keepalive: send KEEPALIVE after [`KEEPALIVE_INTERVAL`] without any outgoing packet;
 /// - liveness: no packet from the peer for `peer_idle_timeout` → close with
 ///   [`CloseReason::PeerIdle`];
@@ -184,9 +202,6 @@ pub struct Connection {
     /// EXP expiration counter (`EXPCount`); reset to 1 by any received
     /// packet, incremented by each EXP timer expiry.
     exp_count: u32,
-    /// Encrypted (KK ≠ None) data packets dropped — no crypto context here
-    /// (libsrt `rcvUndecrypt` analog); also gates the warn-once log.
-    undecrypted_drops: u64,
     /// Stats snapshot frozen when the connection closed.
     closed_stats: Stats,
 }
@@ -239,7 +254,6 @@ impl Connection {
             last_sent: now,
             last_recv: now,
             exp_count: 1,
-            undecrypted_drops: 0,
             closed_stats: Stats::default(),
         }
     }
@@ -271,22 +285,26 @@ impl Connection {
             remote = %negotiated.remote,
             local = ?negotiated.local_socket_id,
             peer = ?negotiated.peer_socket_id,
+            secured = negotiated.crypto.is_some(),
             "connection accepted (listener)"
         );
         Connection {
-            state: State::Established { sender, receiver },
             remote: negotiated.remote,
             local_socket_id: negotiated.local_socket_id,
             peer_socket_id: negotiated.peer_socket_id,
             timebase,
             streamid: negotiated.streamid.clone(),
+            state: State::Established {
+                sender,
+                receiver,
+                crypto: negotiated.crypto,
+            },
             opts,
             hs_reply: Some(hs_reply.clone()),
             transmit_q: VecDeque::from([hs_reply]),
             last_sent: now,
             last_recv: now,
             exp_count: 1,
-            undecrypted_drops: 0,
             closed_stats: Stats::default(),
         }
     }
@@ -350,7 +368,9 @@ impl Connection {
                 }
                 return;
             }
-            State::Established { sender, receiver } => {
+            State::Established {
+                sender, receiver, ..
+            } => {
                 sender.on_timer(now);
                 receiver.on_timer(now);
 
@@ -405,7 +425,12 @@ impl Connection {
                 pending_send.push_back(payload);
                 Ok(())
             }
-            State::Established { sender, .. } => sender.push(now, payload),
+            // With crypto, the payload is encrypted in place at buffering
+            // time and the KK bits are stored with it — the buffer holds
+            // ciphertext, retransmissions included (encryption.md §9.3).
+            State::Established { sender, crypto, .. } => {
+                sender.push(now, payload, crypto.as_mut())
+            }
             State::Closed { reason, .. } => Err(SrtError::Closed(*reason)),
         }
     }
@@ -473,7 +498,9 @@ impl Connection {
         }
         match &self.state {
             State::Connecting { hs, .. } => hs.next_deadline(),
-            State::Established { sender, receiver } => {
+            State::Established {
+                sender, receiver, ..
+            } => {
                 let mut deadline = receiver
                     .next_deadline(now)
                     .unwrap_or(now + KEEPALIVE_INTERVAL);
@@ -522,7 +549,11 @@ impl Connection {
     pub fn stats(&self) -> Stats {
         match &self.state {
             State::Connecting { .. } => Stats::default(),
-            State::Established { sender, receiver } => merge_stats(sender, receiver),
+            State::Established {
+                sender,
+                receiver,
+                crypto,
+            } => merge_stats(sender, receiver, crypto.as_ref()),
             State::Closed { .. } => self.closed_stats,
         }
     }
@@ -536,29 +567,13 @@ impl Connection {
     }
 
     fn handle_data_packet(&mut self, now: Instant, data: DataPacket) {
-        if data.encryption != EncryptionFlags::None {
-            // No crypto context here (encryption unsupported): the packet
-            // is undecryptable and MUST be dropped, never delivered
-            // (docs/spec/packets.md §3.2, transmission.md §9.5) — libsrt
-            // counts it in rcvUndecrypt and continues. Touching no state
-            // keeps the early_data buffer clean too; the resulting sequence
-            // gap recovers via NAK / TSBPD too-late drop. Warn once, then
-            // trace: a misbehaving peer would otherwise log per-packet.
-            self.undecrypted_drops += 1;
-            if self.undecrypted_drops == 1 {
-                warn!(seq = data.seq.value(), kk = ?data.encryption,
-                    "encrypted data packet dropped (no crypto context); further drops logged at trace");
-            } else {
-                trace!(seq = data.seq.value(), kk = ?data.encryption,
-                    drops = self.undecrypted_drops, "encrypted data packet dropped");
-            }
-            return;
-        }
         let discrepancy = match &mut self.state {
             State::Connecting { early_data, .. } => {
                 // Data can race ahead of the conclusion response
                 // (handshake.md §5.5); buffer a little, drop the rest (NAK
-                // recovery fetches it after establishment).
+                // recovery fetches it after establishment). Encrypted
+                // packets are buffered too: the crypto context arrives with
+                // the negotiated handshake and decrypts them at establish.
                 if early_data.len() < EARLY_DATA_MAX {
                     trace!(
                         seq = data.seq.value(),
@@ -573,8 +588,10 @@ impl Connection {
                 }
                 false
             }
-            State::Established { receiver, .. } => {
-                receiver.handle_data(now, data);
+            State::Established {
+                receiver, crypto, ..
+            } => {
+                ingest_data(now, receiver, crypto.as_mut(), data);
                 receiver.sequence_discrepancy()
             }
             State::Closed { .. } => unreachable!("checked in handle_packet"),
@@ -600,22 +617,41 @@ impl Connection {
                 debug!("congestion warning ignored");
             }
             ControlType::PeerError { code } => warn!(code, "PEERERROR ignored (live mode)"),
+            // In-stream KM refresh KMX (docs/spec/encryption.md §11).
+            ControlType::KmReq(payload) => self.handle_kmreq(&payload),
+            ControlType::KmRsp(payload) => self.handle_kmrsp(&payload),
             other => self.handle_transmission_control(now, other),
         }
     }
 
     /// ACK / NAK / ACKACK / DROPREQ — meaningful only when established.
     fn handle_transmission_control(&mut self, now: Instant, ct: ControlType) {
-        let State::Established { sender, receiver } = &mut self.state else {
+        let State::Established {
+            sender,
+            receiver,
+            crypto,
+        } = &mut self.state
+        else {
             trace!("transmission control packet outside established state dropped");
             return;
         };
         let mut ackack_reply = None;
         let mut violation = false;
+        let mut km_req = None;
         match ct {
             ControlType::Ack { ack_number, cif } => {
                 match sender.handle_ack(now, ack_number, &cif) {
-                    Ok(reply) => ackack_reply = reply,
+                    Ok(reply) => {
+                        ackack_reply = reply;
+                        // Refresh decisions and KMREQ retry pacing run on
+                        // the ACK-processing path only (encryption.md
+                        // §10.2, §11.2); the pacing clock is the
+                        // sender-side smoothed RTT.
+                        if let Some(crypto) = crypto.as_mut() {
+                            let (srtt_us, _) = sender.rtt();
+                            km_req = crypto.on_ack(now, srtt_us);
+                        }
+                    }
                     Err(_) => violation = true,
                 }
             }
@@ -633,6 +669,14 @@ impl Connection {
             }
             _ => unreachable!("dispatched in handle_control_packet"),
         }
+        if let Some(payload) = km_req {
+            // Initial/refresh KMREQ (or a paced retry) as `UMSG_EXT`
+            // (encryption.md §11.1); poll_transmit stamps it like any
+            // control packet. Length only — never the KM bytes.
+            debug!(kmreq_len = payload.len(), "in-stream KMREQ queued");
+            self.transmit_q
+                .push_back(control(ControlType::KmReq(payload)));
+        }
         if let Some(ack_number) = ackack_reply {
             self.transmit_q
                 .push_back(control(ControlType::AckAck { ack_number }));
@@ -642,6 +686,57 @@ impl Connection {
             warn!("peer protocol violation; breaking connection");
             self.close_with(now, CloseReason::Local, true);
         }
+    }
+
+    /// In-stream `UMSG_EXT` KMREQ (docs/spec/encryption.md §11.3): a peer
+    /// key refresh, or the unsolicited fake-KM of a permissive failed-KMX
+    /// responder (§6.2 step 6). Success → full-echo KMRSP. Failure policy
+    /// (encryption is always enforced): NO RESPONSE AT ALL, and the
+    /// connection stays up regardless — the §11.3 non-enforced 1-word
+    /// status KMRSP is not implemented. An endpoint without a crypto
+    /// context is equally silent (packets.md §5.10).
+    fn handle_kmreq(&mut self, payload: &[u8]) {
+        let State::Established { crypto, .. } = &mut self.state else {
+            trace!("in-stream KMREQ ignored while not established");
+            return;
+        };
+        let response = match crypto.as_mut() {
+            Some(crypto) => match crypto.handle_kmreq(payload) {
+                KmReqOutcome::Installed(echo) => {
+                    debug!(kmrsp_len = echo.len(), "in-stream KM installed; echoing KMRSP");
+                    Some(echo)
+                }
+                KmReqOutcome::Failed(state) => {
+                    debug!(?state, "in-stream KMREQ failed; silent (enforced encryption)");
+                    None
+                }
+            },
+            None => {
+                debug!("in-stream KMREQ without a crypto context; silent (enforced encryption)");
+                None
+            }
+        };
+        if let Some(payload) = response {
+            self.transmit_q
+                .push_back(control(ControlType::KmRsp(payload)));
+        }
+    }
+
+    /// In-stream `UMSG_EXT` KMRSP (docs/spec/encryption.md §6.3, §11.3):
+    /// feeds the engine — echo confirmation stops the KMREQ retries, a
+    /// 1-word status applies the peer-failure state table. Never a
+    /// connection consequence, whatever the outcome.
+    fn handle_kmrsp(&mut self, payload: &[u8]) {
+        let State::Established {
+            crypto: Some(crypto),
+            ..
+        } = &mut self.state
+        else {
+            trace!("KMRSP ignored (no crypto context)");
+            return;
+        };
+        let outcome = crypto.handle_kmrsp(payload);
+        debug!(?outcome, "in-stream KMRSP processed");
     }
 
     fn handle_handshake_packet(
@@ -698,8 +793,19 @@ impl Connection {
         let (sender, receiver) = transmission_pair(now, &negotiated, &self.opts, self.timebase);
         self.peer_socket_id = negotiated.peer_socket_id;
         self.streamid = negotiated.streamid.clone();
-        debug!(peer = ?negotiated.peer_socket_id, "connection established (caller)");
-        let prev = std::mem::replace(&mut self.state, State::Established { sender, receiver });
+        debug!(
+            peer = ?negotiated.peer_socket_id,
+            secured = negotiated.crypto.is_some(),
+            "connection established (caller)"
+        );
+        let prev = std::mem::replace(
+            &mut self.state,
+            State::Established {
+                sender,
+                receiver,
+                crypto: negotiated.crypto,
+            },
+        );
         let State::Connecting {
             pending_send,
             early_data,
@@ -708,17 +814,23 @@ impl Connection {
         else {
             unreachable!("establish is only reached from Connecting");
         };
-        let State::Established { sender, receiver } = &mut self.state else {
+        let State::Established {
+            sender,
+            receiver,
+            crypto,
+        } = &mut self.state
+        else {
             unreachable!("state was just set");
         };
         receiver.set_hs_anchor(now, hs_ts);
         for (at, pkt) in early_data {
             // Replayed with the original arrival instant so the TSBPD
-            // anchor is not skewed by the buffering delay.
-            receiver.handle_data(at, pkt);
+            // anchor is not skewed by the buffering delay; runs through the
+            // same decrypt step as live arrivals.
+            ingest_data(at, receiver, crypto.as_mut(), pkt);
         }
         for payload in pending_send {
-            if let Err(e) = sender.push(now, payload) {
+            if let Err(e) = sender.push(now, payload, crypto.as_mut()) {
                 warn!(%e, "payload buffered while connecting was dropped");
             }
         }
@@ -757,7 +869,9 @@ impl Connection {
         }
         match &mut self.state {
             State::Connecting { hs, .. } => hs.poll_transmit(now),
-            State::Established { sender, receiver } => {
+            State::Established {
+                sender, receiver, ..
+            } => {
                 // Control before data: ACKs/NAKs must not queue behind a
                 // burst of payloads.
                 if let Some(ct) = receiver.poll_control(now) {
@@ -823,7 +937,56 @@ fn transmission_pair(
     (sender, receiver)
 }
 
-fn merge_stats(sender: &Sender, receiver: &Receiver) -> Stats {
+/// Feeds one data packet to the receiver through the decrypt step
+/// (docs/spec/encryption.md §9.4). KK = None passes through untouched —
+/// cleartext is accepted even on a secured link, a rule owned by
+/// [`Crypto::decrypt`]. An unkeyed SEK slot, or any KK ≠ None without a
+/// crypto context (unencrypted endpoint receiving encrypted data,
+/// packets.md §5.10), makes the packet undecryptable: it still occupies
+/// its sequence slot and is ACKed, but is never delivered and never
+/// NAK-repaired.
+fn ingest_data(
+    now: Instant,
+    receiver: &mut Receiver,
+    crypto: Option<&mut Crypto>,
+    mut data: DataPacket,
+) {
+    let decrypted = match crypto {
+        Some(crypto) => crypto
+            .decrypt(data.seq, data.encryption, &mut data.payload)
+            .is_ok(),
+        None => data.encryption == EncryptionFlags::None,
+    };
+    if decrypted {
+        // §9.4: the KK bits are cleared once the payload is plaintext.
+        data.encryption = EncryptionFlags::None;
+        receiver.handle_data(now, data);
+        return;
+    }
+    let seq = data.seq.value();
+    let kk = data.encryption;
+    // Warn once — on the 0 → 1 transition of the counter, which only
+    // advances when the packet occupies a buffer slot (belated/duplicate/
+    // overflow arrivals do not tick it) — then trace: a key mismatch
+    // (encryption.md §8 rows 4/11, or a lost refresh KMREQ) would
+    // otherwise log per packet. States and lengths only — never key
+    // material.
+    let first = receiver.undecrypted_count() == 0;
+    receiver.handle_undecryptable(now, data);
+    if first && receiver.undecrypted_count() == 1 {
+        warn!(seq, ?kk,
+            "undecryptable data packet (no usable key for its KK slot); further ones logged at trace");
+    } else {
+        trace!(
+            seq,
+            ?kk,
+            undecrypted = receiver.undecrypted_count(),
+            "undecryptable data packet"
+        );
+    }
+}
+
+fn merge_stats(sender: &Sender, receiver: &Receiver, crypto: Option<&Crypto>) -> Stats {
     let s = sender.stats();
     let r = receiver.stats();
     Stats {
@@ -835,6 +998,8 @@ fn merge_stats(sender: &Sender, receiver: &Receiver) -> Stats {
         pkts_send_dropped: s.pkts_dropped,
         pkts_recv_dropped: r.pkts_dropped,
         pkts_recv_lost: r.pkts_lost,
+        undecrypted_pkts: receiver.undecrypted_count(),
+        km_refreshes: crypto.map_or(0, Crypto::key_switches),
         rtt_us: r.rtt_us,
         rtt_var_us: r.rtt_var_us,
     }
@@ -1308,9 +1473,11 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_data_dropped_connection_survives() {
-        // packets.md §3.2: no crypto context → the packet MUST be dropped,
-        // never delivered; the connection stays up (libsrt rcvUndecrypt).
+    fn encrypted_data_without_context_is_undecryptable() {
+        // encryption.md §9.4 / packets.md §5.10: KK ≠ 0 without a crypto
+        // context is undecryptable by definition — the packet occupies its
+        // sequence slot and is ACKed, but is never delivered; the
+        // connection stays up (libsrt rcvUndecrypt).
         let t0 = Instant::now();
         let (mut c, _) = establish_pair(t0, SrtOptions::default(), SrtOptions::default());
         drain(&mut c, t0);
@@ -1318,6 +1485,7 @@ mod tests {
         pkt.encryption = EncryptionFlags::Even;
         c.handle_packet(t0 + MS, Packet::Data(pkt));
         assert_eq!(c.state(), ConnState::Established, "drop, not break");
+        assert_eq!(c.stats().undecrypted_pkts, 1);
         // Nothing is sent in reaction — in particular no SHUTDOWN.
         assert!(
             !drain(&mut c, t0 + MS).iter().any(|p| matches!(
@@ -1327,32 +1495,48 @@ mod tests {
                     ..
                 })
             )),
-            "no SHUTDOWN for a dropped undecryptable packet"
+            "no SHUTDOWN for an undecryptable packet"
         );
-        // The undecryptable payload is never delivered to the application.
-        assert!(c.poll_deliver(t0 + Duration::from_secs(1)).is_none());
 
-        // Corrupted-KK-bits scenario: the intact original (same seq) is
-        // retransmitted and must still be accepted and delivered — the drop
-        // left no trace of that sequence number in the receiver.
+        // §9.4: the undecryptable copy occupies (and is ACKed for) its
+        // slot, so a later clean copy of the same sequence is a duplicate
+        // and discarded — libsrt behaves the same (the sender saw the ACK
+        // and never retransmits it anyway).
         let t1 = t0 + MS * 2;
         c.handle_packet(
             t1,
             Packet::Data(data_packet(ISN.value(), CALLER_ID, vec![7; 4])),
         );
-        assert_eq!(c.state(), ConnState::Established);
+        // The next sequence delivers normally: at play time the
+        // undecryptable slot is freed like a TSBPD drop and the stream
+        // continues behind it.
+        c.handle_packet(
+            t1,
+            Packet::Data(data_packet(ISN.add(1).value(), CALLER_ID, vec![8; 4])),
+        );
+        let due = t0 + Duration::from_millis(125);
         assert_eq!(
-            c.poll_deliver(t1 + Duration::from_millis(121)),
-            Some(vec![7; 4]),
-            "clean retransmission of the dropped seq is delivered"
+            c.poll_deliver(due),
+            Some(vec![8; 4]),
+            "stream resumes past the freed undecryptable slot"
+        );
+        assert!(c.poll_deliver(due).is_none());
+        let stats = c.stats();
+        assert_eq!(stats.undecrypted_pkts, 1);
+        assert_eq!(
+            stats.pkts_recv_dropped, 1,
+            "the freed slot counts as a drop (libsrt folds rcvUndecrypt in)"
         );
     }
 
     #[test]
     fn encrypted_data_while_connecting_dropped_handshake_continues() {
         // A stray encrypted data packet racing the conclusion response must
-        // not abort the handshake, must not queue a SHUTDOWN (the peer id is
-        // still unknown), and must stay out of the early-data buffer.
+        // not abort the handshake and must not queue a SHUTDOWN (the peer
+        // id is still unknown). It is buffered like any early data and runs
+        // through the decrypt step at establishment; without a negotiated
+        // crypto context it lands as undecryptable (encryption.md §9.4) and
+        // is never delivered.
         let t0 = Instant::now();
         let mut c = caller(t0, SrtOptions::default());
         let mut l = Listener::new(7, Timebase::new(t0), SrtOptions::default());
@@ -1385,11 +1569,12 @@ mod tests {
             "no SHUTDOWN queued while connecting"
         );
 
-        // The handshake completes and the encrypted payload was never
-        // buffered as early data: nothing is ever delivered.
+        // The handshake completes; the replayed early packet is counted as
+        // undecryptable and nothing is ever delivered.
         let t2 = t0 + MS * 2;
         c.handle_packet(t2, reply);
         assert_eq!(c.state(), ConnState::Established);
+        assert_eq!(c.stats().undecrypted_pkts, 1);
         assert!(c.poll_deliver(t2 + Duration::from_secs(1)).is_none());
     }
 
@@ -1570,5 +1755,251 @@ mod tests {
         let (c, a) = establish_pair(t0, copts, SrtOptions::default());
         assert_eq!(c.streamid(), Some("live/cam-7"));
         assert_eq!(a.streamid(), Some("live/cam-7"));
+    }
+
+    // ---- encryption wiring (docs/spec/encryption.md §§6, 9, 10, 11) ----
+
+    const PASSPHRASE: &str = "correct horse battery";
+
+    /// Options for an encrypted connection. `refresh` = `(rr, pa)` sets a
+    /// tiny KM refresh rate / pre-announce window (encryption.md §10.1) so
+    /// a whole refresh cycle fits in a short test.
+    fn crypto_opts(refresh: Option<(u32, u32)>) -> SrtOptions {
+        SrtOptions {
+            passphrase: Some(PASSPHRASE.to_string().into()),
+            km_refresh_rate: refresh.map(|(rr, _)| rr),
+            km_preannounce: refresh.map(|(_, pa)| pa),
+            ..SrtOptions::default()
+        }
+    }
+
+    /// Cleartext for the n-th pumped packet (1-based).
+    fn msg(n: u32) -> Vec<u8> {
+        format!("packet {n:04}").into_bytes()
+    }
+
+    /// Drives an encrypted pair packet-by-packet with a fake clock: each
+    /// round sends `msg(n)` caller → accepted, relays everything (data,
+    /// ACK, ACKACK, KMREQ/KMRSP), and ticks both timer paths — so the
+    /// caller's ACK-driven refresh machine (§10.2) runs every round.
+    /// `drop_kmreq` simulates losing every in-stream KMREQ. Returns the KK
+    /// bits of each transmitted data packet plus the relayed KM payloads.
+    fn pump_encrypted(
+        c: &mut Connection,
+        a: &mut Connection,
+        t0: Instant,
+        rounds: u32,
+        drop_kmreq: bool,
+    ) -> (Vec<EncryptionFlags>, Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let mut flags = Vec::new();
+        let mut kmreqs = Vec::new();
+        let mut kmrsps = Vec::new();
+        let mut now = t0;
+        for n in 1 ..= rounds {
+            now += Duration::from_millis(12);
+            c.send(now, msg(n)).unwrap();
+            for p in drain(c, now) {
+                match &p {
+                    Packet::Data(d) => {
+                        let n = d.seq.value() - ISN.value() + 1;
+                        assert_ne!(d.payload, msg(n), "wire payload must be ciphertext");
+                        flags.push(d.encryption);
+                    }
+                    Packet::Control(ControlPacket {
+                        control_type: ControlType::KmReq(blob),
+                        ..
+                    }) => {
+                        kmreqs.push(blob.clone());
+                        if drop_kmreq {
+                            continue;
+                        }
+                    }
+                    _ => {}
+                }
+                a.handle_packet(now, p);
+            }
+            a.handle_timer(now); // 10 ms ACK tick fires every 12 ms round
+            for p in drain(a, now) {
+                if let Packet::Control(ControlPacket {
+                    control_type: ControlType::KmRsp(blob),
+                    ..
+                }) = &p
+                {
+                    kmrsps.push(blob.clone());
+                }
+                c.handle_packet(now, p);
+            }
+            c.handle_timer(now);
+        }
+        (flags, kmreqs, kmrsps)
+    }
+
+    #[test]
+    fn encrypted_pair_delivers_cleartext_both_directions() {
+        let t0 = Instant::now();
+        let (mut c, mut a) = establish_pair(t0, crypto_opts(None), crypto_opts(None));
+        drain(&mut c, t0);
+        drain(&mut a, t0);
+        let due = t0 + Duration::from_millis(125);
+
+        // Caller → listener: the wire carries ciphertext under the even KK
+        // bits (§9.1: the first SEK of a connection is always even); the
+        // application gets the cleartext back.
+        let clear = b"attack at dawn".to_vec();
+        c.send(t0, clear.clone()).unwrap();
+        let data = drain(&mut c, t0)
+            .into_iter()
+            .find_map(|p| match p {
+                Packet::Data(d) => Some(d),
+                _ => None,
+            })
+            .expect("data packet");
+        assert_eq!(data.encryption, EncryptionFlags::Even);
+        assert_ne!(data.payload, clear, "payload must be encrypted on the wire");
+        a.handle_packet(t0 + MS, Packet::Data(data));
+        assert_eq!(a.poll_deliver(due), Some(clear));
+
+        // Listener → caller: §1 — the caller's one SEK serves both
+        // directions after the handshake KMX.
+        let clear = b"hold position".to_vec();
+        a.send(t0, clear.clone()).unwrap();
+        let data = drain(&mut a, t0)
+            .into_iter()
+            .find_map(|p| match p {
+                Packet::Data(d) => Some(d),
+                _ => None,
+            })
+            .expect("data packet");
+        assert_eq!(data.encryption, EncryptionFlags::Even);
+        assert_ne!(data.payload, clear);
+        c.handle_packet(t0 + MS, Packet::Data(data));
+        assert_eq!(c.poll_deliver(due), Some(clear));
+
+        assert_eq!(c.stats().undecrypted_pkts, 0);
+        assert_eq!(a.stats().undecrypted_pkts, 0);
+        assert_eq!(c.stats().km_refreshes, 0);
+    }
+
+    #[test]
+    fn km_refresh_cycle_over_connection() {
+        // §10/§11 across two Connections: with rr = 16, pa = 4 and the
+        // initial counter at 1, the dual-SEK KMREQ is due on the ACK after
+        // packet 12 (cnt 13 > 12) and the KK bits flip after packet 16
+        // (cnt 17 > 16) — refresh decisions run only on received ACKs
+        // (§10.2), which the pump provides every round.
+        let t0 = Instant::now();
+        let (mut c, mut a) = establish_pair(t0, crypto_opts(Some((16, 4))), crypto_opts(None));
+        drain(&mut c, t0);
+        drain(&mut a, t0);
+        let (flags, kmreqs, kmrsps) = pump_encrypted(&mut c, &mut a, t0, 24, false);
+
+        // Exactly one KMREQ (echo-confirmed before any 1.5×SRTT retry came
+        // due): the §10.1 dual-SEK KM — 72 bytes for AES-128 (§3).
+        assert_eq!(kmreqs.len(), 1, "one pre-announce KMREQ");
+        assert_eq!(kmreqs[0].len(), 72, "dual-SEK KM message");
+        // ...answered with the byte-exact echo KMRSP (§10.4, §6.3).
+        assert!(kmrsps.iter().any(|b| b == &kmreqs[0]), "echo KMRSP relayed");
+
+        // Packets 1..=16 ride the even key, 17.. the odd one (§10.1).
+        assert_eq!(flags.len(), 24);
+        for (i, kk) in flags.iter().enumerate() {
+            let expect = if i < 16 {
+                EncryptionFlags::Even
+            } else {
+                EncryptionFlags::Odd
+            };
+            assert_eq!(*kk, expect, "packet {}", i + 1);
+        }
+        assert_eq!(c.stats().km_refreshes, 1, "one completed key switch");
+        assert_eq!(a.stats().km_refreshes, 0, "peer TX never switched");
+
+        // Every payload decrypts and delivers, in order, across the switch.
+        let due = t0 + Duration::from_secs(2);
+        let delivered: Vec<Vec<u8>> = std::iter::from_fn(|| a.poll_deliver(due)).collect();
+        assert_eq!(delivered.len(), 24);
+        for (i, p) in delivered.iter().enumerate() {
+            assert_eq!(p, &msg(i as u32 + 1), "payload {}", i + 1);
+        }
+        assert_eq!(a.stats().undecrypted_pkts, 0);
+    }
+
+    #[test]
+    fn lost_refresh_kmreq_leaves_new_key_undecryptable() {
+        // §11.2 trap: the sender switches at RR whether or not the KMREQ
+        // was ever answered. With every in-stream KMREQ "lost", the peer
+        // never learns the odd SEK: packets 17.. arrive undecryptable —
+        // ACKed, counted, never delivered — and the connection stays up.
+        let t0 = Instant::now();
+        let (mut c, mut a) = establish_pair(t0, crypto_opts(Some((16, 4))), crypto_opts(None));
+        drain(&mut c, t0);
+        drain(&mut a, t0);
+        let (flags, kmreqs, kmrsps) = pump_encrypted(&mut c, &mut a, t0, 24, true);
+
+        assert!(!kmreqs.is_empty(), "pre-announce KMREQ was emitted");
+        assert!(kmrsps.is_empty(), "no KMRSP for a KMREQ never delivered");
+        assert!(
+            flags[16 ..].iter().all(|kk| *kk == EncryptionFlags::Odd),
+            "switch happened regardless (§11.2)"
+        );
+
+        assert_eq!(c.state(), ConnState::Established);
+        assert_eq!(a.state(), ConnState::Established);
+        assert_eq!(
+            a.stats().undecrypted_pkts,
+            8,
+            "every odd-key packet is undecryptable"
+        );
+        let due = t0 + Duration::from_secs(2);
+        let delivered: Vec<Vec<u8>> = std::iter::from_fn(|| a.poll_deliver(due)).collect();
+        assert_eq!(delivered.len(), 16, "only even-key packets delivered");
+    }
+
+    #[test]
+    fn endpoint_is_silent_on_bad_instream_kmreq() {
+        // §11.3: a failed in-stream KMREQ gets NO response (encryption is
+        // always enforced; the non-enforced 1-word status KMRSP is not
+        // implemented) — and never a connection consequence. Both failure
+        // classes: garbage that passes the §6.2 step-1 pre-checks but
+        // fails parsing (NOSECRET class), and a truncated KM that fails
+        // the pre-checks themselves (BADSECRET class).
+        let t0 = Instant::now();
+        for payload in [vec![0xAB; 20], vec![0; 10]] {
+            let (mut c, _) = establish_pair(t0, crypto_opts(None), crypto_opts(None));
+            drain(&mut c, t0);
+            c.handle_packet(t0 + MS, control_to(CALLER_ID, ControlType::KmReq(payload)));
+            assert_eq!(c.state(), ConnState::Established);
+            assert!(
+                drain(&mut c, t0 + MS).iter().all(|p| !matches!(
+                    p,
+                    Packet::Control(ControlPacket {
+                        control_type: ControlType::KmRsp(_),
+                        ..
+                    })
+                )),
+                "a failed in-stream KMREQ is answered with silence"
+            );
+        }
+    }
+
+    #[test]
+    fn instream_kmreq_on_unencrypted_endpoint() {
+        // packets.md §5.10 / §11.3: an endpoint without a crypto context
+        // is silent too (the non-enforced NOSECRET status KMRSP is not
+        // implemented) — and the connection stays up.
+        let t0 = Instant::now();
+        let (mut c, _) = establish_pair(t0, SrtOptions::default(), SrtOptions::default());
+        drain(&mut c, t0);
+        c.handle_packet(
+            t0 + MS,
+            control_to(CALLER_ID, ControlType::KmReq(vec![0xAB; 20])),
+        );
+        assert_eq!(c.state(), ConnState::Established);
+        assert!(drain(&mut c, t0 + MS).iter().all(|p| !matches!(
+            p,
+            Packet::Control(ControlPacket {
+                control_type: ControlType::KmRsp(_),
+                ..
+            })
+        )));
     }
 }

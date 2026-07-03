@@ -92,7 +92,15 @@ impl SrtListener {
     ///
     /// `opts` apply to every accepted connection (`opts.streamid` is
     /// ignored; the caller supplies it).
+    ///
+    /// Errors: [`SrtError::InvalidPassphrase`],
+    /// [`SrtError::InvalidKmParameters`], [`SrtError::NoIpv4Address`],
+    /// [`SrtError::Io`].
     pub async fn bind(addr: impl ToSocketAddrs, opts: SrtOptions) -> Result<SrtListener, SrtError> {
+        // Fail fast on invalid encryption options (encryption.md §2),
+        // before any I/O: `core::Listener` re-derives this config and
+        // would otherwise silently reject every conclusion.
+        opts.crypto_config()?;
         let addr = net::resolve_v4(addr).await?;
         let udp = net::bind_udp(addr, opts.udp_recv_buffer)?;
         let local_addr = match udp.local_addr()? {
@@ -307,7 +315,10 @@ impl ListenerDriver {
                 let peer_key = (from, negotiated.peer_socket_id);
                 let (tx, rx) = mpsc::channel(DEMUX_QUEUE);
                 // The accepted connection queues `reply` itself and replays
-                // it on repeated CONCLUSIONs.
+                // it on repeated CONCLUSIONs. `*negotiated` MOVES the boxed
+                // value — with its crypto engine and key material — into the
+                // connection (`Negotiated` is neither `Copy` nor `Clone`),
+                // so the demux keys above are read out beforehand.
                 let mut conn = Connection::accepted(now, *negotiated, reply, self.opts.clone());
                 // TSBPD anchor from the CONCLUSION request: same peer clock
                 // as the caller's data packets (transmission.md §9.2).
@@ -547,6 +558,30 @@ mod tests {
         driver.reap(SocketId(5));
         assert!(driver.conns.is_empty());
         assert_eq!(driver.by_peer[&peer], SocketId(6));
+    }
+
+    /// Invalid encryption options fail `bind` before any I/O: the address
+    /// here cannot resolve, so reaching resolution would surface an
+    /// [`SrtError::Io`] instead of the validation error.
+    #[tokio::test]
+    async fn bind_validates_crypto_options_before_io() {
+        // Passphrase below the 10-byte minimum (encryption.md §2).
+        let opts = SrtOptions::default().passphrase("short");
+        let e = SrtListener::bind(("host.invalid.", 1), opts)
+            .await
+            .err()
+            .expect("invalid passphrase must fail bind");
+        assert!(matches!(e, SrtError::InvalidPassphrase), "{e:?}");
+
+        // km_preannounce > (km_refresh_rate - 1) / 2 (encryption.md §2).
+        let mut opts = SrtOptions::default().passphrase("0123456789");
+        opts.km_refresh_rate = Some(10);
+        opts.km_preannounce = Some(9);
+        let e = SrtListener::bind(("host.invalid.", 1), opts)
+            .await
+            .err()
+            .expect("invalid km parameters must fail bind");
+        assert!(matches!(e, SrtError::InvalidKmParameters(_)), "{e:?}");
     }
 
     /// The wire dst-socket-id sits at bytes 12..16 of every SRT packet; the

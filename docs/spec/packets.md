@@ -473,7 +473,9 @@ For this implementation (HSv5-only, unencrypted):
   - Permissive mode (`ENFORCEDENCRYPTION=false`) replies with
     `UMSG_EXT`/`SRT_CMD_KMRSP` whose CIF is **one 32-bit word = KM state
     `SRT_KM_S_NOSECRET` (3)** (wire payload confirmed: `srtlen = 1`, word 0 =
-    `m_RcvKmState`, big-endian like every control word).
+    `m_RcvKmState`, **sender-host-endian — little-endian in practice**, because
+    the KM double-swap cancellation applies to this word too; see
+    encryption.md §5.1).
   (This situation is unreachable when the handshake correctly rejects encryption
   mismatches — see the handshake doc for `SRT_KM_S_*` values and rejection rules.)
 - Unknown subtypes: ignore silently (libsrt forwards them to the congestion

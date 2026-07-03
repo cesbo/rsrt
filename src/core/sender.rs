@@ -6,6 +6,9 @@
 //! - assign sequence numbers, message numbers (PP=Only; O=0 — libsrt's live profile submits with
 //!   `inorder = false`) and timestamps to outgoing payloads and keep them buffered for
 //!   retransmission;
+//! - with crypto, encrypt each payload in place at buffering time and store the returned KK bits:
+//!   the buffer holds ciphertext, so the first send and every retransmission emit byte-identical
+//!   payload and KK bits (docs/spec/encryption.md §9.3);
 //! - on ACK: release acknowledged packets, reply with ACKACK (non-light ACKs only, throttled),
 //!   track the peer's advertised receive-buffer window, and adopt the peer receiver's SRTT/RTTVar
 //!   pair from the full-ACK CIF (docs/spec/transmission.md §6 step 9);
@@ -41,6 +44,7 @@ use tracing::{
 
 use super::time::Timebase;
 use crate::{
+    crypto::Crypto,
     error::{
         CloseReason,
         SrtError,
@@ -119,6 +123,12 @@ struct BufEntry {
     /// `None` until the first retransmission — first transmissions never
     /// stamp it). Drives the §7.5 retransmission throttle.
     last_rexmit: Option<Instant>,
+    /// KK bits sampled from the active SEK when the payload was encrypted
+    /// at buffering time (`None` without crypto). Emitted identically on
+    /// the first send and every retransmission — the buffer holds
+    /// ciphertext, never re-encrypted (docs/spec/encryption.md §9.3).
+    encryption: EncryptionFlags,
+    /// Payload as it goes on the wire: ciphertext when crypto is active.
     payload: Vec<u8>,
 }
 
@@ -201,7 +211,17 @@ impl Sender {
     /// Accepts one application message (≤ `max_payload` bytes) for
     /// transmission. Live mode never blocks: if the buffer or the in-flight
     /// window is full, the oldest packet is dropped to make room.
-    pub fn push(&mut self, now: Instant, payload: Vec<u8>) -> Result<(), SrtError> {
+    ///
+    /// With `crypto`, the payload is encrypted in place here and the
+    /// returned KK bits are stored with the packet: the buffer holds
+    /// ciphertext, and the first send and every retransmission emit
+    /// byte-identical payload and KK bits (docs/spec/encryption.md §9.3).
+    pub fn push(
+        &mut self,
+        now: Instant,
+        mut payload: Vec<u8>,
+        crypto: Option<&mut Crypto>,
+    ) -> Result<(), SrtError> {
         if payload.len() > self.cfg.max_payload {
             return Err(SrtError::PayloadTooLarge(payload.len()));
         }
@@ -229,11 +249,26 @@ impl Sender {
             succ
         };
 
+        // Encrypt in place with the final wire seqno in the IV and record
+        // the KK bits (docs/spec/encryption.md §9.3). libsrt encrypts at
+        // first transmission; doing it at buffering time is equivalent —
+        // the sequence assigned here is never restamped — and makes "read
+        // active key + stamp KK + encrypt" atomic, as §9.3 demands.
+        let encryption = match crypto {
+            // §9.4: never encrypt a zero-length payload (HaiCrypt reports
+            // it as failure; live mode never produces one).
+            Some(crypto) if !payload.is_empty() => {
+                crypto.encrypt(self.seq_at(index), &mut payload)
+            }
+            _ => EncryptionFlags::None,
+        };
+
         let ts = self.cfg.timebase.timestamp(now);
         trace!(
             seq = self.seq_at(index).value(),
             msg = msg.value(),
             len = payload.len(),
+            kk = ?encryption,
             "data packet queued"
         );
         self.buffer.push_back(BufEntry {
@@ -241,6 +276,7 @@ impl Sender {
             origin: now,
             ts,
             last_rexmit: None,
+            encryption,
             payload,
         });
         Ok(())
@@ -638,14 +674,15 @@ impl Sender {
     }
 
     /// Builds the wire packet for a buffered index. Retransmissions reuse
-    /// the ORIGINAL sequence, message number and timestamp with R=1.
+    /// the ORIGINAL sequence, message number, timestamp and KK bits with
+    /// R=1 — same ciphertext, never re-encrypted (encryption.md §9.3).
     fn packet_at(&self, index: u64, retransmitted: bool) -> DataPacket {
         let entry = &self.buffer[(index - self.base_index) as usize];
         DataPacket {
             seq: self.seq_at(index),
             position: PacketPosition::Only,
             order: false,
-            encryption: EncryptionFlags::None,
+            encryption: entry.encryption,
             retransmitted,
             msg_number: entry.msg,
             timestamp: entry.ts,
@@ -659,6 +696,12 @@ impl Sender {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::{
+        CryptoConfig,
+        KeyLength,
+        KmReqOutcome,
+        KmRspOutcome,
+    };
 
     const ISN: u32 = 100;
     const MS: Duration = Duration::from_millis(1);
@@ -708,7 +751,7 @@ mod tests {
     /// them all; returns the transmitted packets.
     fn push_and_send(s: &mut Sender, start: Instant, n: usize) -> Vec<DataPacket> {
         for i in 0 .. n {
-            s.push(start + MS * i as u32, vec![i as u8; 3]).unwrap();
+            s.push(start + MS * i as u32, vec![i as u8; 3], None).unwrap();
         }
         let mut out = Vec::new();
         while let Some(p) = s.poll_transmit(start + MS * n as u32) {
@@ -754,13 +797,13 @@ mod tests {
     fn payload_too_large_rejected() {
         let t0 = Instant::now();
         let mut s = sender(t0);
-        match s.push(t0, vec![0; 1457]) {
+        match s.push(t0, vec![0; 1457], None) {
             Err(SrtError::PayloadTooLarge(1457)) => {}
             other => panic!("expected PayloadTooLarge, got {other:?}"),
         }
         assert_eq!(s.buffered_pkts(), 0);
         // At the limit is fine.
-        s.push(t0, vec![0; 1456]).unwrap();
+        s.push(t0, vec![0; 1456], None).unwrap();
         assert_eq!(s.buffered_pkts(), 1);
     }
 
@@ -795,7 +838,7 @@ mod tests {
             ..config(t0)
         });
         for i in 0 .. 4 {
-            s.push(t0 + MS * i, vec![0; 8]).unwrap();
+            s.push(t0 + MS * i, vec![0; 8], None).unwrap();
         }
         // Window of 2: only two go out.
         assert!(s.poll_transmit(t0).is_some());
@@ -888,7 +931,7 @@ mod tests {
         let t0 = Instant::now();
         let mut s = sender(t0);
         for i in 0 .. 5 {
-            s.push(t0 + MS * i, vec![0; 8]).unwrap();
+            s.push(t0 + MS * i, vec![0; 8], None).unwrap();
         }
         assert_eq!(
             s.poll_transmit(t0 + MS * 5).unwrap().seq,
@@ -1016,7 +1059,7 @@ mod tests {
         let t0 = Instant::now();
         let mut s = sender(t0);
         for i in 0 .. 3 {
-            s.push(t0 + MS * i, vec![i as u8]).unwrap();
+            s.push(t0 + MS * i, vec![i as u8], None).unwrap();
         }
         // Send only the first two; seq 102 still pending.
         assert_eq!(s.poll_transmit(t0).unwrap().seq, SeqNumber::new(ISN));
@@ -1158,7 +1201,7 @@ mod tests {
         let t0 = Instant::now();
         let mut s = sender(t0);
         for i in 0 .. 3 {
-            s.push(t0 + MS * i, vec![i as u8]).unwrap();
+            s.push(t0 + MS * i, vec![i as u8], None).unwrap();
         }
         // Send the first two; seq 102 still awaits first transmission.
         assert!(s.poll_transmit(t0).is_some());
@@ -1199,8 +1242,9 @@ mod tests {
         let t0 = Instant::now();
         let mut s = sender(t0);
         // Threshold = max(120 ms, 1 s) + 20 ms = 1020 ms.
-        s.push(t0, vec![1]).unwrap();
-        s.push(t0 + Duration::from_millis(1030), vec![2]).unwrap();
+        s.push(t0, vec![1], None).unwrap();
+        s.push(t0 + Duration::from_millis(1030), vec![2], None)
+            .unwrap();
         assert_eq!(s.buffered_pkts(), 2);
 
         // Timespan (1030 ms) exceeds the threshold: deadline armed at
@@ -1232,13 +1276,15 @@ mod tests {
     fn tlpktdrop_on_push_drops_expired_head() {
         let t0 = Instant::now();
         let mut s = sender(t0);
-        s.push(t0, vec![1]).unwrap();
+        s.push(t0, vec![1], None).unwrap();
         // Second push: pre-existing timespan is 0 → no drop.
-        s.push(t0 + Duration::from_millis(1100), vec![2]).unwrap();
+        s.push(t0 + Duration::from_millis(1100), vec![2], None)
+            .unwrap();
         assert_eq!(s.buffered_pkts(), 2);
         // Third push: timespan 1100 ms > 1020 ms → the first packet (older
         // than now - threshold) is dropped before appending.
-        s.push(t0 + Duration::from_millis(1150), vec![3]).unwrap();
+        s.push(t0 + Duration::from_millis(1150), vec![3], None)
+            .unwrap();
         assert_eq!(s.buffered_pkts(), 2);
         assert_eq!(s.stats().pkts_dropped, 1);
         match s.poll_control() {
@@ -1256,7 +1302,8 @@ mod tests {
         let mut s = sender(t0);
         let sent = push_and_send(&mut s, t0, 1);
         assert_eq!(sent[0].seq, SeqNumber::new(ISN));
-        s.push(t0 + Duration::from_millis(1030), vec![2]).unwrap();
+        s.push(t0 + Duration::from_millis(1030), vec![2], None)
+            .unwrap();
         s.on_timer(t0 + Duration::from_millis(1030)); // drops seq 100
         s.poll_control(); // discard the DROPREQ announcement
 
@@ -1274,8 +1321,9 @@ mod tests {
     fn no_deadline_while_timespan_within_threshold() {
         let t0 = Instant::now();
         let mut s = sender(t0);
-        s.push(t0, vec![1]).unwrap();
-        s.push(t0 + Duration::from_millis(500), vec![2]).unwrap();
+        s.push(t0, vec![1], None).unwrap();
+        s.push(t0 + Duration::from_millis(500), vec![2], None)
+            .unwrap();
         assert_eq!(s.next_deadline(), None);
         // Even far in the future the timespan gate keeps the packets:
         // nothing new was submitted (libsrt semantics).
@@ -1293,9 +1341,9 @@ mod tests {
             buffer_pkts: 2,
             ..config(t0)
         });
-        s.push(t0, vec![1]).unwrap();
-        s.push(t0 + MS, vec![2]).unwrap();
-        s.push(t0 + MS * 2, vec![3]).unwrap(); // evicts seq 100
+        s.push(t0, vec![1], None).unwrap();
+        s.push(t0 + MS, vec![2], None).unwrap();
+        s.push(t0 + MS * 2, vec![3], None).unwrap(); // evicts seq 100
         assert_eq!(s.buffered_pkts(), 2);
         assert_eq!(s.stats().pkts_dropped, 1);
         // Oldest is gone: first transmission starts at seq 101.
@@ -1318,14 +1366,14 @@ mod tests {
             flow_window: 2,
             ..config(t0)
         });
-        s.push(t0, vec![1]).unwrap();
-        s.push(t0 + MS, vec![2]).unwrap();
+        s.push(t0, vec![1], None).unwrap();
+        s.push(t0 + MS, vec![2], None).unwrap();
         assert!(s.poll_transmit(t0 + MS).is_some());
         assert!(s.poll_transmit(t0 + MS).is_some());
         assert!(s.poll_transmit(t0 + MS).is_none()); // window full
 
         // Pushing with a full in-flight window evicts the oldest packet.
-        s.push(t0 + MS * 2, vec![3]).unwrap();
+        s.push(t0 + MS * 2, vec![3], None).unwrap();
         assert_eq!(s.stats().pkts_dropped, 1);
         assert_eq!(s.buffered_pkts(), 2);
         let p = s.poll_transmit(t0 + MS * 3).unwrap();
@@ -1369,7 +1417,7 @@ mod tests {
         let t0 = Instant::now();
         let mut s = sender(t0);
         for i in 0 .. 3 {
-            s.push(t0 + MS * i, vec![0; 10]).unwrap();
+            s.push(t0 + MS * i, vec![0; 10], None).unwrap();
         }
         while s.poll_transmit(t0 + MS * 3).is_some() {}
         let st = s.stats();
@@ -1387,7 +1435,7 @@ mod tests {
         assert_eq!(st.pkts_retransmitted, 1);
 
         // TLPKTDROP of the remaining three.
-        s.push(t0 + Duration::from_millis(1500), vec![0; 10])
+        s.push(t0 + Duration::from_millis(1500), vec![0; 10], None)
             .unwrap();
         s.on_timer(t0 + Duration::from_millis(1500));
         let st = s.stats();
@@ -1404,5 +1452,188 @@ mod tests {
         assert_eq!(s.next_deadline(), None);
         s.on_timer(t0 + Duration::from_secs(10)); // no-op
         assert_eq!(s.buffered_pkts(), 0);
+    }
+
+    // ---- encryption (docs/spec/encryption.md §9) ----
+
+    /// Completed KMX pair (encryption.md §6) with tiny refresh thresholds
+    /// (`rr = 16`, `pa = 4`, as in the crypto::context tests): `tx`
+    /// encrypts what the sender buffers, `rx` plays the peer receiver.
+    fn crypto_pair() -> (Crypto, Crypto) {
+        let cfg = CryptoConfig {
+            passphrase: b"sender test secret".to_vec(),
+            key_len: KeyLength::Aes128,
+            km_refresh_rate: 16,
+            km_preannounce: 4,
+        };
+        let mut tx = Crypto::new_initiator(cfg.clone());
+        let kmreq = tx.kmreq().expect("initial KMREQ cached");
+        let (rx, kmrsp) = Crypto::new_responder(cfg, &kmreq).expect("KMX must succeed");
+        assert_eq!(tx.handle_kmrsp(&kmrsp), KmRspOutcome::Confirmed);
+        (tx, rx)
+    }
+
+    /// Pushes payloads `range` (24 bytes of `i` each) encrypted under `tx`.
+    fn push_encrypted(s: &mut Sender, tx: &mut Crypto, t0: Instant, range: std::ops::Range<u32>) {
+        for i in range {
+            s.push(t0 + MS * i, vec![i as u8; 24], Some(tx)).unwrap();
+        }
+    }
+
+    /// Drives `tx` through one §10.1 refresh cycle around `s`: 16 even-key
+    /// packets (the counter starts at 1, so 12 pushes reach the
+    /// pre-announce threshold and 16 the switch threshold), the dual-SEK
+    /// KM installed on `rx`, then `extra` odd-key packets past the switch.
+    fn push_through_key_switch(s: &mut Sender, tx: &mut Crypto, rx: &mut Crypto, t0: Instant, extra: u32) {
+        push_encrypted(s, tx, t0, 0 .. 12);
+        // Refresh ticks run on the ACK path (§10.2); the Connection layer
+        // owns that wiring, so the tests tick the engine directly.
+        let km = tx.on_ack(t0, 100_000).expect("pre-announce KM");
+        let KmReqOutcome::Installed(_) = rx.handle_kmreq(&km) else {
+            panic!("refresh KM must install");
+        };
+        push_encrypted(s, tx, t0, 12 .. 16);
+        assert!(tx.on_ack(t0, 100_000).is_none(), "switch emits no KM");
+        push_encrypted(s, tx, t0, 16 .. 16 + extra);
+    }
+
+    #[test]
+    fn push_buffers_ciphertext_with_kk_bits() {
+        let t0 = Instant::now();
+        let mut s = sender(t0);
+        let (mut tx, mut rx) = crypto_pair();
+
+        let clear = b"buffered as ciphertext".to_vec();
+        s.push(t0, clear.clone(), Some(&mut tx)).unwrap();
+        let p = s.poll_transmit(t0).unwrap();
+        // Encrypted at buffering time under the first (even, §9.1) SEK;
+        // AES-CTR keeps the length (§9.2).
+        assert_eq!(p.encryption, EncryptionFlags::Even);
+        assert_ne!(p.payload, clear, "payload must be ciphertext");
+        assert_eq!(p.payload.len(), clear.len());
+        // The final wire seqno went into the IV: the peer's decrypt with
+        // the packet's own seq and KK bits restores the plaintext.
+        let mut buf = p.payload.clone();
+        rx.decrypt(p.seq, p.encryption, &mut buf).unwrap();
+        assert_eq!(buf, clear);
+    }
+
+    #[test]
+    fn zero_length_payload_is_not_encrypted() {
+        // §9.4: HaiCrypt reports a zero-length encrypt as failure and live
+        // mode never produces one — the cipher is skipped, KK stays 0.
+        let t0 = Instant::now();
+        let mut s = sender(t0);
+        let (mut tx, _rx) = crypto_pair();
+        s.push(t0, Vec::new(), Some(&mut tx)).unwrap();
+        let p = s.poll_transmit(t0).unwrap();
+        assert_eq!(p.encryption, EncryptionFlags::None);
+        assert!(p.payload.is_empty());
+    }
+
+    #[test]
+    fn rexmit_reuses_ciphertext_and_kk_across_key_switch() {
+        let t0 = Instant::now();
+        let mut s = sender(t0);
+        let (mut tx, mut rx) = crypto_pair();
+        push_through_key_switch(&mut s, &mut tx, &mut rx, t0, 2);
+
+        let sent: Vec<DataPacket> = std::iter::from_fn(|| s.poll_transmit(t0 + MS * 18)).collect();
+        assert_eq!(sent.len(), 18);
+        assert!(sent[.. 16]
+            .iter()
+            .all(|p| p.encryption == EncryptionFlags::Even));
+        assert!(sent[16 ..]
+            .iter()
+            .all(|p| p.encryption == EncryptionFlags::Odd));
+
+        // Retransmit an old-key packet AFTER the switch: byte-identical
+        // ciphertext and the ORIGINAL (even) KK bits — never re-encrypted
+        // under the now-active odd key (§9.3); only R is added.
+        s.handle_nak(t0 + MS * 20, &nak(ISN + 3, ISN + 3));
+        let rex = s.poll_transmit(t0 + MS * 20).unwrap();
+        assert!(rex.retransmitted, "R flag set");
+        assert_eq!(rex.encryption, EncryptionFlags::Even, "old KK bits kept");
+        assert_eq!(rex.payload, sent[3].payload, "identical ciphertext");
+        assert_eq!(rex.seq, sent[3].seq);
+
+        // A new-key packet retransmits with its odd KK bits the same way.
+        s.handle_nak(t0 + MS * 21, &nak(ISN + 17, ISN + 17));
+        let rex = s.poll_transmit(t0 + MS * 21).unwrap();
+        assert!(rex.retransmitted);
+        assert_eq!(rex.encryption, EncryptionFlags::Odd);
+        assert_eq!(rex.payload, sent[17].payload);
+
+        // The peer holds both SEKs from the dual KM (§10.4): every packet
+        // decrypts with its own (seq, KK) pair.
+        for (i, p) in sent.iter().enumerate() {
+            let mut buf = p.payload.clone();
+            rx.decrypt(p.seq, p.encryption, &mut buf).unwrap();
+            assert_eq!(buf, vec![i as u8; 24], "packet {i}");
+        }
+    }
+
+    #[test]
+    fn kk_bits_survive_buffer_wraparound() {
+        // Sequence numbers wrap across MAX while older entries are evicted
+        // (overflow) and released (ACK): each surviving packet must keep
+        // the KK bits and ciphertext recorded when it was buffered.
+        let t0 = Instant::now();
+        let mut s = Sender::new(SenderConfig {
+            initial_seq: SeqNumber::new(SeqNumber::MASK - 16),
+            buffer_pkts: 6,
+            ..config(t0)
+        });
+        let (mut tx, mut rx) = crypto_pair();
+
+        // 20 pushes into a 6-packet buffer: the oldest entry is evicted on
+        // every push past the sixth, churning the VecDeque slots.
+        push_through_key_switch(&mut s, &mut tx, &mut rx, t0, 4);
+        assert_eq!(s.buffered_pkts(), 6);
+        assert_eq!(s.stats().pkts_dropped, 14);
+
+        // Survivors are pushes 14..=19: seqs MASK−2 .. 2 — the wire
+        // sequence (the IV pki, §9.2) wraps mid-buffer.
+        let sent: Vec<DataPacket> = std::iter::from_fn(|| s.poll_transmit(t0 + MS * 20)).collect();
+        let seqs: Vec<u32> = sent.iter().map(|p| p.seq.value()).collect();
+        assert_eq!(
+            seqs,
+            vec![
+                SeqNumber::MASK - 2,
+                SeqNumber::MASK - 1,
+                SeqNumber::MASK,
+                0,
+                1,
+                2
+            ]
+        );
+        let flags: Vec<EncryptionFlags> = sent.iter().map(|p| p.encryption).collect();
+        assert_eq!(
+            flags,
+            vec![
+                EncryptionFlags::Even, // pushes 14, 15: before the switch
+                EncryptionFlags::Even,
+                EncryptionFlags::Odd, // pushes 16..: after the switch
+                EncryptionFlags::Odd,
+                EncryptionFlags::Odd,
+                EncryptionFlags::Odd,
+            ]
+        );
+        for (i, p) in sent.iter().enumerate() {
+            let mut buf = p.payload.clone();
+            rx.decrypt(p.seq, p.encryption, &mut buf).unwrap();
+            assert_eq!(buf, vec![(14 + i) as u8; 24], "packet {i}");
+        }
+
+        // ACK across the wrap releases the even tail; a NAK for a wrapped
+        // odd-key sequence still retransmits its original ciphertext + KK.
+        s.handle_ack(t0 + MS * 21, 1, &full_ack(0)).unwrap();
+        assert_eq!(s.buffered_pkts(), 3);
+        s.handle_nak(t0 + MS * 22, &nak(1, 1));
+        let rex = s.poll_transmit(t0 + MS * 22).unwrap();
+        assert!(rex.retransmitted);
+        assert_eq!(rex.seq, SeqNumber::new(1));
+        assert_eq!(rex.encryption, EncryptionFlags::Odd);
+        assert_eq!(rex.payload, sent[4].payload);
     }
 }

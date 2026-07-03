@@ -35,11 +35,16 @@ impl PacketPosition {
     }
 }
 
-/// KK field: which encryption key encrypted this packet's payload.
+/// KK field: which stream encryption key (SEK) encrypted this packet's
+/// payload; `None` means cleartext.
 ///
-/// This implementation does not support encryption: any data packet with a
-/// value other than `None` cannot be decrypted and must break/reject the
-/// connection (docs/spec/handshake.md, encryption rejection).
+/// On receive these bits select the even/odd SEK slot for HaiCrypt
+/// decryption (`crypto::Crypto::decrypt`). A non-`None` value without a
+/// usable key makes the packet undecryptable: it is still buffered, ACKed,
+/// and advances the receive sequence, but is never delivered — no KM or
+/// connection action is taken (docs/spec/encryption.md §9.4). The packet
+/// layer therefore accepts every KK value; rejection here would break
+/// secured connections.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EncryptionFlags {
     None = 0b00,
@@ -210,6 +215,26 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn encrypted_kk_values_accepted_at_packet_layer() {
+        // encryption.md §9.4: undecryptable packets are buffered and ACKed,
+        // never rejected. The packet layer must parse every KK value; key
+        // availability is the crypto layer's concern.
+        for (kk_bits, expected) in [
+            (0b00u32, EncryptionFlags::None),
+            (0b01, EncryptionFlags::Even),
+            (0b10, EncryptionFlags::Odd),
+            (0b11, EncryptionFlags::Both),
+        ] {
+            let mut buf = Vec::new();
+            sample().encode(&mut buf);
+            // Patch the KK bits (word1 bits 28..27) directly in the wire image.
+            buf[4] = (buf[4] & !0b0001_1000) | (kk_bits << 3) as u8;
+            let p = DataPacket::parse(&buf).expect("KK must never fail parse");
+            assert_eq!(p.encryption, expected);
         }
     }
 
