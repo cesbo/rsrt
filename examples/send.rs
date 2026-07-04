@@ -166,7 +166,7 @@ async fn with_stats<F: Future>(sock: &SrtSocket, next_stats: &mut Instant, f: F)
 /// Connects or listens according to the URL (see [`SrtUrl::is_listener`]).
 async fn open(url: &SrtUrl, opts: SrtOptions) -> Result<SrtSocket, Box<dyn Error>> {
     if url.is_listener() {
-        let mut listener = SrtListener::bind(("0.0.0.0", url.port()), opts).await?;
+        let mut listener = SrtListener::bind(url.socket_addr(), opts).await?;
         eprintln!("send: listening on {}", listener.local_addr());
         let (sock, peer) = listener.accept().await?;
         eprintln!("send: accepted {peer}");

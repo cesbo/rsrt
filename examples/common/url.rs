@@ -26,11 +26,14 @@ impl SrtUrl {
                 None => (pair.to_string(), String::new()),
             })
             .collect();
-        Ok(SrtUrl {
-            host: host.to_string(),
-            port,
-            params,
-        })
+
+        let host = if host.is_empty() {
+            "0.0.0.0".to_owned()
+        } else {
+            host.to_owned()
+        };
+
+        Ok(SrtUrl { host, port, params })
     }
 
     pub fn host(&self) -> &str {
@@ -49,9 +52,9 @@ impl SrtUrl {
         &self.params
     }
 
-    /// An empty host (`srt://:9000`) or `0.0.0.0` means "listen here".
+    /// `0.0.0.0` means "listen here".
     pub fn is_listener(&self) -> bool {
-        self.host.is_empty() || self.host == "0.0.0.0"
+        self.host == "0.0.0.0"
     }
 }
 
@@ -73,6 +76,7 @@ mod tests {
         assert!(SrtUrl::parse("srt://:9000").unwrap().is_listener());
         assert!(SrtUrl::parse("srt://0.0.0.0:9000").unwrap().is_listener());
         assert!(!SrtUrl::parse("srt://127.0.0.1:9000").unwrap().is_listener());
+        assert_eq!(SrtUrl::parse("srt://:9000").unwrap().host(), "0.0.0.0");
     }
 
     #[test]

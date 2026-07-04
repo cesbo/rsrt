@@ -144,7 +144,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 /// Connects or listens according to the URL (see [`SrtUrl::is_listener`]).
 async fn open(url: &SrtUrl, opts: SrtOptions) -> Result<SrtSocket, Box<dyn Error>> {
     if url.is_listener() {
-        let mut listener = SrtListener::bind(("0.0.0.0", url.port()), opts).await?;
+        let mut listener = SrtListener::bind(url.socket_addr(), opts).await?;
         eprintln!("recv: listening on {}", listener.local_addr());
         let (sock, peer) = listener.accept().await?;
         match sock.streamid() {
