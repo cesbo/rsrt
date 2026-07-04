@@ -17,7 +17,7 @@ use std::time::{
     Instant,
 };
 
-use srt::{
+use crate::{
     core::{
         Receiver,
         ReceiverConfig,

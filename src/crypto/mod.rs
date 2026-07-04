@@ -25,27 +25,12 @@ pub use self::{
         KmReqOutcome,
         KmRspOutcome,
     },
-    ctr::{
-        apply_keystream,
-        CtrCipher,
-    },
     keys::{
-        derive_kek,
-        random_salt,
-        unwrap_key,
-        wrap_key,
-        Kek,
         KeyLength,
-        SecretKey,
         PASSPHRASE_MAX,
         PASSPHRASE_MIN,
     },
-    km::{
-        KmKeys,
-        KmMessage,
-        KmResponse,
-        KmState,
-    },
+    km::KmState,
 };
 
 /// Errors from KM/key-material processing. Never fatal by themselves —

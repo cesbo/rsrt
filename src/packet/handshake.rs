@@ -74,6 +74,9 @@ impl HandshakeType {
 }
 
 /// SRT_REJ rejection reasons (handshake type = 1000 + reason).
+/// The full spec table is kept even where this implementation never
+/// produces a given code.
+#[allow(dead_code)]
 pub mod reject {
     pub const UNKNOWN: u32 = 1000;
     pub const SYSTEM: u32 = 1001;
@@ -241,6 +244,7 @@ impl HandshakeCif {
     }
 
     /// True if the peer attached key material (encryption requested).
+    #[cfg(test)]
     pub fn requests_encryption(&self) -> bool {
         self.encryption != 0
             || self
@@ -410,6 +414,8 @@ impl HsFlags {
     pub const REXMITFLG: u32 = 0x20;
     /// File/stream mode marker — must NOT be set in live mode.
     pub const STREAM: u32 = 0x40;
+    /// Kept for spec-table completeness; never negotiated in live mode.
+    #[allow(dead_code)]
     pub const PACKET_FILTER: u32 = 0x80;
 
     pub fn contains(self, bits: u32) -> bool {

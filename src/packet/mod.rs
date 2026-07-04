@@ -17,6 +17,8 @@ mod types;
 
 use std::fmt;
 
+#[cfg(test)]
+pub use self::handshake::SRT_CMD_SID;
 pub use self::{
     control::{
         AckCif,
@@ -39,14 +41,8 @@ pub use self::{
         HS_EXT_CONFIG,
         HS_EXT_HSREQ,
         HS_EXT_KMREQ,
-        SRT_CMD_CONGESTION,
         SRT_CMD_FILTER,
         SRT_CMD_GROUP,
-        SRT_CMD_HSREQ,
-        SRT_CMD_HSRSP,
-        SRT_CMD_KMREQ,
-        SRT_CMD_KMRSP,
-        SRT_CMD_SID,
         SRT_MAGIC,
         SRT_VERSION,
     },
@@ -100,6 +96,7 @@ impl Packet {
         }
     }
 
+    #[cfg(test)]
     pub fn timestamp(&self) -> Timestamp {
         match self {
             Packet::Data(p) => p.timestamp,

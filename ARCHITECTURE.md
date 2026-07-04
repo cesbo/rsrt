@@ -34,7 +34,10 @@ The crate is split into four layers. Lower layers never depend on higher ones.
 ```
 
 Support files: `src/error.rs` (`SrtError`), `src/options.rs` (`SrtOptions`),
-`src/lib.rs` (re-exports only).
+`src/lib.rs` (re-exports only). Layers 1–3 (`packet`, `crypto`, `core`) are
+crate-private; the only public surface is the root re-exports in `src/lib.rs`
+(`SrtSocket`, `SrtListener`, `SrtOptions`, `SrtError`, `CloseReason`, `Stats`,
+`KeyLength`).
 
 ### Layer 1 — packet codec (`src/packet/`)
 
@@ -157,9 +160,13 @@ then: drain poll_transmit -> socket.send_to, drain poll_deliver -> data mpsc
   passphrases, salts or KM blob contents.
 - No `unsafe`.
 - Errors: one public `SrtError` in `src/error.rs`.
-- Every module carries unit tests in-file (`#[cfg(test)] mod tests`).
+- Every module carries unit tests in-file (`#[cfg(test)] mod tests`). The
+  sans-I/O simulation suites (`sim_tests`, `encrypted_sim_tests`,
+  `tsbpd_stall_tests`) live in `src/core/` as `#[cfg(test)]` modules because
+  they exercise crate-private internals.
 - Integration tests in `tests/` (interop with srt-live-transmit, lossy-proxy
-  ARQ test). Examples in `examples/` (`recv.rs`, `send.rs`).
+  ARQ test) use only the public API. Examples in `examples/` (`recv.rs`,
+  `send.rs`).
 - Payload limit in live mode: 1456 bytes (MSS 1500 − 28 IPv4/UDP − 16 SRT).
   `send()` of anything larger returns `SrtError::PayloadTooLarge`.
 

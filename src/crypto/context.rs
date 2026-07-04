@@ -566,11 +566,13 @@ impl Crypto {
     /// Sender-side KM state (`SRT_KM_S_*`): SECURED once the peer confirmed
     /// our KMREQ (or, on a responder, immediately — it inherited the
     /// caller's keys).
+    #[cfg(test)]
     pub fn snd_km_state(&self) -> KmState {
         self.snd_state
     }
 
     /// Receiver-side KM state.
+    #[cfg(test)]
     pub fn rcv_km_state(&self) -> KmState {
         self.rcv_state
     }

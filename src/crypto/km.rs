@@ -215,6 +215,7 @@ impl KmResponse<'_> {
     }
 
     /// Failure-KMRSP payload (little-endian; §5.1).
+    #[cfg(test)]
     pub fn encode_status(state: KmState) -> [u8; 4] {
         (state as u32).to_le_bytes()
     }

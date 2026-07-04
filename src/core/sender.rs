@@ -560,11 +560,13 @@ impl Sender {
     /// True once at least one full ACK's RTT pair passed the initial-value
     /// gate and was adopted (i.e. [`Sender::rtt`] reflects the path, not
     /// the initial constants).
+    #[cfg(test)]
     pub fn has_rtt_sample(&self) -> bool {
         self.rtt_adopted
     }
 
     /// Packets currently buffered (scheduled or in flight, unacknowledged).
+    #[cfg(test)]
     pub fn buffered_pkts(&self) -> usize {
         self.buffer.len()
     }

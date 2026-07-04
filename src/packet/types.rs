@@ -112,17 +112,6 @@ impl fmt::Debug for SocketId {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Timestamp(pub u32);
 
-impl Timestamp {
-    pub const fn as_micros(self) -> u32 {
-        self.0
-    }
-
-    /// Wire-order difference `self - other`, wrapping (mod 2^32).
-    pub fn wrapping_sub(self, other: Timestamp) -> u32 {
-        self.0.wrapping_sub(other.0)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,12 +146,5 @@ mod tests {
     fn msg_wraps() {
         let max = MsgNumber::new(MsgNumber::MASK);
         assert_eq!(max.next(), MsgNumber::new(0));
-    }
-
-    #[test]
-    fn timestamp_wrapping_sub() {
-        let a = Timestamp(10);
-        let b = Timestamp(u32::MAX - 9);
-        assert_eq!(a.wrapping_sub(b), 20);
     }
 }

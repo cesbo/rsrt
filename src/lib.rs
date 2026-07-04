@@ -6,10 +6,10 @@
 //! refresh; interoperable with libsrt 1.4.4 (`srt-live-transmit`). No
 //! rendezvous mode, no file/messaging mode.
 //!
-//! Layering (see ARCHITECTURE.md):
-//! - [`packet`] — pure wire codec;
-//! - [`crypto`] — sans-I/O HaiCrypt engine (keys, KM messages, AES-CTR);
-//! - [`core`] — sans-I/O connection state machine;
+//! Layering (internal modules, see ARCHITECTURE.md):
+//! - `packet` — pure wire codec;
+//! - `crypto` — sans-I/O HaiCrypt engine (keys, KM messages, AES-CTR);
+//! - `core` — sans-I/O connection state machine;
 //! - crate root — tokio-based runtime and public API.
 //!
 //! # Receiving (caller)
@@ -35,14 +35,13 @@
 
 #![deny(unsafe_code)]
 
-pub mod core;
-pub mod crypto;
-pub mod packet;
-
+mod core;
+mod crypto;
 mod error;
 mod listener;
 mod net;
 mod options;
+mod packet;
 mod socket;
 
 pub use self::{

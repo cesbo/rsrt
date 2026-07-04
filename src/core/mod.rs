@@ -18,6 +18,13 @@ pub mod receiver;
 pub mod sender;
 pub mod time;
 
+#[cfg(test)]
+mod encrypted_sim_tests;
+#[cfg(test)]
+mod sim_tests;
+#[cfg(test)]
+mod tsbpd_stall_tests;
+
 use std::{
     collections::VecDeque,
     net::SocketAddrV4,
@@ -43,17 +50,12 @@ pub use self::{
     receiver::{
         Receiver,
         ReceiverConfig,
-        ReceiverStats,
     },
     sender::{
         Sender,
         SenderConfig,
-        SenderStats,
     },
-    time::{
-        Timebase,
-        TimestampExtender,
-    },
+    time::Timebase,
 };
 use crate::{
     crypto::{

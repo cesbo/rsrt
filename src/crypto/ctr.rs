@@ -85,6 +85,7 @@ impl CtrCipher {
 /// One-shot convenience over [`CtrCipher`]: re-expands the key schedule on
 /// EVERY call. Per-packet paths must hold a [`CtrCipher`] per installed
 /// SEK instead, like libsrt's per-key `CRYSPR_AESCTX`.
+#[cfg(test)]
 pub fn apply_keystream(key: &SecretKey, salt: &[u8; 16], seq: u32, payload: &mut [u8]) {
     CtrCipher::new(key).apply_keystream(salt, seq, payload);
 }
