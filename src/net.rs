@@ -155,9 +155,8 @@ mod tests {
         assert_eq!(from, b.local_addr().unwrap());
     }
 
-    /// A second binder that sets `SO_REUSEADDR` (as libsrt does by default,
-    /// and as this library did via the `udp` crate before the fix) must get
-    /// `AddrInUse`. If `bind_udp` ever sets `SO_REUSEADDR` again, the rival
+    /// A second binder that sets `SO_REUSEADDR` (as libsrt does by default)
+    /// must get `AddrInUse`. If `bind_udp` ever sets `SO_REUSEADDR`, the rival
     /// bind succeeds and the kernel silently redirects all unicast datagrams
     /// to it — this test then fails.
     #[tokio::test]

@@ -147,9 +147,10 @@ then: drain poll_transmit -> socket.send_to, drain poll_deliver -> data mpsc
   `Arc<tokio::net::UdpSocket>` for sends), answers inductions statelessly,
   and on accepted conclusions spawns a connection driver, demuxing subsequent
   datagrams to it by (peer addr, dst socket id) via mpsc.
-- UDP sockets are created with the `udp` crate (cesbo/libudp: buffer sizing
-  etc.), then `into_std()` → `set_nonblocking(true)` → `tokio::net::UdpSocket::from_std`.
-  IPv4 only (libudp is `SocketAddrV4`-based).
+- UDP sockets are built via `socket2` (`src/net.rs::bind_udp`: receive buffer
+  sized before `bind`, deliberately no `SO_REUSEADDR` — a duplicate bind on an
+  SRT port must fail instead of hijacking traffic), then
+  `set_nonblocking(true)` → `tokio::net::UdpSocket::from_std`. IPv4 only.
 
 ## Conventions
 

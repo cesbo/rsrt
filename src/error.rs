@@ -63,7 +63,7 @@ pub enum SrtError {
     /// Operation on a connection that is closed.
     Closed(CloseReason),
     /// Address did not resolve to any IPv4 address (the library is
-    /// IPv4-only, matching the underlying `udp` crate).
+    /// IPv4-only).
     NoIpv4Address,
     /// StreamID longer than 512 bytes.
     StreamIdTooLong,
