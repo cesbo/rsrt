@@ -1,6 +1,6 @@
 [package]
 name = "srt"
-version = "0.0.1"
+version = "0.1.0"
 authors = ["Andrey Dyldin <and@cesbo.com>"]
 edition = "2021"
 
@@ -8,10 +8,6 @@ edition = "2021"
 tracing = "0.1"
 tokio = { version = "1.48", features = ["rt", "net", "time", "sync", "macros"] }
 socket2 = "0.6"
-# Encryption (HaiCrypt): AES-CTR payload cipher, AES keywrap for key material,
-# PBKDF2-HMAC-SHA1 passphrase KEK derivation — pure-Rust RustCrypto stack.
-# `zeroize`: cached round-key schedules (`crypto::ctr::CtrCipher`) scrub
-# themselves on drop, matching `SecretKey`'s guarantee for the raw bytes.
 aes = { version = "0.8", features = ["zeroize"] }
 ctr = "0.9"
 aes-kw = "0.2"
