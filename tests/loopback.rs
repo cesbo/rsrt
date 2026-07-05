@@ -12,6 +12,7 @@ use std::{
 };
 
 use srt::{
+    CloseReason,
     SrtError,
     SrtListener,
     SrtOptions,
@@ -342,4 +343,52 @@ async fn dropping_the_handle_closes_the_connection() {
     tokio::time::timeout(Duration::from_secs(5), run)
         .await
         .expect("accepted side never saw the close");
+}
+
+#[tokio::test]
+async fn data_idle_closes_silent_caller() {
+    // A 500 ms data-idle window on the caller, and nobody sends: the
+    // drivers' automatic 1 s keepalives keep peer-idle quiet, so only the
+    // data-idle window can close the connection. The caller's driver must
+    // wake at the window deadline on its own (no traffic to prompt it),
+    // and the accepted peer sees the close as a clean SHUTDOWN.
+    let (mut caller, mut accepted, _listener) = pair(
+        SrtOptions::default().data_idle_timeout(Duration::from_millis(500)),
+        SrtOptions::default(),
+    )
+    .await;
+    let run = async {
+        let closed = caller.recv().await;
+        assert!(
+            matches!(closed, Err(SrtError::Closed(CloseReason::DataIdle))),
+            "expected DataIdle close, got {closed:?}"
+        );
+        assert_eq!(accepted.recv().await.expect("peer recv"), None);
+    };
+    tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("data-idle close timed out");
+}
+
+#[tokio::test]
+async fn data_idle_closes_silent_accepted_inherited_from_bind() {
+    // The mirror direction, with the option set only at bind: the accepted
+    // socket inherits it, breaks with DataIdle, and the silent caller sees
+    // a clean SHUTDOWN.
+    let (mut caller, mut accepted, _listener) = pair(
+        SrtOptions::default(),
+        SrtOptions::default().data_idle_timeout(Duration::from_millis(500)),
+    )
+    .await;
+    let run = async {
+        let closed = accepted.recv().await;
+        assert!(
+            matches!(closed, Err(SrtError::Closed(CloseReason::DataIdle))),
+            "expected DataIdle close, got {closed:?}"
+        );
+        assert_eq!(caller.recv().await.expect("peer recv"), None);
+    };
+    tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("data-idle close timed out");
 }

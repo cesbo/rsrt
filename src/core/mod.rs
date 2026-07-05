@@ -181,6 +181,8 @@ enum State {
 /// - keepalive: send KEEPALIVE after [`KEEPALIVE_INTERVAL`] without any outgoing packet;
 /// - liveness: no packet from the peer for `peer_idle_timeout` → close with
 ///   [`CloseReason::PeerIdle`];
+/// - data idle (optional): no data packet from the peer for `data_idle_timeout` → close with
+///   [`CloseReason::DataIdle`] - keepalives and other control traffic do not count;
 /// - on close (any reason): emit SHUTDOWN (best effort), drain state.
 pub struct Connection {
     state: State,
@@ -201,6 +203,10 @@ pub struct Connection {
     last_sent: Instant,
     /// When anything was last received from the peer (liveness base).
     last_recv: Instant,
+    /// When a data packet was last received from the peer; base for the
+    /// optional data-idle check (`SrtOptions::data_idle_timeout`). Starts
+    /// at connection establishment.
+    last_data: Instant,
     /// EXP expiration counter (`EXPCount`); reset to 1 by any received
     /// packet, incremented by each EXP timer expiry.
     exp_count: u32,
@@ -255,6 +261,7 @@ impl Connection {
             transmit_q: VecDeque::new(),
             last_sent: now,
             last_recv: now,
+            last_data: now,
             exp_count: 1,
             closed_stats: Stats::default(),
         }
@@ -306,6 +313,7 @@ impl Connection {
             transmit_q: VecDeque::from([hs_reply]),
             last_sent: now,
             last_recv: now,
+            last_data: now,
             exp_count: 1,
             closed_stats: Stats::default(),
         }
@@ -362,6 +370,7 @@ impl Connection {
     /// Runs every timer that is due at `now`.
     pub fn handle_timer(&mut self, now: Instant) {
         let mut peer_idle = false;
+        let mut data_idle = false;
         match &mut self.state {
             State::Connecting { hs, .. } => {
                 if hs.is_timed_out(now) {
@@ -389,9 +398,23 @@ impl Connection {
                     }
                 }
 
+                // Data-idle break: a plain wall-clock window on data arrival.
+                // Not gated by the EXP escalation above - control traffic
+                // keeps resetting EXPCount, so an escalation gate would never
+                // open while the peer sends keepalives, which is exactly the
+                // case this timer exists for.
+                if let Some(window) = self.opts.data_idle_timeout {
+                    if now.duration_since(self.last_data) >= window {
+                        data_idle = true;
+                    }
+                }
+
                 // Keepalive after 1 s of send silence. `last_sent` advances
                 // at queue time so a late-polled driver queues only one.
-                if !peer_idle && now.duration_since(self.last_sent) >= KEEPALIVE_INTERVAL {
+                if !peer_idle
+                    && !data_idle
+                    && now.duration_since(self.last_sent) >= KEEPALIVE_INTERVAL
+                {
                     trace!("send direction idle; queueing KEEPALIVE");
                     self.transmit_q.push_back(control(ControlType::KeepAlive));
                     self.last_sent = now;
@@ -405,6 +428,16 @@ impl Connection {
                 "nothing received within the peer idle timeout; breaking connection"
             );
             self.close_with(now, CloseReason::PeerIdle, true);
+        }
+        // Total silence can trip both idle timers in one tick; peer idle is
+        // the more precise diagnosis then, so data idle closes (and logs)
+        // only when it fires alone.
+        if data_idle && !peer_idle {
+            warn!(
+                idle = ?now.duration_since(self.last_data),
+                "no data received within the data idle timeout; breaking connection"
+            );
+            self.close_with(now, CloseReason::DataIdle, true);
         }
     }
 
@@ -512,6 +545,9 @@ impl Connection {
                 deadline = deadline.min(self.last_sent + KEEPALIVE_INTERVAL);
                 let (rtt, rtt_var) = receiver.rtt();
                 deadline = deadline.min(exp_deadline(self.last_recv, self.exp_count, rtt, rtt_var));
+                if let Some(window) = self.opts.data_idle_timeout {
+                    deadline = deadline.min(self.last_data + window);
+                }
                 Some(deadline)
             }
             // A closed connection drives no timers; remaining receive-buffer
@@ -569,6 +605,8 @@ impl Connection {
     }
 
     fn handle_data_packet(&mut self, now: Instant, data: DataPacket) {
+        // Data arrival, decryptable or not, resets the data-idle window.
+        self.last_data = now;
         let discrepancy = match &mut self.state {
             State::Connecting { early_data, .. } => {
                 // Data can race ahead of the conclusion response
@@ -838,6 +876,7 @@ impl Connection {
         }
         self.exp_count = 1;
         self.last_recv = now;
+        self.last_data = now;
     }
 
     fn close_with(&mut self, now: Instant, reason: CloseReason, send_shutdown: bool) {
@@ -1106,6 +1145,43 @@ mod tests {
     /// Drains all pending transmissions.
     fn drain(conn: &mut Connection, now: Instant) -> Vec<Packet> {
         std::iter::from_fn(|| conn.poll_transmit(now)).collect()
+    }
+
+    /// Drives `conn` strictly at its advertised deadlines from `from` until
+    /// `until` (or until it leaves Established), injecting a peer KEEPALIVE
+    /// every 500 ms so peer-idle liveness stays fresh and only the data-idle
+    /// window can break the connection. Returns the instant of the last
+    /// processed event and everything transmitted along the way.
+    fn pump_with_keepalives(
+        conn: &mut Connection,
+        dst: SocketId,
+        from: Instant,
+        until: Instant,
+    ) -> (Instant, Vec<Packet>) {
+        const KEEPALIVE_EVERY: Duration = Duration::from_millis(500);
+        let mut now = from;
+        let mut next_ka = from + KEEPALIVE_EVERY;
+        let mut sent = Vec::new();
+        while conn.state() == ConnState::Established {
+            let deadline = conn
+                .next_deadline(now)
+                .expect("deadline while established");
+            let next = deadline.min(next_ka).max(now + MS);
+            if next > until {
+                break;
+            }
+            now = next;
+            if now >= next_ka {
+                conn.handle_packet(now, control_to(dst, ControlType::KeepAlive));
+                next_ka += KEEPALIVE_EVERY;
+            }
+            if now >= deadline {
+                conn.handle_timer(now);
+            }
+            sent.extend(drain(conn, now));
+            while conn.poll_deliver(now).is_some() {}
+        }
+        (now, sent)
     }
 
     #[test]
@@ -1411,6 +1487,197 @@ mod tests {
             ConnState::Established,
             "liveness must be refreshed"
         );
+    }
+
+    #[test]
+    fn data_idle_fires_despite_keepalives() {
+        let t0 = Instant::now();
+        let lopts = SrtOptions::default().data_idle_timeout(Duration::from_secs(2));
+        let (_c, mut a) = establish_pair(t0, SrtOptions::default(), lopts);
+        drain(&mut a, t0);
+        // Keepalives every 500 ms refresh peer-idle liveness but never the
+        // data-idle window: the accepted side must still break at 2 s.
+        let (now, sent) = pump_with_keepalives(&mut a, ACCEPT_ID, t0, t0 + Duration::from_secs(4));
+        assert_eq!(a.state(), ConnState::Closed(CloseReason::DataIdle));
+        let idle = now.duration_since(t0);
+        assert!(idle >= Duration::from_secs(2), "broke too early: {idle:?}");
+        assert!(
+            idle < Duration::from_millis(2_500),
+            "broke too late: {idle:?}"
+        );
+        // The still-reachable peer is told with a best-effort SHUTDOWN.
+        assert!(sent.iter().any(|p| matches!(
+            p,
+            Packet::Control(ControlPacket {
+                control_type: ControlType::Shutdown,
+                ..
+            })
+        )));
+    }
+
+    #[test]
+    fn data_packet_resets_data_idle_window() {
+        let t0 = Instant::now();
+        let copts = SrtOptions::default().data_idle_timeout(Duration::from_secs(2));
+        let (mut c, _a) = establish_pair(t0, copts, SrtOptions::default());
+        drain(&mut c, t0);
+        // A data packet at 1.5 s restarts the window: the connection must
+        // survive past the original 2 s deadline...
+        let (data_at, _) =
+            pump_with_keepalives(&mut c, CALLER_ID, t0, t0 + Duration::from_millis(1_500));
+        assert_eq!(c.state(), ConnState::Established);
+        c.handle_packet(
+            data_at,
+            Packet::Data(data_packet(ISN.value(), CALLER_ID, vec![7; 16])),
+        );
+        let (now, _) = pump_with_keepalives(&mut c, CALLER_ID, data_at, t0 + Duration::from_secs(3));
+        assert_eq!(
+            c.state(),
+            ConnState::Established,
+            "window must reset on data arrival"
+        );
+        // ...and break one full window after the last data packet.
+        let (end, _) = pump_with_keepalives(&mut c, CALLER_ID, now, t0 + Duration::from_secs(4));
+        assert_eq!(c.state(), ConnState::Closed(CloseReason::DataIdle));
+        let idle = end.duration_since(data_at);
+        assert!(idle >= Duration::from_secs(2), "broke too early: {idle:?}");
+        assert!(
+            idle < Duration::from_millis(2_500),
+            "broke too late: {idle:?}"
+        );
+    }
+
+    #[test]
+    fn data_idle_none_never_fires() {
+        // Default options (no data-idle window): a connected but silent peer
+        // that keeps sending keepalives stays connected indefinitely.
+        let t0 = Instant::now();
+        let (mut c, _a) = establish_pair(t0, SrtOptions::default(), SrtOptions::default());
+        drain(&mut c, t0);
+        pump_with_keepalives(&mut c, CALLER_ID, t0, t0 + Duration::from_secs(12));
+        assert_eq!(c.state(), ConnState::Established);
+    }
+
+    #[test]
+    fn data_idle_shorter_than_peer_idle_wins() {
+        // Total silence with a 1 s data-idle window and the default 5 s
+        // peer-idle timeout: the data-idle break is a plain wall-clock
+        // window, not gated by the EXP escalation that guards peer-idle.
+        let t0 = Instant::now();
+        let copts = SrtOptions::default().data_idle_timeout(Duration::from_secs(1));
+        let (mut c, _a) = establish_pair(t0, copts, SrtOptions::default());
+        drain(&mut c, t0);
+        let mut now = t0;
+        let cap = t0 + Duration::from_secs(3);
+        while c.state() == ConnState::Established && now < cap {
+            now = c
+                .next_deadline(now)
+                .expect("deadline while established")
+                .max(now + MS);
+            c.handle_timer(now);
+            drain(&mut c, now);
+        }
+        assert_eq!(c.state(), ConnState::Closed(CloseReason::DataIdle));
+        let idle = now.duration_since(t0);
+        assert!(idle >= Duration::from_secs(1), "broke too early: {idle:?}");
+        assert!(
+            idle < Duration::from_millis(1_100),
+            "broke too late: {idle:?}"
+        );
+    }
+
+    #[test]
+    fn peer_idle_fires_first_when_shorter() {
+        // Total silence trips both idle timers eventually; with the default
+        // 5 s peer-idle timeout due first, the close (and its reason) is
+        // PeerIdle - a 10 s data-idle window never preempts it.
+        let t0 = Instant::now();
+        let copts = SrtOptions::default().data_idle_timeout(Duration::from_secs(10));
+        let (mut c, _a) = establish_pair(t0, copts, SrtOptions::default());
+        drain(&mut c, t0);
+        let mut now = t0;
+        let cap = t0 + Duration::from_secs(12);
+        while c.state() == ConnState::Established && now < cap {
+            now = c
+                .next_deadline(now)
+                .expect("deadline while established")
+                .max(now + MS);
+            c.handle_timer(now);
+            drain(&mut c, now);
+        }
+        assert_eq!(c.state(), ConnState::Closed(CloseReason::PeerIdle));
+        let idle = now.duration_since(t0);
+        assert!(idle >= Duration::from_secs(5), "broke too early: {idle:?}");
+        assert!(idle < Duration::from_secs(6), "broke too late: {idle:?}");
+    }
+
+    #[test]
+    fn data_idle_window_starts_at_establishment() {
+        // The conclusion response is delayed 2 s (inside the 3 s connect
+        // timeout): the 1 s data-idle window must start at establishment,
+        // not at connection construction.
+        let t0 = Instant::now();
+        let mut c = caller(
+            t0,
+            SrtOptions::default().data_idle_timeout(Duration::from_secs(1)),
+        );
+        let mut l = Listener::new(7, Timebase::new(t0), SrtOptions::default());
+        let ind = c.poll_transmit(t0).unwrap();
+        let rsp = match l.handle_handshake(t0, caller_addr(), hs_cif(&ind), ACCEPT_ID, UNUSED_ISN) {
+            ListenerAction::Reply(p) => p,
+            _ => panic!(),
+        };
+        c.handle_packet(t0, rsp);
+        let conc = c.poll_transmit(t0).unwrap();
+        let reply =
+            match l.handle_handshake(t0, caller_addr(), hs_cif(&conc), ACCEPT_ID, UNUSED_ISN) {
+                ListenerAction::Accept { reply, .. } => reply,
+                _ => panic!(),
+            };
+        let established_at = t0 + Duration::from_secs(2);
+        c.handle_packet(established_at, reply);
+        assert_eq!(c.state(), ConnState::Established);
+        drain(&mut c, established_at);
+
+        // Already 2 s past construction: a window started there would have
+        // expired; one started at establishment has 1 s left.
+        let (now, _) = pump_with_keepalives(
+            &mut c,
+            CALLER_ID,
+            established_at,
+            established_at + Duration::from_millis(900),
+        );
+        assert_eq!(
+            c.state(),
+            ConnState::Established,
+            "window must start at establishment"
+        );
+        let (end, _) =
+            pump_with_keepalives(&mut c, CALLER_ID, now, established_at + Duration::from_secs(2));
+        assert_eq!(c.state(), ConnState::Closed(CloseReason::DataIdle));
+        let idle = end.duration_since(established_at);
+        assert!(idle >= Duration::from_secs(1), "broke too early: {idle:?}");
+        assert!(
+            idle < Duration::from_millis(1_100),
+            "broke too late: {idle:?}"
+        );
+    }
+
+    #[test]
+    fn next_deadline_advertises_data_idle_expiry() {
+        // A data-idle window shorter than every other armed timer (full-ACK
+        // tick 10 ms, EXP floor 300 ms, keepalive 1 s): the advertised
+        // deadline must be exactly the window expiry, so a driver with an
+        // otherwise silent socket wakes right when the check is due.
+        let t0 = Instant::now();
+        let window = Duration::from_millis(5);
+        let copts = SrtOptions::default().data_idle_timeout(window);
+        let (mut c, _a) = establish_pair(t0, copts, SrtOptions::default());
+        drain(&mut c, t0);
+        assert_eq!(c.next_deadline(t0), Some(t0 + window));
+        // Driving the timer at that instant breaks the connection.
+        c.handle_timer(t0 + window);
+        assert_eq!(c.state(), ConnState::Closed(CloseReason::DataIdle));
     }
 
     #[test]

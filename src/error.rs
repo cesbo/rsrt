@@ -12,6 +12,10 @@ pub enum CloseReason {
     Shutdown,
     /// Nothing received from the peer for the peer-idle timeout (5 s default).
     PeerIdle,
+    /// No data packet received within the data-idle timeout
+    /// (`SrtOptions::data_idle_timeout`); keepalives and other control
+    /// traffic do not count.
+    DataIdle,
     /// Closed by the local application.
     Local,
     /// Caller handshake did not complete within the connect timeout.
@@ -30,6 +34,7 @@ impl fmt::Display for CloseReason {
         match self {
             CloseReason::Shutdown => write!(f, "peer shutdown"),
             CloseReason::PeerIdle => write!(f, "peer idle timeout"),
+            CloseReason::DataIdle => write!(f, "data idle timeout"),
             CloseReason::Local => write!(f, "closed locally"),
             CloseReason::ConnectTimeout => write!(f, "connect timeout"),
             CloseReason::Rejected(code) => write!(f, "rejected by peer (code {code})"),

@@ -716,6 +716,52 @@ fn peer_goes_silent_peer_idle_close() {
     );
 }
 
+/// A connected but silent sender: an idle established pair exchanges
+/// keepalives automatically, so peer-idle never fires in either direction
+/// and only the accepted side's data-idle window can break the connection.
+/// The best-effort SHUTDOWN crosses to the still-alive caller.
+#[test]
+fn data_idle_closes_silent_sender_shutdown_crosses() {
+    let t0 = Instant::now();
+    let mut sim = Sim::new(
+        t0,
+        SrtOptions::default(),
+        SrtOptions::default().data_idle_timeout(Duration::from_secs(2)),
+        0xDA7A,
+    );
+    sim.run_until(100, "handshake", Sim::both_established);
+    let established_at = sim.now;
+
+    // Nobody sends: the accepted side must break at its 2 s window (which
+    // opened at accept, a few link round-trips before `established_at`).
+    let mut steps = 0u64;
+    while sim.accepted_mut().state() == ConnState::Established {
+        sim.step();
+        steps += 1;
+        assert!(steps < 3_000, "no DataIdle close within 3 s");
+    }
+    assert_eq!(
+        sim.accepted_mut().state(),
+        ConnState::Closed(CloseReason::DataIdle)
+    );
+    let idle = sim.now.duration_since(established_at);
+    assert!(
+        idle >= Duration::from_millis(1_900),
+        "broke too early: {idle:?}"
+    );
+    assert!(
+        idle < Duration::from_millis(2_200),
+        "broke too late: {idle:?}"
+    );
+
+    // The caller, alive on keepalives alone, sees a clean SHUTDOWN.
+    sim.run_for(50);
+    assert_eq!(
+        sim.caller.state(),
+        ConnState::Closed(CloseReason::Shutdown)
+    );
+}
+
 /// Long-run wrap: the shared timebase starts ~71 minutes in the fake past,
 /// so wire timestamps cross the 32-bit µs wrap 30 s into the stream. The
 /// stream must cross the boundary without stalls, drops or reordering.

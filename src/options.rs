@@ -46,6 +46,14 @@ pub struct SrtOptions {
     /// Connection is broken after this long without any packet from the
     /// peer. Default 5 s.
     pub peer_idle_timeout: Duration,
+    /// Connection is broken with `CloseReason::DataIdle` after this long
+    /// without a data packet from the peer - keepalives and other control
+    /// traffic do not count, unlike `peer_idle_timeout`, which any packet
+    /// resets. The window starts at connection establishment and resets on
+    /// every data arrival, decryptable or not - a stream of undecryptable
+    /// data keeps the connection alive. `None` (the default) disables the
+    /// check. A library extension; the SRT spec has no equivalent timer.
+    pub data_idle_timeout: Option<Duration>,
     /// UDP socket receive buffer size in bytes (SO_RCVBUF), if set.
     pub udp_recv_buffer: Option<usize>,
     /// Encryption passphrase (SRTO_PASSPHRASE). `None` or empty =
@@ -89,6 +97,7 @@ impl fmt::Debug for SrtOptions {
             .field("send_buffer_pkts", &self.send_buffer_pkts)
             .field("connect_timeout", &self.connect_timeout)
             .field("peer_idle_timeout", &self.peer_idle_timeout)
+            .field("data_idle_timeout", &self.data_idle_timeout)
             .field("udp_recv_buffer", &self.udp_recv_buffer)
             .field("passphrase", &self.passphrase.as_ref().map(|_| "<redacted>"))
             .field("pbkeylen", &self.pbkeylen)
@@ -110,6 +119,7 @@ impl Default for SrtOptions {
             send_buffer_pkts: 8192,
             connect_timeout: Duration::from_secs(3),
             peer_idle_timeout: Duration::from_secs(5),
+            data_idle_timeout: None,
             udp_recv_buffer: None,
             passphrase: None,
             pbkeylen: None,
@@ -147,6 +157,11 @@ impl SrtOptions {
 
     pub fn peer_idle_timeout(mut self, timeout: Duration) -> Self {
         self.peer_idle_timeout = timeout;
+        self
+    }
+
+    pub fn data_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.data_idle_timeout = Some(timeout);
         self
     }
 
