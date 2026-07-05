@@ -131,6 +131,8 @@ pub struct Stats {
     pub km_refreshes: u64,
     pub rtt_us: u32,
     pub rtt_var_us: u32,
+    /// Net TSBPD clock-drift correction.
+    pub tsbpd_drift_us: i64,
 }
 
 // One `State` lives per connection (never stored in collections), so boxing
@@ -171,9 +173,9 @@ enum State {
 ///   log; duplicate CONCLUSION handshake (listener side) → re-send the stored handshake reply;
 ///   undecodable datagrams → log, drop;
 /// - data decryption (docs/spec/encryption.md §9.4): with a crypto context, payloads are decrypted
-///   in place before the receiver sees them; an undecryptable packet (unkeyed SEK slot, or
-///   KK ≠ None without any crypto context — packets.md §5.10) still occupies its sequence slot and
-///   is ACKed, but is never delivered and never NAK-repaired — the connection stays up;
+///   in place before the receiver sees them; an undecryptable packet (unkeyed SEK slot, or KK ≠
+///   None without any crypto context — packets.md §5.10) still occupies its sequence slot and is
+///   ACKed, but is never delivered and never NAK-repaired — the connection stays up;
 /// - key refresh (docs/spec/encryption.md §10, §11): `Crypto::on_ack` runs on the ACK-processing
 ///   path and its KMREQs go out as `UMSG_EXT`; incoming in-stream KMREQ/KMRSP feed the crypto
 ///   engine, failures answered per the §11.3 policy with total silence (encryption is always
@@ -463,9 +465,7 @@ impl Connection {
             // With crypto, the payload is encrypted in place at buffering
             // time and the KK bits are stored with it — the buffer holds
             // ciphertext, retransmissions included (encryption.md §9.3).
-            State::Established { sender, crypto, .. } => {
-                sender.push(now, payload, crypto.as_mut())
-            }
+            State::Established { sender, crypto, .. } => sender.push(now, payload, crypto.as_mut()),
             State::Closed { reason, .. } => Err(SrtError::Closed(*reason)),
         }
     }
@@ -660,12 +660,14 @@ impl Connection {
             // In-stream KM refresh KMX (docs/spec/encryption.md §11).
             ControlType::KmReq(payload) => self.handle_kmreq(&payload),
             ControlType::KmRsp(payload) => self.handle_kmrsp(&payload),
-            other => self.handle_transmission_control(now, other),
+            other => self.handle_transmission_control(now, ctrl.timestamp, other),
         }
     }
 
     /// ACK / NAK / ACKACK / DROPREQ — meaningful only when established.
-    fn handle_transmission_control(&mut self, now: Instant, ct: ControlType) {
+    /// `ts` is the control packet's header timestamp — an ACKACK's feeds
+    /// the receiver's TSBPD drift tracer (transmission.md §9.4).
+    fn handle_transmission_control(&mut self, now: Instant, ts: Timestamp, ct: ControlType) {
         let State::Established {
             sender,
             receiver,
@@ -699,7 +701,7 @@ impl Connection {
                 sender.handle_nak(now, &ranges);
                 violation = sender.protocol_violation();
             }
-            ControlType::AckAck { ack_number } => receiver.handle_ackack(now, ack_number),
+            ControlType::AckAck { ack_number } => receiver.handle_ackack(now, ack_number, ts),
             ControlType::DropRequest {
                 msg_number,
                 first,
@@ -743,11 +745,17 @@ impl Connection {
         let response = match crypto.as_mut() {
             Some(crypto) => match crypto.handle_kmreq(payload) {
                 KmReqOutcome::Installed(echo) => {
-                    debug!(kmrsp_len = echo.len(), "in-stream KM installed; echoing KMRSP");
+                    debug!(
+                        kmrsp_len = echo.len(),
+                        "in-stream KM installed; echoing KMRSP"
+                    );
                     Some(echo)
                 }
                 KmReqOutcome::Failed(state) => {
-                    debug!(?state, "in-stream KMREQ failed; silent (enforced encryption)");
+                    debug!(
+                        ?state,
+                        "in-stream KMREQ failed; silent (enforced encryption)"
+                    );
                     None
                 }
             },
@@ -1043,6 +1051,7 @@ fn merge_stats(sender: &Sender, receiver: &Receiver, crypto: Option<&Crypto>) ->
         km_refreshes: crypto.map_or(0, Crypto::key_switches),
         rtt_us: r.rtt_us,
         rtt_var_us: r.rtt_var_us,
+        tsbpd_drift_us: r.tsbpd_drift_us,
     }
 }
 
@@ -1163,9 +1172,7 @@ mod tests {
         let mut next_ka = from + KEEPALIVE_EVERY;
         let mut sent = Vec::new();
         while conn.state() == ConnState::Established {
-            let deadline = conn
-                .next_deadline(now)
-                .expect("deadline while established");
+            let deadline = conn.next_deadline(now).expect("deadline while established");
             let next = deadline.min(next_ka).max(now + MS);
             if next > until {
                 break;
@@ -1530,7 +1537,8 @@ mod tests {
             data_at,
             Packet::Data(data_packet(ISN.value(), CALLER_ID, vec![7; 16])),
         );
-        let (now, _) = pump_with_keepalives(&mut c, CALLER_ID, data_at, t0 + Duration::from_secs(3));
+        let (now, _) =
+            pump_with_keepalives(&mut c, CALLER_ID, data_at, t0 + Duration::from_secs(3));
         assert_eq!(
             c.state(),
             ConnState::Established,
@@ -1652,8 +1660,12 @@ mod tests {
             ConnState::Established,
             "window must start at establishment"
         );
-        let (end, _) =
-            pump_with_keepalives(&mut c, CALLER_ID, now, established_at + Duration::from_secs(2));
+        let (end, _) = pump_with_keepalives(
+            &mut c,
+            CALLER_ID,
+            now,
+            established_at + Duration::from_secs(2),
+        );
         assert_eq!(c.state(), ConnState::Closed(CloseReason::DataIdle));
         let idle = end.duration_since(established_at);
         assert!(idle >= Duration::from_secs(1), "broke too early: {idle:?}");

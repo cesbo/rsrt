@@ -9,14 +9,17 @@
 //! - full ACK every 10 ms (with RTT/buffer/rate estimates), light ACK every 64 data packets between
 //!   full ACKs; keep an ACK history so ACKACK can be matched by ACK number;
 //! - on ACKACK: RTT sample → smoothed RTT (7/8) and RTT variance (3/4), initial 100 ms / 50 ms;
+//!   plus a TSBPD drift sample from the ACKACK header timestamp (§9.4);
 //! - on DROPREQ: drop the range from the loss list, never NAK it again;
 //! - §7.1 guard: a packet landing beyond the capacity of an EMPTY buffer is an unrecoverable
 //!   sequence discrepancy — flagged via [`Receiver::sequence_discrepancy`] so the owner breaks the
 //!   connection;
-//! - TSBPD: release a buffered packet when `anchor_local + (extended_ts - anchor_ts) + rcv_latency`
-//!   is reached; missing packets whose deadline passed are skipped (counted dropped). Peer
-//!   timestamps go through [`super::time::TimestampExtender`] — mandatory for streams longer than
-//!   ~71.6 minutes;
+//! - TSBPD: release a buffered packet when `anchor_local + (extended_ts - anchor_ts) + rcv_latency
+//!   + drift_correction` is reached; missing packets whose deadline passed are skipped (counted
+//!   dropped). Peer timestamps go through [`super::time::TimestampExtender`] — mandatory for
+//!   streams longer than ~71.6 minutes — and the anchor is drift-compensated from ACKACK samples by
+//!   [`super::time::DriftTracer`], without which quartz-level clock skew (µs/minute) exhausts the
+//!   whole latency budget on multi-hour streams;
 //! - undecryptable data (encryption.md §9.4): the packet occupies its sequence slot and is ACKed
 //!   like any arrival, but is freed undelivered at its TSBPD deadline; a gap it reveals is never
 //!   NAKed.
@@ -36,7 +39,10 @@ use tracing::{
     warn,
 };
 
-use super::time::TimestampExtender;
+use super::time::{
+    DriftTracer,
+    TimestampExtender,
+};
 use crate::packet::{
     AckCif,
     ControlType,
@@ -115,6 +121,10 @@ pub struct ReceiverStats {
     pub pkts_belated: u64,
     pub rtt_us: u32,
     pub rtt_var_us: u32,
+    /// Net TSBPD drift correction applied to delivery deadlines (µs,
+    /// positive = deadlines pushed later; ≈ how far the peer's clock has
+    /// fallen behind ours since the connection started).
+    pub tsbpd_drift_us: i64,
 }
 
 /// TSBPD time base: local arrival instant of the anchor packet — the
@@ -131,8 +141,11 @@ struct Anchor {
 struct Slot {
     payload: Vec<u8>,
     msg_number: MsgNumber,
-    /// TSBPD release deadline (anchor + timestamp delta + latency).
-    deadline: Instant,
+    /// Extended peer timestamp; the TSBPD release deadline (anchor +
+    /// timestamp delta + latency + drift correction) is computed from it on
+    /// demand, so a drift update reaches already-buffered packets too
+    /// (libsrt likewise computes play time lazily at delivery).
+    ext_us: u64,
     /// Payload could not be decrypted (encryption.md §9.4): the slot is
     /// freed at its deadline instead of delivered — the application sees
     /// a sequence gap exactly like a TSBPD drop.
@@ -186,6 +199,10 @@ pub struct Receiver {
     rtt_var_us: u32,
     /// True until the first ACKACK RTT sample (which resets, not smooths).
     rtt_first: bool,
+    /// The connection's first ACKACK RTT sample — the RTT₀ approximation of
+    /// the §9.4 drift formula's `(rtt − first_rtt)/2` path-delay correction.
+    first_rtt_us: u32,
+    drift: DriftTracer,
 
     /// Negotiated maximum payload size, bounding the NAK CIF (§7.3).
     max_payload: usize,
@@ -228,6 +245,8 @@ impl Receiver {
             srtt_us: INITIAL_RTT_US,
             rtt_var_us: INITIAL_RTT_VAR_US,
             rtt_first: true,
+            first_rtt_us: 0,
+            drift: DriftTracer::new(),
             max_payload: DEFAULT_MAX_PAYLOAD,
             discrepancy: false,
             undecrypted: 0,
@@ -317,20 +336,15 @@ impl Receiver {
         // otherwise fall back to the first data packet (which bakes that
         // packet's one-way delay into every deadline).
         let ext_us = self.extender.extend(pkt.timestamp, now);
-        let anchor = match self.anchor {
-            Some(a) => a,
-            None => {
-                let a = Anchor {
-                    instant: now,
-                    ext_us,
-                };
-                debug!(ext_us, "TSBPD anchored at first data packet");
-                self.anchor = Some(a);
-                a
-            }
-        };
+        if self.anchor.is_none() {
+            debug!(ext_us, "TSBPD anchored at first data packet");
+            self.anchor = Some(Anchor {
+                instant: now,
+                ext_us,
+            });
+        }
 
-        self.store_data(pkt, anchor, ext_us, undecryptable);
+        self.store_data(pkt, ext_us, undecryptable);
 
         // Light ACK after 64, 128, 192… packets within one full-ACK period
         // (the counter is reset only by the timer ACK, not by light ACKs).
@@ -340,7 +354,7 @@ impl Receiver {
         }
     }
 
-    fn store_data(&mut self, pkt: DataPacket, anchor: Anchor, ext_us: u64, undecryptable: bool) {
+    fn store_data(&mut self, pkt: DataPacket, ext_us: u64, undecryptable: bool) {
         let seq = pkt.seq;
         trace!(
             seq = seq.value(),
@@ -436,11 +450,10 @@ impl Receiver {
             self.unlose(seq);
         }
 
-        let deadline = self.tsbpd_deadline(anchor, ext_us);
         self.slots[offset] = Some(Slot {
             payload: pkt.payload,
             msg_number: pkt.msg_number,
-            deadline,
+            ext_us,
             undecryptable,
         });
         if undecryptable {
@@ -452,8 +465,9 @@ impl Receiver {
         }
     }
 
-    /// Matches an ACKACK to a sent ACK and updates the RTT estimate.
-    pub fn handle_ackack(&mut self, now: Instant, ack_number: u32) {
+    /// Matches an ACKACK to a sent ACK, updates the RTT estimate, and feeds
+    /// a TSBPD drift sample from the ACKACK header timestamp `ts` (§9.4).
+    pub fn handle_ackack(&mut self, now: Instant, ack_number: u32, ts: Timestamp) {
         let Some(pos) = self.ack_journal.iter().position(|r| r.number == ack_number) else {
             // Unknown, light (0), or already-consumed number.
             warn!(ack_number, "ACKACK does not match any pending ACK; ignored");
@@ -476,6 +490,7 @@ impl Receiver {
             // First sample resets the estimator instead of smoothing into
             // the 100 ms/50 ms initial values.
             self.rtt_first = false;
+            self.first_rtt_us = rtt_us;
             self.srtt_us = rtt_us;
             self.rtt_var_us = rtt_us / 2;
             debug!(rtt_us, "first RTT sample");
@@ -493,6 +508,27 @@ impl Receiver {
         }
         if rec.seq.diff(self.rcv_last_ackack) > 0 {
             self.rcv_last_ackack = rec.seq;
+        }
+
+        // Drift sample (§9.4): how far the local clock has run ahead of the
+        // peer's wire clock since the anchor, with the path-delay change
+        // since the connection's first RTT sample removed. The anchor is
+        // always set by the time a matched ACKACK arrives on the shipped
+        // caller/listener paths (both seed it at establishment); the guard
+        // covers fallback-anchored connections where a DROPREQ can unlock
+        // full ACKs before any data.
+        let Some(anchor) = self.anchor else {
+            return;
+        };
+        let ext_us = self.extender.extend(ts, now);
+        let local_us = now.saturating_duration_since(anchor.instant).as_micros() as i64;
+        let peer_us = ext_us as i64 - anchor.ext_us as i64;
+        let rtt_corr_us = (i64::from(rtt_us) - i64::from(self.first_rtt_us)) / 2;
+        if self.drift.sample(local_us - peer_us - rtt_corr_us) {
+            debug!(
+                correction_us = self.drift.correction_us(),
+                "TSBPD drift correction updated"
+            );
         }
     }
 
@@ -582,10 +618,12 @@ impl Receiver {
     /// frees undecryptable packets at their play time without delivering
     /// them (encryption.md §9.4).
     pub fn poll_deliver(&mut self, now: Instant) -> Option<Vec<u8>> {
+        // Occupied slots imply an anchor: `ingest` sets it before storing.
+        let anchor = self.anchor?;
         loop {
             let first = self.slots.iter().position(|s| s.is_some())?;
-            let deadline = self.slots[first].as_ref().expect("occupied").deadline;
-            if deadline > now {
+            let ext_us = self.slots[first].as_ref().expect("occupied").ext_us;
+            if self.tsbpd_deadline(anchor, ext_us) > now {
                 return None;
             }
             if first > 0 {
@@ -636,8 +674,8 @@ impl Receiver {
         if !self.loss.is_empty() {
             deadline = deadline.min(self.next_nak_time);
         }
-        if let Some(t) = self.slots.iter().flatten().next().map(|s| s.deadline) {
-            deadline = deadline.min(t);
+        if let (Some(anchor), Some(slot)) = (self.anchor, self.slots.iter().flatten().next()) {
+            deadline = deadline.min(self.tsbpd_deadline(anchor, slot.ext_us));
         }
         Some(deadline.max(now))
     }
@@ -651,6 +689,7 @@ impl Receiver {
         ReceiverStats {
             rtt_us: self.srtt_us,
             rtt_var_us: self.rtt_var_us,
+            tsbpd_drift_us: self.drift.correction_us(),
             ..self.stats
         }
     }
@@ -782,14 +821,21 @@ impl Receiver {
         self.cfg.buffer_pkts.saturating_sub(used).max(MIN_AVAIL_BUF) as u32
     }
 
+    /// Delivery deadline (§9.1): anchor + timestamp delta + latency + drift
+    /// correction. Computed on demand from the slot's extended timestamp so
+    /// drift updates reach already-buffered packets.
     fn tsbpd_deadline(&self, anchor: Anchor, ext_us: u64) -> Instant {
-        let base = anchor.instant + self.cfg.rcv_latency;
-        let delta = ext_us as i64 - anchor.ext_us as i64;
-        if delta >= 0 {
-            base + Duration::from_micros(delta as u64)
+        let offset = ext_us as i64 - anchor.ext_us as i64
+            + self.drift.correction_us()
+            + self.cfg.rcv_latency.as_micros() as i64;
+        if offset >= 0 {
+            anchor.instant + Duration::from_micros(offset as u64)
         } else {
-            // Reordered packet stamped before the anchor packet.
-            base.checked_sub(Duration::from_micros(delta.unsigned_abs()))
+            // Reordered packet stamped before the anchor packet (or a large
+            // negative drift correction early in the connection).
+            anchor
+                .instant
+                .checked_sub(Duration::from_micros(offset.unsigned_abs()))
                 .unwrap_or(anchor.instant)
         }
     }
@@ -852,6 +898,8 @@ impl Receiver {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Range;
+
     use super::*;
     use crate::packet::{
         EncryptionFlags,
@@ -1364,7 +1412,7 @@ mod tests {
         assert_eq!(a[0].1.last_ack_seq, SeqNumber::new(ISN + 5));
 
         // Once the peer ACKACKs the position, it is never announced again.
-        r.handle_ackack(t0 + ms(331), 3);
+        r.handle_ackack(t0 + ms(331), 3, Timestamp(331_000));
         r.on_timer(t0 + ms(700));
         assert!(drain(&mut r, t0 + ms(700)).is_empty());
     }
@@ -1426,7 +1474,7 @@ mod tests {
         assert_eq!(acks(&drain(&mut r, t0 + ms(10)))[0].0, 1);
 
         // First sample: SRTT = rtt, RTTVar = rtt/2.
-        r.handle_ackack(t0 + ms(50), 1); // rtt = 40 ms
+        r.handle_ackack(t0 + ms(50), 1, Timestamp(50_000)); // rtt = 40 ms
         assert_eq!(r.rtt(), (40_000, 20_000));
         assert_eq!(r.stats().rtt_us, 40_000);
         assert_eq!(r.stats().rtt_var_us, 20_000);
@@ -1436,7 +1484,7 @@ mod tests {
         r.handle_data(t0 + ms(50), data(ISN + 1, 50_000));
         r.on_timer(t0 + ms(60)); // full ACK #2 sent at t0+60ms
         assert_eq!(acks(&drain(&mut r, t0 + ms(60)))[0].0, 2);
-        r.handle_ackack(t0 + ms(140), 2); // rtt = 80 ms
+        r.handle_ackack(t0 + ms(140), 2, Timestamp(140_000)); // rtt = 80 ms
         assert_eq!(
             r.rtt(),
             ((7 * 40_000 + 80_000) / 8, (3 * 20_000 + 40_000) / 4)
@@ -1452,13 +1500,228 @@ mod tests {
         r.on_timer(t0 + ms(10));
         drain(&mut r, t0 + ms(10));
 
-        r.handle_ackack(t0 + ms(20), 99); // never sent
+        r.handle_ackack(t0 + ms(20), 99, Timestamp(20_000)); // never sent
         assert_eq!(r.rtt(), (INITIAL_RTT_US, INITIAL_RTT_VAR_US));
 
-        r.handle_ackack(t0 + ms(50), 1);
+        r.handle_ackack(t0 + ms(50), 1, Timestamp(50_000));
         assert_eq!(r.rtt(), (40_000, 20_000));
-        r.handle_ackack(t0 + ms(90), 1); // duplicate: entry consumed
+        r.handle_ackack(t0 + ms(90), 1, Timestamp(90_000)); // duplicate: entry consumed
         assert_eq!(r.rtt(), (40_000, 20_000));
+    }
+
+    // ---- TSBPD drift (transmission.md §9.4) ----
+    //
+    // Model used throughout: the anchor is seeded at (t0, wire ts `base_ts`)
+    // and the peer's clock runs `offset_us` BEHIND the local clock — every
+    // peer stamp reads `elapsed_local − offset_us`. ACKACKs are stamped at
+    // their local arrival instant (one-way delay folded into the ACK leg),
+    // so with a constant RTT each drift sample measures exactly `offset_us`.
+
+    /// One ACK→ACKACK exchange per round, 10 ms apart, 2 ms RTT: round `i`
+    /// feeds `data(ISN+i)` stamped by the skewed peer clock, pulls the full
+    /// ACK, answers it with a matching skewed ACKACK, and drains deliveries
+    /// that have come due, keeping the buffer shallow.
+    fn drift_rounds(
+        r: &mut Receiver,
+        t0: Instant,
+        base_ts: u32,
+        rounds: Range<u32>,
+        offset_us: i64,
+    ) {
+        for i in rounds {
+            let elapsed = 10_000 * (u64::from(i) + 1);
+            let t = t0 + us(elapsed);
+            let peer = |at_us: u64| base_ts.wrapping_add((at_us as i64 - offset_us) as u32);
+            r.handle_data(t, data(ISN + i, peer(elapsed)));
+            r.on_timer(t);
+            let n = acks(&drain(r, t))[0].0;
+            r.handle_ackack(t + ms(2), n, Timestamp(peer(elapsed + 2_000)));
+            while r.poll_deliver(t).is_some() {}
+        }
+    }
+
+    /// Releases everything due at `t` and returns the last payload.
+    fn drain_due(r: &mut Receiver, t: Instant) -> Option<Vec<u8>> {
+        let mut last = None;
+        while let Some(p) = r.poll_deliver(t) {
+            last = Some(p);
+        }
+        last
+    }
+
+    /// Asserts the packet delivered as `[byte]` is released exactly at
+    /// `deadline`: draining one µs earlier flushes only the older backlog,
+    /// and draining at the deadline yields precisely this packet.
+    fn assert_released_at(r: &mut Receiver, deadline: Instant, byte: u8) {
+        let before = drain_due(r, deadline - us(1));
+        assert_ne!(before, Some(vec![byte]), "released before its deadline");
+        assert_eq!(drain_due(r, deadline), Some(vec![byte]));
+    }
+
+    /// 999 samples are not a batch: deadlines still follow the raw (skewed)
+    /// peer timestamps and the reported drift is 0.
+    #[test]
+    fn drift_no_correction_before_batch_completes() {
+        let t0 = Instant::now();
+        let mut r = rx(t0);
+        r.set_hs_anchor(t0, Timestamp(0));
+        drift_rounds(&mut r, t0, 0, 0 .. 999, 2_000);
+        assert_eq!(r.stats().tsbpd_drift_us, 0);
+
+        // Probe stamped by the slow peer: its deadline lands 2 ms early
+        // (the uncompensated latency-budget erosion).
+        let t_p = t0 + ms(10_000);
+        r.handle_data(t_p, data(ISN + 999, 10_000_000 - 2_000));
+        let deadline = t_p + LATENCY - us(2_000);
+        assert_released_at(&mut r, deadline, (ISN + 999) as u8);
+    }
+
+    /// The 1000th sample commits the correction: a peer running 2 ms slow
+    /// gets its deadlines pushed 2 ms later, restoring them to the nominal
+    /// anchor + timestamp-delta + latency instants.
+    #[test]
+    fn drift_batch_restores_slow_peer_deadlines() {
+        let t0 = Instant::now();
+        let mut r = rx(t0);
+        r.set_hs_anchor(t0, Timestamp(0));
+        drift_rounds(&mut r, t0, 0, 0 .. 1000, 2_000);
+        assert_eq!(r.stats().tsbpd_drift_us, 2_000);
+
+        let t_p = t0 + ms(10_010);
+        r.handle_data(t_p, data(ISN + 1000, 10_010_000 - 2_000));
+        let deadline = t_p + LATENCY; // skew exactly cancelled
+        assert_released_at(&mut r, deadline, (ISN + 1000) as u8);
+    }
+
+    /// A peer running fast yields a negative correction, and the commit
+    /// reaches packets already sitting in the buffer: the packet buffered
+    /// just before the 1000th ACKACK releases at the corrected (earlier)
+    /// deadline, not the one in force when it was stored.
+    #[test]
+    fn drift_negative_correction_applies_to_buffered_packets() {
+        let t0 = Instant::now();
+        let mut r = rx(t0);
+        r.set_hs_anchor(t0, Timestamp(0));
+        drift_rounds(&mut r, t0, 0, 0 .. 999, -3_000);
+
+        // Round 1000 by hand: buffer the packet first (deadline would be
+        // t + 120 ms + 3 ms at the still-zero correction), then let its
+        // ACKACK complete the batch.
+        let t = t0 + ms(10_000);
+        r.handle_data(t, data(ISN + 999, 10_000_000 + 3_000));
+        r.on_timer(t);
+        let n = acks(&drain(&mut r, t))[0].0;
+        r.handle_ackack(t + ms(2), n, Timestamp((10_002_000i64 + 3_000) as u32));
+        assert_eq!(r.stats().tsbpd_drift_us, -3_000);
+
+        let deadline = t + LATENCY; // 3 ms earlier than at store time
+        assert_released_at(&mut r, deadline, (ISN + 999) as u8);
+    }
+
+    /// A path-delay change is not clock drift: when the RTT grows from 2 ms
+    /// to 10 ms and the extra delay shows up in both the ACKACK's stamp lag
+    /// and its arrival lag, the `(rtt − first_rtt)/2` term cancels it and
+    /// the batch commits a zero correction.
+    #[test]
+    fn drift_rtt_change_is_not_drift() {
+        let t0 = Instant::now();
+        let mut r = rx(t0);
+        // Handshake trip time 1 ms: the peer's clock read 0 at t0 − 1 ms.
+        r.set_hs_anchor(t0, Timestamp(0));
+        for i in 0 .. 1000u32 {
+            let elapsed = 10_000 * (u64::from(i) + 1);
+            let t = t0 + us(elapsed);
+            let owd_us: u64 = if i == 0 { 1_000 } else { 5_000 };
+            r.handle_data(t, data(ISN + i, (elapsed - owd_us + 1_000) as u32));
+            r.on_timer(t);
+            let n = acks(&drain(&mut r, t))[0].0;
+            // Stamped at the peer's send instant, arriving one OWD later.
+            r.handle_ackack(
+                t + us(2 * owd_us),
+                n,
+                Timestamp((elapsed + owd_us + 1_000) as u32),
+            );
+            while r.poll_deliver(t).is_some() {}
+        }
+        assert_eq!(
+            r.stats().tsbpd_drift_us,
+            0,
+            "a symmetric path-delay increase must not register as drift"
+        );
+    }
+
+    /// ACKACK timestamps feed the same arrival-guided extender as data, so
+    /// sampling keeps working across the 2^32 µs wire-clock wrap.
+    #[test]
+    fn drift_sampling_across_timestamp_wrap() {
+        let t0 = Instant::now();
+        let mut r = rx(t0);
+        // 5 ms before the wire clock wraps.
+        let base_ts = u32::MAX - 4_999;
+        r.set_hs_anchor(t0, Timestamp(base_ts));
+        drift_rounds(&mut r, t0, base_ts, 0 .. 1000, 2_000);
+        assert_eq!(r.stats().tsbpd_drift_us, 2_000);
+
+        let t_p = t0 + ms(10_010);
+        r.handle_data(
+            t_p,
+            data(ISN + 1000, base_ts.wrapping_add(10_010_000 - 2_000)),
+        );
+        let deadline = t_p + LATENCY;
+        assert_released_at(&mut r, deadline, (ISN + 1000) as u8);
+    }
+
+    /// ACKACKs that match no pending ACK (never sent, light-ACK number 0,
+    /// or already consumed) are not drift samples — their timestamps, however
+    /// wild, must not delay the batch or pollute it.
+    #[test]
+    fn drift_ignores_unmatched_ackacks() {
+        let t0 = Instant::now();
+        let mut r = rx(t0);
+        r.set_hs_anchor(t0, Timestamp(0));
+        drift_rounds(&mut r, t0, 0, 0 .. 999, 2_000);
+        for junk in [0u32, 424_242] {
+            r.handle_ackack(t0 + ms(9_995), junk, Timestamp(0));
+        }
+        assert_eq!(r.stats().tsbpd_drift_us, 0, "unmatched ACKACKs sampled?");
+
+        // The 1000th *valid* ACKACK commits the batch, unpolluted.
+        drift_rounds(&mut r, t0, 0, 999 .. 1000, 2_000);
+        assert_eq!(r.stats().tsbpd_drift_us, 2_000);
+    }
+
+    /// The wake-up deadline advertises the drift-corrected TSBPD instant
+    /// too: a driver sleeping until `next_deadline` must not be woken at
+    /// the stale uncorrected release time (poll_deliver and next_deadline
+    /// share `tsbpd_deadline`, but only an exact-instant assertion here
+    /// pins the next_deadline site — the sim harness polls every 1 ms and
+    /// never sleeps on the TSBPD term).
+    #[test]
+    fn drift_correction_reaches_next_deadline() {
+        let t0 = Instant::now();
+        let mut r = rx(t0);
+        r.set_hs_anchor(t0, Timestamp(0));
+        drift_rounds(&mut r, t0, 0, 0 .. 999, -3_000);
+
+        // Round 1000 by hand, as in the buffered-packets test: the packet
+        // is in the buffer when its ACKACK commits the −3 ms correction.
+        let t = t0 + ms(10_000);
+        r.handle_data(t, data(ISN + 999, 10_000_000 + 3_000));
+        r.on_timer(t);
+        let n = acks(&drain(&mut r, t))[0].0;
+        r.handle_ackack(t + ms(2), n, Timestamp((10_002_000i64 + 3_000) as u32));
+        assert_eq!(r.stats().tsbpd_drift_us, -3_000);
+
+        // 5 ms before the corrected release: flush the older backlog so the
+        // probe is the first occupied slot, re-arm the ACK timer to 10 ms
+        // out, and the TSBPD term must win with the corrected instant —
+        // not the store-time deadline 3 ms later.
+        let deadline = t + LATENCY;
+        let t_w = deadline - ms(5);
+        drain_due(&mut r, t_w);
+        r.on_timer(t_w);
+        drain(&mut r, t_w);
+        assert_eq!(r.next_deadline(t_w), Some(deadline));
     }
 
     // ---- DROPREQ ----
@@ -1720,7 +1983,11 @@ mod tests {
         }
         assert_eq!(
             out,
-            vec![vec![ISN as u8], vec![(ISN + 2) as u8], vec![(ISN + 4) as u8]]
+            vec![
+                vec![ISN as u8],
+                vec![(ISN + 2) as u8],
+                vec![(ISN + 4) as u8]
+            ]
         );
         assert_eq!(r.stats().pkts_dropped, 3);
     }

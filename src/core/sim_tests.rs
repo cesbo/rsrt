@@ -7,6 +7,14 @@
 //! also verify that the advertised deadlines cover every duty (ACK/NAK
 //! ticks, TSBPD release, keepalive, EXP/peer-idle, handshake retransmits).
 //!
+//! Each endpoint has its own clock ([`SkewClock`]): the wire clock `now`
+//! orders link events, while every `handle_*`/`poll_*`/`send` call gets the
+//! owning endpoint's instant, skewed by a configurable ppm rate. Since the
+//! sans-I/O core derives outgoing wire timestamps from those same instants
+//! (via its `Timebase`), a non-zero skew reproduces real sender/receiver
+//! quartz drift end to end. At the default 0 ppm every endpoint instant is
+//! bit-identical to `now`.
+//!
 //! Everything is deterministic: the channel PRNG is seeded per test.
 
 use std::{
@@ -83,6 +91,34 @@ impl Rng {
         } else {
             self.next() % n
         }
+    }
+}
+
+/// One endpoint's local clock: maps the sim's elapsed time to the
+/// endpoint's `Instant`, running fast (`ppm > 0`) or slow (`ppm < 0`)
+/// relative to the wire clock — `endpoint_now = origin + elapsed·(1 +
+/// ppm/1e6)`, integer-µs math. At 0 ppm the mapping is the identity, so
+/// every instant is bit-identical to the shared wire clock.
+///
+/// Set a non-zero `ppm` only before the first step (re-basing mid-run would
+/// jump the endpoint's clock, possibly backwards) and never together with a
+/// shared `accept_timebase` (a cross-domain `Timebase` is meaningless under
+/// skew).
+#[derive(Clone, Copy)]
+struct SkewClock {
+    origin: Instant,
+    ppm: i64,
+}
+
+impl SkewClock {
+    fn new(origin: Instant) -> SkewClock {
+        SkewClock { origin, ppm: 0 }
+    }
+
+    fn at(&self, elapsed_us: u64) -> Instant {
+        debug_assert!(self.ppm.unsigned_abs() < 1_000_000);
+        let skew = elapsed_us as i64 * self.ppm / 1_000_000;
+        self.origin + Duration::from_micros((elapsed_us as i64 + skew) as u64)
     }
 }
 
@@ -177,7 +213,12 @@ fn is_conclusion(pkt: &Packet) -> bool {
 
 /// The two endpoints plus the channel between them.
 struct Sim {
+    /// Wire clock: orders link events and timestamps `*_rx` records.
     now: Instant,
+    /// Wire-clock time since the sim started, driving the [`SkewClock`]s.
+    elapsed_us: u64,
+    caller_clock: SkewClock,
+    listener_clock: SkewClock,
     caller: Connection,
     listener: Listener,
     listener_opts: SrtOptions,
@@ -228,6 +269,9 @@ impl Sim {
         let listener_tb = accept_timebase.unwrap_or_else(|| Timebase::new(now));
         Sim {
             now,
+            elapsed_us: 0,
+            caller_clock: SkewClock::new(now),
+            listener_clock: SkewClock::new(now),
             caller,
             listener: Listener::new(seed ^ 0x5EC2E7, listener_tb, listener_opts.clone()),
             listener_opts,
@@ -246,57 +290,80 @@ impl Sim {
             .expect("listener has accepted a connection")
     }
 
-    /// Submits one payload on the accepted (listener) side at `self.now`.
+    /// The caller's local clock at the current sim time.
+    fn caller_now(&self) -> Instant {
+        self.caller_clock.at(self.elapsed_us)
+    }
+
+    /// The listener side's local clock at the current sim time.
+    fn listener_now(&self) -> Instant {
+        self.listener_clock.at(self.elapsed_us)
+    }
+
+    /// Submits one payload on the caller side, at the caller's clock.
+    fn send_caller(&mut self, data: Vec<u8>) {
+        let now = self.caller_now();
+        self.caller.send(now, data).unwrap();
+    }
+
+    /// Submits one payload on the accepted (listener) side, at that side's
+    /// clock.
     fn send_listener(&mut self, data: Vec<u8>) {
-        let now = self.now;
+        let now = self.listener_now();
         self.accepted_mut().send(now, data).unwrap();
     }
 
     /// Advances the fake clock by one step and runs the event loop once.
+    /// Link events run on the wire clock; each endpoint's `handle_*`/
+    /// `poll_*` calls get that endpoint's own (possibly skewed) instant.
     fn step(&mut self) {
         self.now += STEP;
+        self.elapsed_us += STEP.as_micros() as u64;
         let now = self.now;
+        let c_now = self.caller_now();
+        let l_now = self.listener_now();
 
         // 1. Deliver arrived packets.
         for pkt in self.to_listener.pop_due(now) {
             match &mut self.accepted {
-                Some(conn) => conn.handle_packet(now, pkt),
-                None => self.listener_handshake(pkt),
+                Some(conn) => conn.handle_packet(l_now, pkt),
+                None => self.listener_handshake(l_now, pkt),
             }
         }
         for pkt in self.to_caller.pop_due(now) {
-            self.caller.handle_packet(now, pkt);
+            self.caller.handle_packet(c_now, pkt);
         }
 
         // 2. Timers, strictly when the connection says one is due.
-        if timer_due(&self.caller, now) {
-            self.caller.handle_timer(now);
+        if timer_due(&self.caller, c_now) {
+            self.caller.handle_timer(c_now);
         }
         if let Some(conn) = &mut self.accepted {
-            if timer_due(conn, now) {
-                conn.handle_timer(now);
+            if timer_due(conn, l_now) {
+                conn.handle_timer(l_now);
             }
         }
 
         // 3. Drain outputs.
-        while let Some(p) = self.caller.poll_transmit(now) {
+        while let Some(p) = self.caller.poll_transmit(c_now) {
             self.to_listener.push(now, p);
         }
-        while let Some(d) = self.caller.poll_deliver(now) {
+        while let Some(d) = self.caller.poll_deliver(c_now) {
             self.caller_rx.push((now, d));
         }
         if let Some(conn) = &mut self.accepted {
-            while let Some(p) = conn.poll_transmit(now) {
+            while let Some(p) = conn.poll_transmit(l_now) {
                 self.to_caller.push(now, p);
             }
-            while let Some(d) = conn.poll_deliver(now) {
+            while let Some(d) = conn.poll_deliver(l_now) {
                 self.listener_rx.push((now, d));
             }
         }
     }
 
     /// Pre-accept path: handshake packets go to the stateless listener.
-    fn listener_handshake(&mut self, pkt: Packet) {
+    /// `l_now` is the listener side's local clock reading.
+    fn listener_handshake(&mut self, l_now: Instant, pkt: Packet) {
         let Packet::Control(ControlPacket {
             control_type: ControlType::Handshake(cif),
             ..
@@ -306,21 +373,21 @@ impl Sim {
         };
         match self
             .listener
-            .handle_handshake(self.now, caller_addr(), &cif, ACCEPT_ID, LISTENER_ISN)
+            .handle_handshake(l_now, caller_addr(), &cif, ACCEPT_ID, LISTENER_ISN)
         {
             ListenerAction::Reply(p) => self.to_caller.push(self.now, p),
             ListenerAction::Accept { reply, negotiated } => {
                 // The accepted connection queues (and can replay) the reply.
                 let conn = match self.accept_timebase {
                     Some(tb) => Connection::accepted_with_timebase(
-                        self.now,
+                        l_now,
                         *negotiated,
                         reply,
                         self.listener_opts.clone(),
                         tb,
                     ),
                     None => Connection::accepted(
-                        self.now,
+                        l_now,
                         *negotiated,
                         reply,
                         self.listener_opts.clone(),
@@ -826,4 +893,139 @@ fn timestamp_wrap_long_run() {
         assert_eq!(stats.pkts_recv_lost, 0);
         assert_eq!(stats.pkts_recv, u64::from(sent));
     }
+}
+
+// ---- TSBPD clock drift (transmission.md §9.4) ----
+
+/// Streams caller → listener for `secs` of wire time (one payload per
+/// 10 ms) with the caller's clock skewed by `caller_ppm`, then asserts
+/// every payload was delivered in order, nothing was dropped, and each
+/// wire-clock delivery latency stayed within `[min_ms, max_ms]`.
+///
+/// ±500 ppm eats the whole 120 ms latency budget in 240 s, so a 360 s run
+/// is decisive in both directions: without the drift tracer the slow-clock
+/// run collapses to near-zero latency (every packet released "late") and
+/// the fast-clock run inflates past +180 ms.
+fn drift_run(caller_ppm: i64, secs: u64, min_ms: u64, max_ms: u64) -> Sim {
+    let t0 = Instant::now();
+    let mut sim = Sim::new(t0, SrtOptions::default(), SrtOptions::default(), 0xD21F7);
+    sim.caller_clock.ppm = caller_ppm;
+
+    sim.run_until(100, "handshake", Sim::both_established);
+
+    let mut sent_at = Vec::new();
+    let mut sent: u32 = 0;
+    for tick in 0 .. secs * 1_000 {
+        if tick.is_multiple_of(10) {
+            sim.send_caller(payload(0xA, sent));
+            sent_at.push(sim.now);
+            sent += 1;
+        }
+        sim.step();
+    }
+    sim.run_for(500); // drain the last latency window
+
+    assert!(sim.both_established());
+    assert_eq!(sim.listener_rx.len(), sent as usize);
+    assert_contiguous(&sim.listener_rx, 0xA, sent);
+    let ls = sim.accepted_mut().stats();
+    assert_eq!(ls.pkts_recv_dropped, 0);
+    assert_eq!(ls.pkts_recv_lost, 0);
+
+    // The tracer corrects in ±5 ms steps once per 1000-ACKACK batch (~10 s
+    // at the 10 ms full-ACK cadence), so the residual mistracking stays
+    // within one batch of accumulation (~5 ms at 500 ppm) plus the commit
+    // lag — the latency window just needs to absorb that, not the full
+    // accumulated offset (±180 ms over the run).
+    for (i, (at, _)) in sim.listener_rx.iter().enumerate() {
+        let lat = at.duration_since(sent_at[i]);
+        assert!(
+            lat >= Duration::from_millis(min_ms) && lat <= Duration::from_millis(max_ms),
+            "payload {i} delivered at latency {lat:?} under {caller_ppm} ppm skew"
+        );
+    }
+    sim
+}
+
+/// The sender's clock runs 500 ppm fast: uncompensated, delivery latency
+/// would grow 0.5 ms/s to ~+180 ms by the end of the run. The drift tracer
+/// must keep it near the nominal 125 ms throughout.
+#[test]
+fn fast_sender_clock_drift_compensated_long_run() {
+    let mut sim = drift_run(500, 360, 110, 150);
+
+    // The listener's net correction ≈ −(accumulated offset): 500 ppm over
+    // 360 s = 180 ms, minus at most a couple of batches of tracking lag.
+    let drift = sim.accepted_mut().stats().tsbpd_drift_us;
+    assert!(
+        (-190_000 ..= -160_000).contains(&drift),
+        "listener drift correction {drift} µs, expected ≈ −180 ms"
+    );
+    // The caller received no data, so its tracer never sampled.
+    assert_eq!(sim.caller.stats().tsbpd_drift_us, 0);
+}
+
+/// The sender's clock runs 500 ppm slow: uncompensated, the 120 ms latency
+/// budget is exhausted at 240 s — every later packet is released the moment
+/// it arrives (latency collapses to the 5 ms link delay) and ARQ has no
+/// recovery window left. The drift tracer must hold the release point.
+#[test]
+fn slow_sender_clock_drift_compensated_long_run() {
+    let mut sim = drift_run(-500, 360, 110, 150);
+
+    let drift = sim.accepted_mut().stats().tsbpd_drift_us;
+    assert!(
+        (160_000 ..= 190_000).contains(&drift),
+        "listener drift correction {drift} µs, expected ≈ +180 ms"
+    );
+}
+
+/// The real casualty of uncompensated drift is ARQ: once the budget is
+/// eaten, every retransmission arrives past its deadline. A slow sender
+/// clock plus random loss and reordering over 6 minutes must still recover
+/// every single packet at the default 120 ms latency — uncompensated, the
+/// budget is gone at 240 s and every loss after that becomes a drop.
+#[test]
+fn clock_drift_with_loss_keeps_arq_alive() {
+    let t0 = Instant::now();
+    let mut sim = Sim::new(t0, SrtOptions::default(), SrtOptions::default(), 0xA9C0FFEE);
+    sim.caller_clock.ppm = -500;
+
+    sim.run_until(100, "handshake", Sim::both_established);
+
+    let mut sent: u32 = 0;
+    for tick in 0 .. 360_000u64 {
+        if tick == 5_000 {
+            // Clean 5 s warmup first, so NAK pacing runs on a measured RTT
+            // (not the 300 ms initial interval) before recovery is needed.
+            sim.to_listener.loss_pct = 2;
+            sim.to_listener.jitter_us = 2_000;
+            sim.to_caller.loss_pct = 2;
+            sim.to_caller.jitter_us = 2_000;
+        }
+        if tick.is_multiple_of(10) {
+            sim.send_caller(payload(0xA, sent));
+            sent += 1;
+        }
+        sim.step();
+    }
+    // Trailing traffic so a lost tail packet still gets its gap detected.
+    for _ in 0 .. 10 {
+        sim.send_caller(payload(0xA, sent));
+        sent += 1;
+        sim.run_for(20);
+    }
+    sim.run_for(1_500);
+
+    assert_contiguous(&sim.listener_rx, 0xA, sent);
+    let ls = sim.accepted_mut().stats();
+    assert!(ls.pkts_recv_lost > 0, "losses must have been detected");
+    assert_eq!(
+        ls.pkts_recv_dropped, 0,
+        "recovery must beat every deadline despite the clock drift"
+    );
+    assert!(
+        sim.caller.stats().pkts_retransmitted > 0,
+        "caller must have retransmitted"
+    );
 }

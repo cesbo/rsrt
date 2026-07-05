@@ -1,5 +1,6 @@
-//! Time base: local `Instant` ↔ 32-bit wire timestamps (µs), and extension
-//! of the peer's wrapping timestamps to a monotonic 64-bit scale.
+//! Time base: local `Instant` ↔ 32-bit wire timestamps (µs), extension of
+//! the peer's wrapping timestamps to a monotonic 64-bit scale, and the TSBPD
+//! clock-drift tracer.
 
 use std::time::Instant;
 
@@ -76,6 +77,82 @@ impl TimestampExtender {
         // candidate of `ts` nearest to it, clamped at 0.
         let delta = ts.0.wrapping_sub(expected as u32) as i32;
         expected.saturating_add_signed(delta as i64)
+    }
+}
+
+/// Drift-batch size (`TSBPD_DRIFT_MAX_SAMPLES`): one correction per this
+/// many ACKACK samples (~10 s at the 10 ms full-ACK cadence).
+pub const TSBPD_DRIFT_MAX_SAMPLES: u32 = 1000;
+
+/// Largest single time-base shift (`TSBPD_DRIFT_MAX_VALUE`, µs): a batch
+/// average beyond ±5 ms moves the base by at most this much per batch, the
+/// remainder staying in the residual drift term.
+pub const TSBPD_DRIFT_MAX_VALUE_US: i64 = 5000;
+
+/// TSBPD clock-drift tracer (transmission.md §9.4, libsrt `SRTO_DRIFTTRACER`
+/// semantics, always on).
+///
+/// The TSBPD anchor maps the peer's wire clock onto the local clock once, at
+/// connection setup; sender/receiver quartz then diverges by µs-per-minute,
+/// which alone eats a 120 ms latency budget in tens of minutes — after which
+/// every packet is "late" and ARQ recovers nothing. The tracer measures the
+/// accumulated offset on every ACKACK and periodically folds it back into
+/// the delivery deadlines.
+///
+/// Each [`DriftTracer::sample`] takes the current local−peer clock-offset
+/// measurement relative to the *original* anchor (the tracer nets out its
+/// own accumulated correction internally). After every
+/// [`TSBPD_DRIFT_MAX_SAMPLES`] samples the plain batch average becomes the
+/// new correction: within ±[`TSBPD_DRIFT_MAX_VALUE_US`] it is carried
+/// entirely by the residual drift term; beyond that the base shifts by the
+/// clamped average and only the excess stays residual, so one corrupt batch
+/// can never yank the base by more than 5 ms.
+#[derive(Debug, Default)]
+pub struct DriftTracer {
+    sum_us: i64,
+    samples: u32,
+    /// Residual drift — the `Drift` term of the §9.1 delivery formula.
+    drift_us: i64,
+    /// Accumulated time-base shifts (the `TsbpdTimeBase +=` steps of §9.4).
+    base_shift_us: i64,
+}
+
+impl DriftTracer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feeds one measurement: how far the local clock has run ahead of the
+    /// peer's wire clock since the TSBPD anchor (µs, positive = peer clock
+    /// slow), with path-delay changes already removed by the caller via the
+    /// `(rtt − first_rtt)/2` term. Returns `true` when the measurement
+    /// completed a batch and [`DriftTracer::correction_us`] was updated.
+    pub fn sample(&mut self, offset_us: i64) -> bool {
+        // §9.4 samples are taken against the *shifted* base; the residual
+        // drift term is intentionally not subtracted (it re-converges to
+        // the batch average instead of integrating twice).
+        self.sum_us += offset_us - self.base_shift_us;
+        self.samples += 1;
+        if self.samples < TSBPD_DRIFT_MAX_SAMPLES {
+            return false;
+        }
+        let avg = self.sum_us / i64::from(self.samples);
+        self.sum_us = 0;
+        self.samples = 0;
+        let shift = if avg.abs() > TSBPD_DRIFT_MAX_VALUE_US {
+            avg.clamp(-TSBPD_DRIFT_MAX_VALUE_US, TSBPD_DRIFT_MAX_VALUE_US)
+        } else {
+            0
+        };
+        self.base_shift_us += shift;
+        self.drift_us = avg - shift;
+        true
+    }
+
+    /// Net correction currently applied to every TSBPD delivery deadline
+    /// (µs, positive = deadlines pushed later).
+    pub fn correction_us(&self) -> i64 {
+        self.base_shift_us + self.drift_us
     }
 }
 
@@ -184,6 +261,94 @@ mod tests {
             ex.extend(Timestamp(ts.0 + 20_000), t0 + us(gap + 20_000)),
             1_000_000 + gap + 20_000,
         );
+    }
+
+    // ---- drift tracer ----
+
+    /// Feeds one full batch of identical samples and returns the tracer.
+    fn batched(offset_us: i64) -> DriftTracer {
+        let mut d = DriftTracer::new();
+        feed_batch(&mut d, offset_us);
+        d
+    }
+
+    fn feed_batch(d: &mut DriftTracer, offset_us: i64) {
+        for i in 1 ..= TSBPD_DRIFT_MAX_SAMPLES {
+            let updated = d.sample(offset_us);
+            assert_eq!(
+                updated,
+                i == TSBPD_DRIFT_MAX_SAMPLES,
+                "correction must land exactly on the batch boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn drift_no_correction_before_full_batch() {
+        let mut d = DriftTracer::new();
+        for _ in 0 .. TSBPD_DRIFT_MAX_SAMPLES - 1 {
+            assert!(!d.sample(3_000));
+            assert_eq!(d.correction_us(), 0);
+        }
+    }
+
+    #[test]
+    fn drift_below_threshold_is_pure_residual() {
+        let d = batched(3_000);
+        assert_eq!(d.correction_us(), 3_000);
+        assert_eq!(d.base_shift_us, 0, "±5 ms average must not move the base");
+        assert_eq!(d.drift_us, 3_000);
+    }
+
+    #[test]
+    fn drift_above_threshold_splits_base_shift_and_residual() {
+        let d = batched(7_500);
+        assert_eq!(d.correction_us(), 7_500);
+        assert_eq!(d.base_shift_us, 5_000, "base shift clamped at ±5 ms");
+        assert_eq!(d.drift_us, 2_500);
+    }
+
+    #[test]
+    fn drift_negative_offset_corrects_backwards() {
+        let d = batched(-7_500);
+        assert_eq!(d.correction_us(), -7_500);
+        assert_eq!(d.base_shift_us, -5_000);
+        assert_eq!(d.drift_us, -2_500);
+    }
+
+    /// Samples measure the offset against the *original* anchor, so with a
+    /// constant true offset every later batch sees the same raw value; the
+    /// tracer must subtract its own base shift or the correction would
+    /// integrate (7.5 → 12.5 → …) instead of converging.
+    #[test]
+    fn drift_constant_offset_converges_not_integrates() {
+        let mut d = batched(7_500);
+        feed_batch(&mut d, 7_500);
+        assert_eq!(
+            d.correction_us(),
+            7_500,
+            "second batch must not double-count"
+        );
+        assert_eq!(d.base_shift_us, 5_000);
+        assert_eq!(d.drift_us, 2_500);
+        feed_batch(&mut d, 7_500);
+        assert_eq!(d.correction_us(), 7_500);
+    }
+
+    /// A continuously drifting clock (offset growing every batch) is chased
+    /// batch-by-batch: each average lands in the residual while it stays
+    /// under 5 ms, and the base ratchets once it exceeds it.
+    #[test]
+    fn drift_growing_offset_is_chased() {
+        let mut d = batched(1_000);
+        assert_eq!(d.correction_us(), 1_000);
+        feed_batch(&mut d, 2_000);
+        assert_eq!(d.correction_us(), 2_000);
+        // Jump: 9 ms beyond the base → 5 ms base shift + 4 ms residual.
+        feed_batch(&mut d, 9_000);
+        assert_eq!(d.correction_us(), 9_000);
+        assert_eq!(d.base_shift_us, 5_000);
+        assert_eq!(d.drift_us, 4_000);
     }
 
     /// Regression: a stall may span one or more 2^32 µs wire-clock wraps

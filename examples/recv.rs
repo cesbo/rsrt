@@ -183,13 +183,14 @@ fn spawn_writer(path: Option<String>) -> io::Result<Writer> {
 
 fn print_stats(s: &Stats) {
     eprintln!(
-        "recv: pkts={} bytes={} lost={} dropped={} retrans={} rtt={:.3}ms",
+        "recv: pkts={} bytes={} lost={} dropped={} retrans={} rtt={:.3}ms drift={:.3}ms",
         s.pkts_recv,
         s.bytes_recv,
         s.pkts_recv_lost,
         s.pkts_recv_dropped,
         s.pkts_retransmitted,
         s.rtt_us as f64 / 1000.0,
+        s.tsbpd_drift_us as f64 / 1000.0,
     );
 }
 
