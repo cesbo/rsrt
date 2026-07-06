@@ -14,13 +14,12 @@
 //! - §7.1 guard: a packet landing beyond the capacity of an EMPTY buffer is an unrecoverable
 //!   sequence discrepancy — flagged via [`Receiver::sequence_discrepancy`] so the owner breaks the
 //!   connection;
-//! - TSBPD: release a buffered packet when
-//!   `anchor_local + (extended_ts - anchor_ts) + rcv_latency + drift_correction` is reached;
-//!   missing packets whose deadline passed are skipped (counted dropped). Peer timestamps go
-//!   through [`super::time::TimestampExtender`] — mandatory for streams longer than ~71.6 minutes —
-//!   and the anchor is drift-compensated from ACKACK samples by [`super::time::DriftTracer`],
-//!   without which quartz-level clock skew (µs/minute) exhausts the whole latency budget on
-//!   multi-hour streams;
+//! - TSBPD: release a buffered packet when `anchor_local + (extended_ts - anchor_ts) + rcv_latency
+//!   + drift_correction` is reached; missing packets whose deadline passed are skipped (counted
+//!   dropped). Peer timestamps go through [`super::time::TimestampExtender`] — mandatory for
+//!   streams longer than ~71.6 minutes — and the anchor is drift-compensated from ACKACK samples by
+//!   [`super::time::DriftTracer`], without which quartz-level clock skew (µs/minute) exhausts the
+//!   whole latency budget on multi-hour streams;
 //! - undecryptable data (encryption.md §9.4): the packet occupies its sequence slot and is ACKed
 //!   like any arrival, but is freed undelivered at its TSBPD deadline; a gap it reveals is never
 //!   NAKed.
@@ -170,6 +169,10 @@ pub struct Receiver {
     base_seq: SeqNumber,
     /// `slots[seq - base_seq]`; `None` = hole (missing or already cleared).
     slots: VecDeque<Option<Slot>>,
+    /// Lower bound on the first occupied slot index: `slots[.. scan_hint]`
+    /// is all-`None`. Keeps `poll_deliver`/`next_deadline` from rescanning
+    /// a large leading hole (e.g. after an outage) on every datagram.
+    scan_hint: usize,
     /// Highest contiguity-tracked received sequence (`RcvCurrSeqNo`).
     rcv_curr_seq: SeqNumber,
     /// Missing ranges, ascending and disjoint. First entry pins the ACK.
@@ -232,6 +235,7 @@ impl Receiver {
             rcv_last_ack: cfg.initial_seq,
             rcv_last_ackack: cfg.initial_seq,
             slots: VecDeque::new(),
+            scan_hint: 0,
             loss: Vec::new(),
             extender: TimestampExtender::new(),
             anchor: None,
@@ -373,18 +377,7 @@ impl Receiver {
         }
         let offset = offset as usize;
         if offset >= self.cfg.buffer_pkts {
-            // §7.1: with TSBPD+TLPKTDROP (always on in live mode), an
-            // offset beyond an EMPTY buffer is an unrecoverable sequence
-            // discrepancy — `base_seq` only advances through delivery or
-            // skips, both of which need an occupied slot, so every future
-            // packet lands beyond capacity too and the connection would be
-            // a permanent zombie (e.g. after a network outage long enough
-            // for the sender's sequence to advance past `buffer_pkts`).
-            // libsrt sends SHUTDOWN and breaks the connection here. The
-            // all-None check (not `slots.is_empty()`) matters: DROPREQ's
-            // msg-number path can leave the deque populated only with
-            // holes, which is equally unrecoverable.
-            if self.slots.iter().all(|s| s.is_none()) {
+            if self.slots.iter().skip(self.scan_hint).all(|s| s.is_none()) {
                 error!(
                     seq = seq.value(),
                     offset,
@@ -393,8 +386,7 @@ impl Receiver {
                 );
                 self.discrepancy = true;
             } else {
-                // Buffer genuinely full/behind: drop only (libsrt does the
-                // same while the buffer is non-empty).
+                // Buffer genuinely full/behind: drop only.
                 warn!(
                     seq = seq.value(),
                     offset, "receive buffer full; packet dropped"
@@ -417,11 +409,6 @@ impl Receiver {
         let expected = self.rcv_curr_seq.next();
         if seq.diff(expected) > 0 {
             if undecryptable {
-                // encryption.md §9.4: loss detection is gated on decrypt
-                // success — a gap revealed by an undecryptable packet
-                // never enters the loss list and is never NAKed, while
-                // the receive cursor still advances past it (below), so
-                // TSBPD later skips the hole like any other drop.
                 debug!(
                     first = expected.value(),
                     last = seq.prev().value(),
@@ -457,11 +444,8 @@ impl Receiver {
             ext_us,
             undecryptable,
         });
+        self.scan_hint = self.scan_hint.min(offset);
         if undecryptable {
-            // Counted only once the packet occupies its slot, so belated,
-            // duplicate and overflow-dropped arrivals (all rejected above)
-            // never tick the counter — libsrt increments pktRcvUndecrypt
-            // only after a successful buffer insert (core.cpp processData).
             self.undecrypted += 1;
         }
     }
@@ -619,10 +603,21 @@ impl Receiver {
     /// frees undecryptable packets at their play time without delivering
     /// them (encryption.md §9.4).
     pub fn poll_deliver(&mut self, now: Instant) -> Option<Vec<u8>> {
-        // Occupied slots imply an anchor: `ingest` sets it before storing.
         let anchor = self.anchor?;
         loop {
-            let first = self.slots.iter().position(|s| s.is_some())?;
+            let first = match self
+                .slots
+                .iter()
+                .skip(self.scan_hint)
+                .position(|s| s.is_some())
+            {
+                Some(p) => self.scan_hint + p,
+                None => {
+                    self.scan_hint = self.slots.len();
+                    return None;
+                }
+            };
+            self.scan_hint = first;
             let ext_us = self.slots[first].as_ref().expect("occupied").ext_us;
             if self.tsbpd_deadline(anchor, ext_us) > now {
                 return None;
@@ -643,13 +638,10 @@ impl Receiver {
                 self.slots.drain(.. first);
                 self.base_seq = self.base_seq.add(first as i32);
             }
+            self.scan_hint = 0;
+
             let slot = self.slots.pop_front().flatten().expect("occupied");
             if slot.undecryptable {
-                // encryption.md §9.4: an undecryptable unit is freed when
-                // its play time arrives, never delivered — the application
-                // sees a gap exactly like a TSBPD drop (libsrt also folds
-                // it into the drop counter). Keep scanning: the next slot
-                // may be due as well.
                 debug!(
                     seq = self.base_seq.value(),
                     "undecryptable packet freed at play time"
@@ -675,7 +667,10 @@ impl Receiver {
         if !self.loss.is_empty() {
             deadline = deadline.min(self.next_nak_time);
         }
-        if let (Some(anchor), Some(slot)) = (self.anchor, self.slots.iter().flatten().next()) {
+        if let (Some(anchor), Some(slot)) = (
+            self.anchor,
+            self.slots.iter().skip(self.scan_hint).flatten().next(),
+        ) {
             deadline = deadline.min(self.tsbpd_deadline(anchor, slot.ext_us));
         }
         Some(deadline.max(now))
@@ -1001,6 +996,35 @@ mod tests {
         assert_eq!(
             r.poll_deliver(t0 + LATENCY + ms(20)),
             Some(vec![(ISN + 1) as u8])
+        );
+    }
+
+    #[test]
+    fn late_fill_behind_cached_scan_position_still_delivers() {
+        // poll_deliver caches the first-occupied index (`scan_hint`); a
+        // retransmission that then fills a hole BEFORE the cached position
+        // must still be found and released first.
+        let t0 = Instant::now();
+        let mut r = rx(t0);
+        r.handle_data(t0, data(ISN, 0));
+        assert_eq!(r.poll_deliver(t0 + LATENCY), Some(vec![ISN as u8]));
+        // Hole at ISN+1..=ISN+2, occupied at ISN+3 (offset 2).
+        r.handle_data(t0 + us(300), data(ISN + 3, 300));
+        // Nothing due yet: this poll walks to offset 2 and caches it.
+        assert_eq!(r.poll_deliver(t0 + us(400)), None);
+        // The retransmission lands at offset 0, behind the cached position.
+        r.handle_data(t0 + us(500), rexmit(ISN + 1, 100));
+        assert_eq!(
+            r.poll_deliver(t0 + LATENCY + us(100)),
+            Some(vec![(ISN + 1) as u8])
+        );
+        // …and next_deadline tracks the front slot (ISN+2 still missing,
+        // ISN+3 due at anchor + 300 µs + latency).
+        let ctl = drain(&mut r, t0 + LATENCY + us(100));
+        assert!(!ctl.is_empty()); // NAKs for the holes were emitted
+        assert_eq!(
+            r.poll_deliver(t0 + LATENCY + us(300)),
+            Some(vec![(ISN + 3) as u8])
         );
     }
 

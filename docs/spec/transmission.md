@@ -101,6 +101,21 @@ Buffers: send buffer default `SRTO_SNDBUF` = 8192 units, receive buffer
 to 1456 bytes). All per-packet state (seqno, msgno, origin time, rexmit time) lives
 in these buffers.
 
+> **Divergence (this implementation).** libsrt keeps the receive-buffer
+> capacity fixed at the configured `SRTO_RCVBUF` even though the peer's
+> handshake proposal can raise the effective TSBPD latency above the local
+> setting (§9.1 max rule) — an undersized buffer then drops steadily at
+> bitrates the configuration was thought to cover. Here the capacity is
+> scaled with the negotiated latency to preserve the provisioned bitrate
+> ceiling: `buffer_pkts = ceil(recv_buffer_pkts · negotiated/configured)`
+> when negotiated > configured (configured floored at 1 ms). Growth is
+> capped at 64× the provisioned capacity and 2²⁰ packets absolute — the
+> peer controls the negotiated latency up to the wire cap (65 535 ms),
+> and one far-offset datagram materializes the whole leading hole as
+> `None` slots, so unbounded scaling would hand the peer control over
+> per-connection memory. An explicit larger `recv_buffer_pkts` is never
+> reduced (`scaled_recv_buffer` in core/mod.rs).
+
 ---
 
 ## 3. Data packet emission (sender)

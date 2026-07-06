@@ -971,6 +971,23 @@ fn exp_deadline(last_recv: Instant, exp_count: u32, rtt_us: u32, rtt_var_us: u32
     last_recv + Duration::from_micros(period.max(count * EXP_MIN_INTERVAL_US))
 }
 
+const MAX_RECV_BUFFER_SCALE: usize = 64;
+const MAX_SCALED_RECV_BUFFER_PKTS: usize = 1 << 20;
+
+fn scaled_recv_buffer(opts: &SrtOptions, rcv_latency: Duration) -> usize {
+    if rcv_latency <= opts.latency {
+        return opts.recv_buffer_pkts;
+    }
+    let configured_us = opts.latency.as_micros().max(1_000);
+    let scaled = (opts.recv_buffer_pkts as u128 * rcv_latency.as_micros()).div_ceil(configured_us);
+    let cap = opts
+        .recv_buffer_pkts
+        .saturating_mul(MAX_RECV_BUFFER_SCALE)
+        .min(MAX_SCALED_RECV_BUFFER_PKTS)
+        .max(opts.recv_buffer_pkts);
+    usize::try_from(scaled).unwrap_or(usize::MAX).min(cap)
+}
+
 /// Builds the established-state machines from a completed negotiation.
 fn transmission_pair(
     now: Instant,
@@ -996,7 +1013,7 @@ fn transmission_pair(
         ReceiverConfig {
             initial_seq: negotiated.recv_initial_seq,
             rcv_latency: negotiated.rcv_latency,
-            buffer_pkts: opts.recv_buffer_pkts,
+            buffer_pkts: scaled_recv_buffer(opts, negotiated.rcv_latency),
         },
     );
     // Periodic-NAK CIF truncation follows the negotiated payload limit.
@@ -1210,6 +1227,33 @@ mod tests {
             while conn.poll_deliver(now).is_some() {}
         }
         (now, sent)
+    }
+
+    #[test]
+    fn recv_buffer_scales_with_negotiated_latency() {
+        let ms = Duration::from_millis;
+        let mut opts = SrtOptions::default();
+        assert_eq!((opts.latency, opts.recv_buffer_pkts), (ms(120), 8192));
+        // Not raised by the peer (equal or lower): capacity as provisioned.
+        assert_eq!(scaled_recv_buffer(&opts, ms(120)), 8192);
+        assert_eq!(scaled_recv_buffer(&opts, ms(20)), 8192);
+        // Raised 120 ms → 4 s: the provisioned bitrate ceiling is kept
+        // (8192 · 4000/120, rounded up).
+        assert_eq!(scaled_recv_buffer(&opts, ms(4000)), 273_067);
+        // A peer forcing the 65 535 ms wire maximum hits the 64× growth
+        // cap instead of the raw ratio (546×).
+        assert_eq!(scaled_recv_buffer(&opts, ms(65_535)), 8192 * 64);
+        // Ratio growth also honors the absolute cap…
+        opts.latency = ms(1);
+        opts.recv_buffer_pkts = 1 << 15;
+        assert_eq!(scaled_recv_buffer(&opts, ms(65_000)), 1 << 20);
+        // …but never caps below an explicit larger provisioning.
+        opts.recv_buffer_pkts = 3 << 20;
+        assert_eq!(scaled_recv_buffer(&opts, ms(65_000)), 3 << 20);
+        // A zero configured latency floors the divisor at 1 ms.
+        opts.recv_buffer_pkts = 8192;
+        opts.latency = Duration::ZERO;
+        assert_eq!(scaled_recv_buffer(&opts, ms(10)), 8192 * 10);
     }
 
     #[test]
