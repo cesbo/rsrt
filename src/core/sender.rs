@@ -42,13 +42,17 @@ use tracing::{
     warn,
 };
 
-use super::time::Timebase;
+use super::{
+    pacing::Pacer,
+    time::Timebase,
+};
 use crate::{
     crypto::Crypto,
     error::{
         CloseReason,
         SrtError,
     },
+    options::Bandwidth,
     packet::{
         AckCif,
         ControlType,
@@ -94,6 +98,9 @@ pub struct SenderConfig {
     pub max_payload: usize,
     /// Send buffer capacity in packets.
     pub buffer_pkts: usize,
+    /// Pacing mode (validated at connect/bind; `Bandwidth::Unlimited` ⇒ no
+    /// pacer — docs/spec/transmission.md §3.3).
+    pub bandwidth: Bandwidth,
     /// Stamps outgoing data packets.
     pub timebase: Timebase,
 }
@@ -108,6 +115,22 @@ pub struct SenderStats {
     pub bytes_sent: u64,
     pub pkts_retransmitted: u64,
     pub pkts_dropped: u64,
+    /// Current inter-packet send interval, µs (libsrt usPktSndPeriod).
+    /// 0 = pacing disabled (Bandwidth::Unlimited).
+    pub snd_period_us: u64,
+    /// Effective pacing ceiling, bytes/s (libsrt mbpsMaxBW analog, kept in
+    /// bytes/s to match the option units). In Estimated mode this is
+    /// max(min, measured)·(100+overhead)/100 once the estimator has closed
+    /// a window; before that the fast-start grace reads the overheaded
+    /// BW_INFINITE·(100+overhead)/100 (156_250_000 at the default 25 %)
+    /// from the first refresh event (full ACK / NAK / timer tick) on —
+    /// plain BW_INFINITE (125_000_000) appears only until that first
+    /// refresh. 0 = pacing disabled.
+    pub snd_max_bw: u64,
+    /// Last measured sender input rate, bytes/s incl. +44/pkt header charge
+    /// (crate extension — libsrt 1.4.4 bstats has no such field).
+    /// 0 unless Bandwidth::Estimated and at least one window has closed.
+    pub snd_input_rate: u64,
 }
 
 /// One buffered (scheduled or sent, not yet acknowledged) packet. The
@@ -176,6 +199,10 @@ pub struct Sender {
     /// `handle_nak` cannot return an error, the connection layer should
     /// poll this flag after dispatching a NAK.
     protocol_violation: bool,
+    /// LiveCC pacing gate (docs/spec/transmission.md §3.3); structurally
+    /// absent for `Bandwidth::Unlimited` — the default path stays exactly
+    /// as it was before pacing existed.
+    pacer: Option<Pacer>,
     stats: SenderStats,
 }
 
@@ -186,10 +213,12 @@ impl Sender {
             flow_window = cfg.flow_window,
             snd_latency_ms = cfg.snd_latency.as_millis() as u64,
             buffer_pkts = cfg.buffer_pkts,
+            bandwidth = ?cfg.bandwidth,
             "sender created"
         );
         Sender {
             advertised_window: cfg.flow_window,
+            pacer: Pacer::new(&cfg.bandwidth, cfg.max_payload),
             cfg,
             buffer: VecDeque::new(),
             base_index: 0,
@@ -224,6 +253,16 @@ impl Sender {
     ) -> Result<(), SrtError> {
         if payload.len() > self.cfg.max_payload {
             return Err(SrtError::PayloadTooLarge(payload.len()));
+        }
+
+        // Input-rate estimator feed, at the application submit point only
+        // (libsrt samples in `addBuffer`; docs/spec/transmission.md §3.3).
+        // Sampled before the overflow drops below: in live mode every push
+        // is accepted, matching libsrt where every addBuffer counts. The
+        // pre-encryption length equals the wire payload length (AES-CTR
+        // does not expand); retransmissions never reach this.
+        if let Some(p) = &mut self.pacer {
+            p.on_input(now, payload.len());
         }
 
         // Sender TLPKTDROP runs on every submit, before the new packet is
@@ -391,6 +430,15 @@ impl Sender {
             self.last_ack_index = ack_ext as u64;
         }
 
+        // Pacing-rate refresh on full ACKs only (TEV_ACK): light ACKs
+        // returned above — libsrt lite ACKs never reach updateCC
+        // (core.cpp:8027-8042). Unlike libsrt, non-advancing duplicate
+        // full ACKs refresh too — idempotent math, spec-marked
+        // simplification (docs/spec/transmission.md §3.3).
+        if let Some(p) = &mut self.pacer {
+            p.refresh();
+        }
+
         Ok(ackack)
     }
 
@@ -454,17 +502,46 @@ impl Sender {
             }
             // A stale *single* sequence is ignored silently (§7.4).
         }
+        // Pacing-rate refresh (TEV_LOSSREPORT,
+        // docs/spec/transmission.md §3.3).
+        if let Some(p) = &mut self.pacer {
+            p.refresh();
+        }
     }
 
-    /// Runs time-based duties (TLPKTDROP scan).
+    /// Runs time-based duties (TLPKTDROP scan, pacing-rate refresh).
     pub fn on_timer(&mut self, now: Instant) {
         self.check_tlpktdrop(now);
+        // TEV_CHECKTIMER refresh (docs/spec/transmission.md §3.3): with a
+        // live peer, full ACKs every 10 ms dominate the cadence exactly as
+        // in libsrt; this additionally fires at pace/TLPKTDROP/keepalive
+        // deadlines.
+        if let Some(p) = &mut self.pacer {
+            p.refresh();
+        }
     }
 
     /// Next data packet to put on the wire (retransmissions take priority
     /// over first transmissions). The destination socket id is left 0: the
     /// connection layer stamps it with the peer's id.
     pub fn poll_transmit(&mut self, now: Instant) -> Option<DataPacket> {
+        // Pacing gate (docs/spec/transmission.md §3.3; packData
+        // core.cpp:8978-8981): a future schedule blocks the whole data
+        // path — retransmissions bypass the flow window but NOT pacing.
+        // Past-due entry lateness accrues as SendTimeDiff credit, spent by
+        // `on_send` to emit back-to-back; accrual happens at most once per
+        // scheduled instant because every exit below rewrites the schedule
+        // (`on_send`) or clears it (`on_nothing_to_send`).
+        if let Some(p) = &mut self.pacer {
+            if let Some(t) = p.next_send_time {
+                if now < t {
+                    // Gated; `next_deadline` advertises `t` to the driver.
+                    return None;
+                }
+                p.credit += now - t;
+            }
+        }
+
         // Retransmission throttle window (SRTO_RETRANSMITALGO=1 — the 1.4.4
         // default whenever the peer sends NAK reports, i.e. always in live
         // mode; docs/spec/transmission.md §7.5 step 2): a sequence whose
@@ -506,6 +583,11 @@ impl Sender {
             self.stats.bytes_sent += pkt.payload.len() as u64;
             self.stats.pkts_retransmitted += 1;
             trace!(seq = pkt.seq.value(), "retransmitting");
+            // Retransmissions consume a paced slot but never probe
+            // (docs/spec/transmission.md §3.3).
+            if let Some(p) = &mut self.pacer {
+                p.on_send(now, pkt.payload.len(), false);
+            }
             return Some(pkt);
         }
 
@@ -518,7 +600,21 @@ impl Sender {
             self.stats.pkts_sent += 1;
             self.stats.bytes_sent += pkt.payload.len() as u64;
             trace!(seq = pkt.seq.value(), "sending");
+            // Probe-pair exception (PUMASK_SEQNO_PROBE, core.cpp:9221-9230):
+            // a NEW packet whose seq & 0xF == 0 schedules the next send at
+            // `now` so the pair hits the wire back-to-back for the peer's
+            // capacity estimator.
+            if let Some(p) = &mut self.pacer {
+                let probe = pkt.seq.value() & 0xF == 0;
+                p.on_send(now, pkt.payload.len(), probe);
+            }
             return Some(pkt);
+        }
+        // A due tick found nothing sendable (idle or window-blocked): zero
+        // schedule AND credit — credit never survives idle
+        // (docs/spec/transmission.md §3.3; packData core.cpp:9106-9117).
+        if let Some(p) = &mut self.pacer {
+            p.on_nothing_to_send();
         }
         None
     }
@@ -529,23 +625,42 @@ impl Sender {
         self.control_queue.pop_front()
     }
 
-    /// Earliest instant `on_timer` needs to run (TLPKTDROP deadline).
+    /// Earliest instant the driver must come back: min of the TLPKTDROP
+    /// deadline and the armed pace schedule.
     ///
-    /// `None` while the buffered timespan is within the drop threshold: the
-    /// timespan only grows on `push`, which re-arms the deadline itself.
+    /// The TLPKTDROP component is `None` while the buffered timespan is
+    /// within the drop threshold: the timespan only grows on `push`, which
+    /// re-arms the deadline itself. The pace schedule is ALWAYS advertised
+    /// while armed — a gate without a wake-up would park the driver forever;
+    /// the guaranteed drain at the tick either emits the due packet or
+    /// resets the idle pacer (docs/spec/transmission.md §3.3).
     pub fn next_deadline(&self) -> Option<Instant> {
-        let front = self.buffer.front()?;
-        let back = self.buffer.back()?;
         let threshold = self.drop_threshold();
-        if back.origin.duration_since(front.origin) > threshold {
-            Some(front.origin + threshold)
-        } else {
-            None
+        let drop = match (self.buffer.front(), self.buffer.back()) {
+            (Some(front), Some(back))
+                if back.origin.duration_since(front.origin) > threshold =>
+            {
+                Some(front.origin + threshold)
+            }
+            _ => None,
+        };
+        let pace = self.pacer.as_ref().and_then(Pacer::deadline);
+        match (drop, pace) {
+            (Some(d), Some(p)) => Some(d.min(p)),
+            (d, p) => d.or(p),
         }
     }
 
     pub fn stats(&self) -> SenderStats {
-        self.stats
+        let mut stats = self.stats;
+        // Pacing gauges live in the pacer (no duplicated state); all three
+        // read 0 while pacing is disabled (Bandwidth::Unlimited).
+        if let Some(p) = &self.pacer {
+            stats.snd_period_us = p.period_us();
+            stats.snd_max_bw = p.max_bw();
+            stats.snd_input_rate = p.input_rate();
+        }
+        stats
     }
 
     /// Sender-side RTT estimate `(rtt_us, rtt_var_us)`: the peer receiver's
@@ -698,11 +813,17 @@ impl Sender {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::{
-        CryptoConfig,
-        KeyLength,
-        KmReqOutcome,
-        KmRspOutcome,
+    use crate::{
+        core::pacing::{
+            with_overhead,
+            BW_INFINITE,
+        },
+        crypto::{
+            CryptoConfig,
+            KeyLength,
+            KmReqOutcome,
+            KmRspOutcome,
+        },
     };
 
     const ISN: u32 = 100;
@@ -715,6 +836,7 @@ mod tests {
             snd_latency: Duration::from_millis(120), // threshold = 1020 ms
             max_payload: 1456,
             buffer_pkts: 8192,
+            bandwidth: Bandwidth::Unlimited,
             timebase: Timebase::new(start),
         }
     }
@@ -1637,5 +1759,339 @@ mod tests {
         assert_eq!(rex.seq, SeqNumber::new(1));
         assert_eq!(rex.encryption, EncryptionFlags::Odd);
         assert_eq!(rex.payload, sent[4].payload);
+    }
+
+    // ---- pacing (docs/spec/transmission.md §3.3) ----
+
+    fn us(n: u64) -> Duration {
+        Duration::from_micros(n)
+    }
+
+    /// `config()` sender with a pacing mode. 1316-byte payloads at
+    /// 1_360_000 B/s give a period of exactly 1000 µs
+    /// (trunc(1e6·(1316+44)/1_360_000)) — the grid most tests run on.
+    fn paced(start: Instant, bandwidth: Bandwidth) -> Sender {
+        Sender::new(SenderConfig {
+            bandwidth,
+            ..config(start)
+        })
+    }
+
+    #[test]
+    fn default_options_are_unpaced() {
+        // Divergence pin (§3.3): Bandwidth::Unlimited disables the pacer
+        // structurally — a burst drains at one instant, no pace deadline
+        // is ever advertised and all gauges read 0. Existing suites rely
+        // on same-instant multi-packet drains.
+        let t0 = Instant::now();
+        let mut s = sender(t0);
+        for i in 0 .. 5 {
+            s.push(t0 + MS * i, vec![0; 100], None).unwrap();
+        }
+        let out: Vec<DataPacket> = std::iter::from_fn(|| s.poll_transmit(t0 + MS * 5)).collect();
+        assert_eq!(out.len(), 5, "same-instant drain must not be gated");
+        assert_eq!(s.next_deadline(), None, "no pace deadline component");
+        let st = s.stats();
+        assert_eq!(st.snd_period_us, 0);
+        assert_eq!(st.snd_max_bw, 0);
+        assert_eq!(st.snd_input_rate, 0);
+    }
+
+    #[test]
+    fn paced_sender_spaces_packets_on_a_microsecond_grid() {
+        // §3.3: period = trunc(1e6·(AvgPayloadSize+44)/max_bw) whole µs;
+        // the first packet after establish goes immediately (zero
+        // m_tsNextSendTime), then the gate holds until the exact tick.
+        let t0 = Instant::now();
+        let mut s = paced(t0, Bandwidth::Max { bytes_per_sec: 1_360_000 });
+        for _ in 0 .. 3 {
+            s.push(t0, vec![0; 1316], None).unwrap();
+        }
+        assert!(s.poll_transmit(t0).is_some());
+        assert!(s.poll_transmit(t0).is_none(), "second packet gated");
+        // MANDATORY: the armed schedule is advertised — the tokio driver
+        // sleeps on next_deadline; a silent gate parks it forever.
+        assert_eq!(s.next_deadline(), Some(t0 + us(1000)));
+        assert!(s.poll_transmit(t0 + us(999)).is_none(), "1 µs early");
+        assert!(s.poll_transmit(t0 + us(1000)).is_some());
+        assert_eq!(s.stats().snd_period_us, 1000);
+        assert_eq!(s.stats().snd_max_bw, 1_360_000);
+    }
+
+    #[test]
+    fn send_time_credit_repays_lateness_back_to_back() {
+        // §3.3: entry lateness accrues as SendTimeDiff credit and is spent
+        // to send back-to-back — the catch-up burst that absorbs coarse
+        // driver wakes (packData core.cpp:8978-8981, 9221-9248).
+        let t0 = Instant::now();
+        let mut s = paced(t0, Bandwidth::Max { bytes_per_sec: 1_360_000 });
+        for _ in 0 .. 6 {
+            s.push(t0, vec![0; 1316], None).unwrap();
+        }
+        assert!(s.poll_transmit(t0).is_some()); // schedule armed at +1000
+        // The driver comes back 3.5 periods late: 3500 µs of credit buys
+        // 3 whole periods plus the due slot — 4 packets back-to-back.
+        let late = t0 + us(4500);
+        let burst: Vec<DataPacket> = std::iter::from_fn(|| s.poll_transmit(late)).collect();
+        assert_eq!(burst.len(), 4, "3 whole credits + the due slot");
+        // The fractional 500 µs remainder is honored exactly: the sixth
+        // packet is due at late + (period - credit) = t0 + 5000 µs.
+        assert_eq!(s.next_deadline(), Some(t0 + us(5000)));
+        assert!(s.poll_transmit(t0 + us(4999)).is_none());
+        assert!(s.poll_transmit(t0 + us(5000)).is_some());
+    }
+
+    #[test]
+    fn idle_resets_credit_and_schedule() {
+        // §3.3: a due poll that finds nothing sendable zeroes credit AND
+        // schedule (packData core.cpp:9106-9117) — a push arriving much
+        // later starts fresh instead of burning stale credit as a burst.
+        let t0 = Instant::now();
+        let mut s = paced(t0, Bandwidth::Max { bytes_per_sec: 1_360_000 });
+        s.push(t0, vec![0; 1316], None).unwrap();
+        assert!(s.poll_transmit(t0).is_some());
+        assert_eq!(s.next_deadline(), Some(t0 + us(1000)));
+        // Contract-honoring drive at the advertised tick: the empty poll
+        // performs the idle reset and the pace deadline disappears.
+        s.on_timer(t0 + us(1000));
+        assert!(s.poll_transmit(t0 + us(1000)).is_none());
+        assert_eq!(s.next_deadline(), None, "idle reset disarms the gate");
+        // 500 periods later: the first packet goes immediately, but the
+        // second waits a FULL period — no spurious credit survived idle.
+        let t2 = t0 + Duration::from_millis(500);
+        s.push(t2, vec![0; 1316], None).unwrap();
+        s.push(t2, vec![0; 1316], None).unwrap();
+        assert!(s.poll_transmit(t2).is_some());
+        assert!(s.poll_transmit(t2).is_none(), "no spurious burst");
+        assert_eq!(s.next_deadline(), Some(t2 + us(1000)));
+        assert!(s.poll_transmit(t2 + us(1000)).is_some());
+    }
+
+    #[test]
+    fn window_blocked_poll_resets_credit() {
+        // §3.3: the congested case shares the idle reset — a due tick that
+        // is flow-window-blocked zeroes credit and schedule too, so the
+        // post-ACK resume is immediate-then-paced, never a credit burst.
+        let t0 = Instant::now();
+        let mut s = Sender::new(SenderConfig {
+            flow_window: 2,
+            bandwidth: Bandwidth::Max { bytes_per_sec: 1_360_000 },
+            ..config(t0)
+        });
+        for _ in 0 .. 4 {
+            s.push(t0, vec![0; 1316], None).unwrap();
+        }
+        assert!(s.poll_transmit(t0).is_some());
+        assert!(s.poll_transmit(t0 + us(1000)).is_some());
+        // Due tick with the window full (flight 2 of 2): reset.
+        assert!(s.poll_transmit(t0 + us(2000)).is_none());
+        assert_eq!(s.next_deadline(), None, "window-blocked reset");
+        // 8 ms later an ACK releases the window: the next send is
+        // immediate (schedule disarmed), the one after a full period.
+        s.handle_ack(t0 + us(10_000), 1, &full_ack(ISN + 2)).unwrap();
+        assert!(s.poll_transmit(t0 + us(10_000)).is_some());
+        assert!(s.poll_transmit(t0 + us(10_000)).is_none(), "credit was zeroed");
+        assert_eq!(s.next_deadline(), Some(t0 + us(11_000)));
+        assert!(s.poll_transmit(t0 + us(11_000)).is_some());
+    }
+
+    #[test]
+    fn probe_pair_bypasses_pacing_for_new_data_only() {
+        // §3.3 probe pairs (PUMASK_SEQNO_PROBE, core.cpp:9221-9230): a NEW
+        // packet whose seq & 0xF == 0 schedules the next send at `now` —
+        // the follower goes back-to-back; retransmissions never probe.
+        let t0 = Instant::now();
+        let mut s = Sender::new(SenderConfig {
+            initial_seq: SeqNumber::new(112), // 112 & 0xF == 0
+            bandwidth: Bandwidth::Max { bytes_per_sec: 1_360_000 },
+            ..config(t0)
+        });
+        for _ in 0 .. 3 {
+            s.push(t0, vec![0; 1316], None).unwrap();
+        }
+        // seq 112 probes: its follower (113) is emitted at the SAME
+        // instant; the packet after the pair is gated normally.
+        assert_eq!(s.poll_transmit(t0).unwrap().seq, SeqNumber::new(112));
+        assert_eq!(s.poll_transmit(t0).unwrap().seq, SeqNumber::new(113));
+        assert!(s.poll_transmit(t0).is_none(), "after the pair: gated");
+        assert_eq!(s.next_deadline(), Some(t0 + us(1000)));
+        assert_eq!(s.poll_transmit(t0 + us(1000)).unwrap().seq, SeqNumber::new(114));
+        // A RETRANSMISSION of the & 0xF == 0 sequence does not arm a
+        // probe: no same-instant follower after the rexmit.
+        s.handle_nak(t0 + us(1500), &nak(112, 112));
+        assert!(s.poll_transmit(t0 + us(1500)).is_none(), "gated until tick");
+        let rex = s.poll_transmit(t0 + us(2000)).unwrap();
+        assert_eq!(rex.seq, SeqNumber::new(112));
+        assert!(rex.retransmitted);
+        assert!(s.poll_transmit(t0 + us(2000)).is_none(), "rexmit never probes");
+        assert_eq!(s.next_deadline(), Some(t0 + us(3000)));
+    }
+
+    #[test]
+    fn rexmit_and_new_data_share_one_paced_slot() {
+        // §3.3: retransmissions bypass the flow window but NOT pacing —
+        // one packet per period across classes, rexmit first (§3.2
+        // ordering preserved under the gate).
+        let t0 = Instant::now();
+        let mut s = paced(t0, Bandwidth::Max { bytes_per_sec: 1_360_000 });
+        for _ in 0 .. 4 {
+            s.push(t0, vec![0; 1316], None).unwrap();
+        }
+        assert!(s.poll_transmit(t0).is_some()); // seq 100 out
+        // NAK while gated: nothing is emitted, the loss entry is retained.
+        s.handle_nak(t0 + us(100), &nak(ISN, ISN));
+        assert!(s.poll_transmit(t0 + us(100)).is_none(), "gate blocks rexmits too");
+        // At the tick the retransmission takes the paced slot ...
+        let rex = s.poll_transmit(t0 + us(1000)).unwrap();
+        assert_eq!(rex.seq, SeqNumber::new(ISN));
+        assert!(rex.retransmitted);
+        assert!(s.poll_transmit(t0 + us(1000)).is_none());
+        // ... and new data resumes only a full period later.
+        let p = s.poll_transmit(t0 + us(2000)).unwrap();
+        assert_eq!(p.seq, SeqNumber::new(ISN + 1));
+        assert!(!p.retransmitted);
+    }
+
+    #[test]
+    fn avg_payload_iir_moves_period_only_on_rate_events() {
+        // §3.3: TEV_SEND feeds the avg_iir<128> payload smoother but never
+        // the interval — the period changes only at refresh events (full
+        // ACK / NAK / timer); light ACKs never reach updateCC
+        // (core.cpp:7371-7379, 8027-8042).
+        let t0 = Instant::now();
+        let mut s = paced(t0, Bandwidth::Max { bytes_per_sec: 1_360_000 });
+        s.push(t0, vec![0; 100], None).unwrap();
+        s.push(t0, vec![0; 100], None).unwrap();
+        // Two 100-byte sends move the IIR (1316 → 1306 → 1296), yet the
+        // period stays at its construction value across both.
+        assert!(s.poll_transmit(t0).is_some());
+        assert_eq!(s.stats().snd_period_us, 1000);
+        assert!(s.poll_transmit(t0 + us(1000)).is_some());
+        assert_eq!(s.stats().snd_period_us, 1000);
+        // Light ACK: no refresh.
+        s.handle_ack(t0 + us(1500), 0, &light_ack(ISN + 2)).unwrap();
+        assert_eq!(s.stats().snd_period_us, 1000);
+        // Full ACK: refresh picks up the IIR drift —
+        // trunc(1e6·(1296+44)/1_360_000) = 985.
+        s.handle_ack(t0 + us(1600), 1, &full_ack(ISN + 2)).unwrap();
+        assert_eq!(s.stats().snd_period_us, 985);
+    }
+
+    #[test]
+    fn estimated_ceiling_tracks_estimator_with_overhead_and_floor() {
+        // §3.3 auto mode: ceiling = withOverhead(max(min, measured)),
+        // refreshed on full ACKs; BW_INFINITE grace until the first
+        // estimator window closes (buffer.h:207, congctl.cpp:182-219).
+        let t0 = Instant::now();
+        let mut s = paced(
+            t0,
+            Bandwidth::Estimated { min_bytes_per_sec: 5_000, overhead_pct: 25 },
+        );
+        // Construction parity with updateBandwidth(0, 0) at TEV_INIT: the
+        // LiveCC ctor ceiling, period trunc(1e6·1360/125e6) = 10 µs.
+        let st = s.stats();
+        assert_eq!(st.snd_max_bw, BW_INFINITE);
+        assert_eq!(st.snd_input_rate, 0);
+        assert_eq!(st.snd_period_us, 10);
+        // Before the first window closes a refresh overheads the grace
+        // value: 125e6·125/100 — still effectively unpaced.
+        s.push(t0, vec![0; 1000], None).unwrap(); // stamps the window only
+        s.handle_ack(t0 + Duration::from_millis(100), 1, &full_ack(ISN)).unwrap();
+        let st = s.stats();
+        assert_eq!(st.snd_max_bw, 156_250_000);
+        assert_eq!(st.snd_input_rate, 0, "no fictitious grace rate in stats");
+        // First window closes at 501 ms with 2 counted 1000-byte pushes:
+        // rate = (2000 + 2·44)·1e6/501_000 = 4167 — below the 5000 floor.
+        s.push(t0 + Duration::from_millis(250), vec![0; 1000], None).unwrap();
+        s.push(t0 + Duration::from_millis(501), vec![0; 1000], None).unwrap();
+        s.handle_ack(t0 + Duration::from_millis(502), 2, &full_ack(ISN)).unwrap();
+        let st = s.stats();
+        assert_eq!(st.snd_input_rate, 4167);
+        assert_eq!(st.snd_max_bw, with_overhead(5_000, 25), "floor wins");
+        assert_eq!(st.snd_max_bw, 6_250);
+        // Second (1 s) window measures above the floor: 5 pushes of 1000
+        // bytes over 1.001 s → (5000 + 5·44)·1e6/1_001_000 = 5214.
+        for i in 1 ..= 4u64 {
+            s.push(t0 + Duration::from_millis(501 + 200 * i), vec![0; 1000], None)
+                .unwrap();
+        }
+        s.push(t0 + Duration::from_millis(1502), vec![0; 1000], None).unwrap();
+        s.handle_ack(t0 + Duration::from_millis(1503), 3, &full_ack(ISN)).unwrap();
+        let st = s.stats();
+        assert_eq!(st.snd_input_rate, 5214);
+        assert_eq!(st.snd_max_bw, with_overhead(5214, 25), "estimate wins");
+        assert_eq!(st.snd_max_bw, 6517);
+        // Period follows: trunc(1e6·(1316+44)/6517) = 208_684 µs (nothing
+        // was emitted, so the payload IIR still sits at its init).
+        assert_eq!(st.snd_period_us, 208_684);
+    }
+
+    #[test]
+    fn tlpktdrop_fires_under_pacing_backpressure() {
+        // §8.1 + §3.3 composition: pace-blocked packets age in the buffer
+        // and sender TLPKTDROP sheds them; next_deadline() is the min of
+        // the two components and the gate survives the drop untouched.
+        let t0 = Instant::now();
+        // 1360 B/s: period = 1e6·(1316+44)/1360 = exactly 1 s.
+        let mut s = paced(t0, Bandwidth::Max { bytes_per_sec: 1360 });
+        s.push(t0, vec![0; 1316], None).unwrap();
+        s.push(t0, vec![0; 1316], None).unwrap();
+        assert!(s.poll_transmit(t0).is_some());
+        assert_eq!(s.next_deadline(), Some(t0 + us(1_000_000)), "pace only");
+        // Third push stretches the timespan past the 1020 ms threshold:
+        // the drop deadline (t0 + 1020 ms) arms, but the pace tick
+        // (t0 + 1000 ms) is earlier and wins the min.
+        s.push(t0 + Duration::from_millis(1030), vec![0; 1316], None).unwrap();
+        assert_eq!(s.next_deadline(), Some(t0 + Duration::from_millis(1000)));
+        // Pace tick: nothing is droppable yet (both t0 packets are 1000 ms
+        // old < 1020 ms); the paced slot emits and re-arms at +2 s, so the
+        // drop deadline is now the earlier component.
+        s.on_timer(t0 + Duration::from_millis(1000));
+        assert!(s.poll_transmit(t0 + Duration::from_millis(1000)).is_some());
+        assert!(s.poll_transmit(t0 + Duration::from_millis(1000)).is_none());
+        assert_eq!(s.next_deadline(), Some(t0 + Duration::from_millis(1020)));
+        // Drop tick: both t0 packets (one sent, one pace-blocked) cross
+        // the threshold and are shed with a DROPREQ; the gate stays armed.
+        s.on_timer(t0 + Duration::from_millis(1020));
+        assert_eq!(s.stats().pkts_dropped, 2);
+        assert!(matches!(
+            s.poll_control(),
+            Some(ControlType::DropRequest { .. })
+        ));
+        assert!(s.poll_transmit(t0 + Duration::from_millis(1020)).is_none(), "still gated");
+        assert_eq!(s.next_deadline(), Some(t0 + Duration::from_secs(2)));
+        // The survivor goes out at the tick, as a first transmission.
+        let p = s.poll_transmit(t0 + Duration::from_secs(2)).unwrap();
+        assert_eq!(p.seq, SeqNumber::new(ISN + 2));
+        assert!(!p.retransmitted);
+    }
+
+    #[test]
+    fn no_busy_wake_invariant() {
+        // §3.3 deadline contract: after any drain-to-None at `now`, the
+        // advertised deadline is None (idle reset ran) or strictly in the
+        // future (gated) — the driver never busy-loops, and the one extra
+        // wake at burst end performs the reset itself.
+        let t0 = Instant::now();
+        let mut s = paced(t0, Bandwidth::Max { bytes_per_sec: 1_360_000 });
+        assert!(s.poll_transmit(t0).is_none());
+        assert_eq!(s.next_deadline(), None, "idle sender advertises nothing");
+        s.push(t0, vec![0; 1316], None).unwrap();
+        s.push(t0, vec![0; 1316], None).unwrap();
+        let mut now = t0;
+        loop {
+            while s.poll_transmit(now).is_some() {}
+            match s.next_deadline() {
+                Some(d) => {
+                    assert!(d > now, "deadline at or before `now` busy-loops the driver");
+                    now = d;
+                }
+                None => break,
+            }
+        }
+        // The loop ends exactly at the burst-end wake: both packets went
+        // out and the empty poll reset the schedule.
+        assert_eq!(s.stats().pkts_sent, 2);
+        assert_eq!(s.next_deadline(), None);
     }
 }

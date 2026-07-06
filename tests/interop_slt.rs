@@ -28,6 +28,7 @@ use std::{
 };
 
 use srt::{
+    Bandwidth,
     SrtListener,
     SrtOptions,
     SrtSocket,
@@ -307,6 +308,176 @@ async fn listener_sends_to_slt_caller() {
             "sender dropped packets on a loss-free path: {stats:?}"
         );
         assert!(stats.pkts_sent as usize >= MESSAGES, "{stats:?}");
+        slt.kill().await.ok();
+    })
+    .await;
+}
+
+/// Pacing interop, `Bandwidth::Estimated` — the SRTO_OHEADBW configuration
+/// (docs/spec/transmission.md §3.3.2): our paced caller sends the full
+/// stream to a real libsrt 1.4.4 receiver. Byte equality proves the paced
+/// stream (probe pairs included) keeps the reference TSBPD/ACK machinery
+/// happy, and the settled gauges pin the estimator: the ceiling must be
+/// exactly withOverhead(measured input rate), with the measured rate in a
+/// generous band around the ~1.3 MB/s send pace (per suite policy wall
+/// clock is a hang detector, never a tight rate assertion — the band only
+/// proves a real §3.3.3 window closed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn paced_caller_delivers_everything_to_slt() {
+    let binary = require_slt!();
+    const SEED: u64 = 0x51A7_0007;
+    within_timeout(async {
+        let port = free_udp_port().expect("free port");
+        // srt://:port -> stdout.
+        let mut slt = SltProcess::spawn_receive(
+            &binary,
+            &listener_uri(port, &["latency=120"]),
+            &[LOG, "-a:no"],
+        )
+        .expect("spawn srt-live-transmit");
+        tokio::time::sleep(Duration::from_millis(300)).await; // let it bind
+
+        let opts = SrtOptions::default().bandwidth(Bandwidth::Estimated {
+            min_bytes_per_sec: 0,
+            overhead_pct: 25,
+        });
+        let sock = SrtSocket::connect(("127.0.0.1", port), opts)
+            .await
+            .expect("connect to slt listener");
+        tokio::time::sleep(Duration::from_millis(200)).await; // slt sees the accept
+
+        // Same shape as direction 3: collect concurrently, then close our
+        // socket so slt exits and flushes its block-buffered stdout tail.
+        let (out, stats) =
+            tokio::join!(slt.collect_stdout(TOTAL, Duration::from_secs(25)), async {
+                send_stream(&sock, SEED).await;
+                tokio::time::sleep(Duration::from_millis(800)).await;
+                let stats = sock.stats();
+                sock.close().await.expect("close");
+                stats
+            },);
+        let out = out.expect("collect slt stdout");
+        assert_eq!(
+            out.len(),
+            TOTAL,
+            "slt wrote {} of {TOTAL} bytes (data lost sender->slt); slt stderr: {:?}",
+            out.len(),
+            slt.drain_stderr(),
+        );
+        verify_prefix(SEED, &out).unwrap_or_else(|e| panic!("slt output diverged: {e}"));
+
+        assert_eq!(
+            stats.pkts_send_dropped, 0,
+            "the ceiling has 25% headroom over the input; nothing may drop: {stats:?}"
+        );
+        // The nominal feed is 1316 B/ms = 1_360_000 B/s with headers; the
+        // wide lower bound only tolerates scheduler starvation slowing the
+        // pace, and both bounds together prove the estimate is neither 0
+        // (never measured) nor BW_INFINITE (stuck in fast-start grace).
+        assert!(
+            (200_000 ..= 2_000_000).contains(&stats.snd_input_rate),
+            "measured input rate outside the loose ~1.36 MB/s band: {stats:?}"
+        );
+        assert_eq!(
+            stats.snd_max_bw,
+            stats.snd_input_rate * 125 / 100,
+            "SRTO_OHEADBW parity: ceiling = measured·(100+25)/100: {stats:?}"
+        );
+        assert!(stats.snd_period_us > 0, "pacing must be engaged: {stats:?}");
+        slt.kill().await.ok();
+    })
+    .await;
+}
+
+/// Pacing interop, `Bandwidth::Max` far below the offered rate: 600
+/// messages (816_000 wire bytes) through a 680_000 B/s ceiling have a firm
+/// ~1.13 s wire-time floor (500 paced slots/s plus one free probe slot per
+/// 16 packets, transmission.md §3.3.4), while the unpaced handover takes
+/// ~0.6 s — finishing under 1 s proves pacing never engaged. Per suite
+/// policy the wall-clock bound is a generous lower bound only; the
+/// functional assert is eventual byte equality through slt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn low_maxbw_engages_pacing() {
+    let binary = require_slt!();
+    const SEED: u64 = 0x51A7_0008;
+    // ~790 KB: sized so the paced run finishes well inside the budget.
+    const N: usize = 600;
+    const BYTES: usize = N * MESSAGE_SIZE;
+    within_timeout(async {
+        let port = free_udp_port().expect("free port");
+        // 1 s latency on both sides: the backlog behind the ceiling peaks
+        // at ~0.6 s of send lag, which must stay inside both the TSBPD
+        // budget and the sender TLPKTDROP threshold — the ceiling
+        // throttles, the too-late valves must never fire.
+        let mut slt = SltProcess::spawn_receive(
+            &binary,
+            &listener_uri(port, &["latency=1000"]),
+            &[LOG, "-a:no"],
+        )
+        .expect("spawn srt-live-transmit");
+        tokio::time::sleep(Duration::from_millis(300)).await; // let it bind
+
+        let opts = SrtOptions::default()
+            .latency(Duration::from_millis(1_000))
+            .bandwidth(Bandwidth::Max { bytes_per_sec: 680_000 });
+        let sock = SrtSocket::connect(("127.0.0.1", port), opts)
+            .await
+            .expect("connect to slt listener");
+        tokio::time::sleep(Duration::from_millis(200)).await; // slt sees the accept
+
+        // Same shape as direction 3: collect concurrently, then close our
+        // socket so slt exits and flushes its block-buffered stdout tail.
+        let (out, stats) =
+            tokio::join!(slt.collect_stdout(BYTES, Duration::from_secs(25)), async {
+                let started = std::time::Instant::now();
+                let mut generator = PayloadGen::new(SEED);
+                for i in 0 .. N {
+                    sock.send(&generator.next_message())
+                        .await
+                        .unwrap_or_else(|e| panic!("send (message {i}): {e}"));
+                    tokio::time::sleep(PACE).await;
+                }
+                // The handover above is ~2× the ceiling; the wire cannot
+                // keep up, so wait until the paced sender emitted it all.
+                while (sock.stats().pkts_sent as usize) < N {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                let elapsed = started.elapsed();
+                assert!(
+                    elapsed >= Duration::from_secs(1),
+                    "600×1360 wire bytes cannot pass a 680_000 B/s ceiling \
+                     in {elapsed:?} — pacing did not engage"
+                );
+                // Outlive the 1 s TSBPD latency before closing: slt
+                // discards its still-queued tail on disconnect.
+                tokio::time::sleep(Duration::from_millis(1_500)).await;
+                let stats = sock.stats();
+                sock.close().await.expect("close");
+                stats
+            },);
+        let out = out.expect("collect slt stdout");
+        assert_eq!(
+            out.len(),
+            BYTES,
+            "slt wrote {} of {BYTES} bytes (data lost sender->slt); slt stderr: {:?}",
+            out.len(),
+            slt.drain_stderr(),
+        );
+        verify_prefix(SEED, &out).unwrap_or_else(|e| panic!("slt output diverged: {e}"));
+
+        assert_eq!(
+            stats.pkts_send_dropped, 0,
+            "the ceiling must throttle without tripping TLPKTDROP: {stats:?}"
+        );
+        assert_eq!(stats.snd_max_bw, 680_000, "{stats:?}");
+        assert_eq!(
+            stats.snd_period_us, 2_000,
+            "period = trunc(1e6·(1316+44)/680_000): {stats:?}"
+        );
+        assert_eq!(
+            stats.snd_input_rate, 0,
+            "Max mode never runs the estimator: {stats:?}"
+        );
         slt.kill().await.ok();
     })
     .await;

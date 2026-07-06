@@ -234,3 +234,120 @@ Pointers only — details live there:
   time and a failed in-stream KMREQ gets total silence. Permissive peers
   still interop: the rejection happens before any data flows.
 - Full checklist: `encryption.md` §15 "Traps".
+
+## 6. Pacing/bandwidth audit — SRTO_MAXBW/INPUTBW/MININPUTBW/OHEADBW (v1.4.4)
+
+Second verification pass, done while implementing LiveCC pacing and the
+`Bandwidth` option (`transmission.md` §3.3.1–3.3.4). Every claim below was
+re-checked against the v1.4.4 tag sources.
+
+### 6.1 Confirmed against source
+
+- **Setter ranges** (all reject with `SRT_EINVPARAM`): `SRTO_MAXBW >= -1`
+  (socketconfig.cpp:226-236), `SRTO_INPUTBW >= 0` (291-300),
+  `SRTO_MININPUTBW >= 0` (302-311), `SRTO_OHEADBW` in **5..=100** (313-322).
+- **Defaults** `-1 / 0 / 0 / 25` (socketconfig.h:262, 275-277).
+- **`updateCC` TEV_INIT mode resolution** (core.cpp:7294-7341):
+  `MAXBW > 0` → fixed ceiling; `MAXBW == 0 && INPUTBW > 0` →
+  `withOverhead(INPUTBW)` fixed; both 0 → in-buffer sampling requested.
+  Includes the `only_input && llMaxBW` "don't change" guard: a runtime
+  INPUTBW/OHEADBW change is ignored while MAXBW is set (core.cpp:7303-7307);
+  a TEV_INIT_OHEADBW stage never resets the sampler (core.cpp:7322-7326).
+- **Periodic ceiling refresh** — auto mode only, on TEV_ACK / TEV_LOSSREPORT /
+  TEV_CHECKTIMER: `updateBandwidth(0, withOverhead(max(llMinInputBW,
+  getInputRate())))` (core.cpp:7344-7364; the event sites: TEV_ACK
+  core.cpp:8249, TEV_LOSSREPORT 8467, TEV_CHECKTIMER 10967).
+- **`withOverhead`** = `(basebw·(100 + iOverheadBW))/100`, integer-truncating
+  (core.h:656-659).
+- **Estimator state machine** (buffer.cpp:299-333): first call stamps
+  `m_tsInRateStartTime` only, bytes uncounted (305-309); strict comparisons on
+  both closes — fast-start early close `pkts > INPUTRATE_MAX_PACKETS = 2000`
+  (315), `elapsed > period` (318); +44·pkts (`SRT_DATA_HDR_SIZE`,
+  packet.h:408-410) charged once at close (321); truncating division into
+  bytes/s (322); on close the window restarts at the closing sample's time and
+  the period switches to `INPUTRATE_RUNNING_US` = 1 s (326-330). Constants
+  and the `BW_INFINITE` initial value: buffer.h:204-207, common.h:280.
+- **Fed only from `addBuffer`** (buffer.cpp:277) — retransmissions
+  (`readData`) never feed the estimator.
+- **packData credit/reset/probe** (core.cpp:8966-9252): entry lateness accrued
+  into `m_tdSendTimeDiff` when past the armed schedule (8978-8981); probe flag
+  set only in the new-packet branch, `seq & PUMASK_SEQNO_PROBE == 0`
+  (9098-9100; mask packet.h:215); idle reset (9106-9108) and window-blocked
+  reset (9115-9117) both zero schedule AND credit; probe schedules the next
+  send at `enter_time` with the credit untouched (9221-9226); the non-busy-
+  wait spend-credit-or-wait tail (9231-9247).
+- **TEV_SEND feeds only the avg-payload IIR**: `avg_iir<128>` over emitted
+  payload lengths, rexmits included (`updatePayloadSize`, congctl.cpp:141-155,
+  connected at 93); the interval copy-out excludes TEV_SEND / TEV_ACKACK /
+  TEV_RECEIVE (core.cpp:7374-7379), so the IIR takes effect at the next rate
+  event. Init: `SRTO_PAYLOADSIZE` (live default 1316) or `maxPayloadSize()`
+  when 0 (congctl.cpp:79-82); ctor ceiling `BW_INFINITE` (congctl.cpp:77) and
+  an immediate `updatePktSndPeriod` (congctl.cpp:89).
+- **Lite and duplicate full ACKs never reach `updateCC`**: the lite-ACK short
+  path returns first (core.cpp:8026-8042), the `m_iSndLastFullAck` gate
+  returns on non-advancing full ACKs (8099-8105), `updateCC(TEV_ACK)` runs
+  after both (8249).
+- **cwnd re-pinned on every `setMaxBW`**: `m_dCWndSize = m_dMaxCWndSize`
+  (congctl.cpp:196) — live mode never cwnd-throttles below the flow window.
+
+### 6.2 Traps
+
+- **`SRTO_OHEADBW` 0–4 is rejected**, not merely inadvisable — the libsrt
+  docs' "avoid 0" guidance is moot; 5 is the real minimum.
+- **The keep-previous-ceiling guard is not where the comment says.** The
+  core.cpp:7353-7360 comment ("Keep previously set maximum in that case
+  (inputbw == 0)") sits on `if (inputbw >= 0)` — vacuously true
+  (`m_iInRateBps` inits to `BW_INFINITE` and is never negative,
+  buffer.cpp:127). The behavior is real but lives in LiveCC:
+  `updateBandwidth`'s `if (bw == 0) return;` (congctl.cpp:210-213), reachable
+  only when the estimate is 0 AND `MININPUTBW == 0`.
+- **Credit never survives idle or congestion**: any due slot with nothing
+  sendable zeroes `SendTimeDiff` — a bursty app cannot bank catch-up credit
+  across gaps.
+- **A stale estimate persists through silence**: the rate only changes inside
+  the submit-path feed; `SRTO_MININPUTBW` is the floor, and it acts **only in
+  the auto path** (`MAXBW = 0, INPUTBW = 0`) — it never floors an explicit
+  `INPUTBW`.
+- **Probe pairs are NEW-packet-only**: the flag is set in the new-packet
+  branch; a retransmission of a `seq & 0xF == 0` packet never probes (its
+  *follower* slot may contain a rexmit, which the peer's estimator discards).
+- **Three independent truncation points**: the window-close rate
+  (buffer.cpp:322), `withOverhead` (core.h:658) and the whole-µs interval
+  copy-out (core.cpp:7378) each truncate — exact-parity math must truncate at
+  all three.
+- **`updateInputRate` divides by a possibly-zero elapsed** (buffer.cpp:322):
+  the `> 2000` early close can fire with all samples at one instant. Tripping
+  it in libsrt takes over 2000 separate submit calls within one clock
+  microsecond; a sans-I/O port whose establish-time flush submits a whole
+  backlog with one `now` trips it deterministically — hence divergence D4
+  below.
+
+### 6.3 Divergences in this implementation (all spec-marked in transmission.md §3.3)
+
+- **D1** — `Bandwidth::Unlimited` (default) disables the pacer structurally
+  instead of gating at `BW_INFINITE`'s ~10.9 µs period (§3.3.2 divergence
+  note). `Max { bytes_per_sec: 125_000_000 }` reproduces libsrt's literal
+  default gate.
+- **D2** — pacing mode fixed at connect; validation at `connect`/`bind`
+  (`InvalidBandwidth`) instead of at `setsockopt` (same ranges, same
+  rejection class). Consequence: the `Input` ceiling is computed once.
+- **D3** — `AvgPayloadSize` init = `min(1316, max_payload)`: the crate has no
+  `SRTO_PAYLOADSIZE` option (§3.3.1 divergence note); exact parity against
+  default-configured libsrt at max payload ≥ 1316, and the IIR converges
+  within ~128 packets regardless.
+- **D4** — estimator zero-elapsed guard: a window never closes with
+  `elapsed < 1 µs`; counters keep accumulating and the next distinct-instant
+  submit closes normally (§3.3.3 simplification note).
+- **S1** — ceiling refresh on every full ACK, not only sequence-advancing
+  ones (idempotent; libsrt's own `checkTimers` refreshes at ≥ the same 10 ms
+  cadence).
+- **S2** — no `onRTO` recompute hook (congctl.cpp:158-163): the crate has no
+  RTO/FASTREXMIT machinery (transmission.md §7.6 — dormant against 1.4.4
+  peers anyway).
+- **S3** — refresh cadence is full ACK + NAK + the sender's `on_timer`
+  (pace/TLPKTDROP/keepalive deadlines) rather than per-received-packet
+  `checkTimers`; the estimate changes at most once per sampling window, so
+  the ceiling trajectory is identical at ≥ 10 ms granularity. The NAK
+  refresh runs in ALL modes; in libsrt a loss report recomputes in auto mode
+  only (no TEV_LOSSREPORT slot in LiveCC, congctl.cpp:93-100 — §3.3.1), so a
+  fixed ceiling here picks up avg-payload IIR drift one event earlier.

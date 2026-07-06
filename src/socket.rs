@@ -380,8 +380,8 @@ impl SrtSocket {
     /// Errors: [`SrtError::ConnectTimeout`], [`SrtError::Rejected`],
     /// [`SrtError::EncryptionUnsupported`], [`SrtError::WrongPassphrase`],
     /// [`SrtError::InvalidPassphrase`], [`SrtError::InvalidKmParameters`],
-    /// [`SrtError::NoIpv4Address`], [`SrtError::StreamIdTooLong`],
-    /// [`SrtError::Io`].
+    /// [`SrtError::InvalidBandwidth`], [`SrtError::NoIpv4Address`],
+    /// [`SrtError::StreamIdTooLong`], [`SrtError::Io`].
     pub async fn connect(
         addr: impl ToSocketAddrs,
         opts: SrtOptions,
@@ -394,6 +394,9 @@ impl SrtSocket {
         // internally and would otherwise fail closed without a
         // user-visible reason.
         opts.crypto_config()?;
+        // Same fail-fast for pacing parameters: libsrt rejects them at
+        // setsockopt; connect is this crate's earliest equivalent.
+        opts.bandwidth.validate()?;
         let remote = net::resolve_v4(addr).await?;
         let udp = net::bind_udp(
             SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
@@ -474,6 +477,8 @@ impl SrtSocket {
     }
 
     /// Graceful close: sends SHUTDOWN and waits for the driver to finish.
+    /// Buffered packets the pacer has not released yet are dropped, like
+    /// any other unsent data (live semantics).
     pub async fn close(mut self) -> Result<(), SrtError> {
         // The driver may already be gone (peer close); that is not an error.
         let _ = self.cmd_tx.send(Cmd::Close).await;

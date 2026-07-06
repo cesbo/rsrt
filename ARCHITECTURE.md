@@ -36,8 +36,8 @@ The crate is split into four layers. Lower layers never depend on higher ones.
 Support files: `src/error.rs` (`SrtError`), `src/options.rs` (`SrtOptions`),
 `src/lib.rs` (re-exports only). Layers 1–3 (`packet`, `crypto`, `core`) are
 crate-private; the only public surface is the root re-exports in `src/lib.rs`
-(`SrtSocket`, `SrtListener`, `SrtOptions`, `SrtError`, `CloseReason`, `Stats`,
-`KeyLength`).
+(`SrtSocket`, `SrtListener`, `SrtOptions`, `Bandwidth`, `SrtError`,
+`CloseReason`, `Stats`, `KeyLength`).
 
 ### Layer 1 — packet codec (`src/packet/`)
 
@@ -107,9 +107,12 @@ This makes every protocol rule unit-testable with a fake clock.
   timeout, stream id, agreed MSS/flow window, and the seeded `crypto::Crypto`
   engine (`None` for unencrypted connections; the struct is intentionally not
   `Clone` — it owns key material).
+- `pacing.rs` — `Pacer`: LiveCC pacing behind the `Bandwidth` option — the
+  input-rate estimator, ceiling/overhead math and the whole-µs send-interval
+  credit schedule (docs/spec/transmission.md §3.3); consumed by `sender.rs`.
 - `sender.rs` — `Sender`: send buffer (seq-indexed), seq/msg-number assignment,
   ACK release + ACKACK reply, NAK-driven retransmission (REXMIT flag),
-  too-late packet drop (emits DROPREQ), in-flight window limiting.
+  too-late packet drop (emits DROPREQ), in-flight window limiting, pacing gate.
 - `receiver.rs` — `Receiver`: receive buffer, loss list, immediate + periodic
   NAK generation, full ACK every 10 ms / light ACK every 64 packets, ACKACK
   RTT estimation (7/8 smoothing), DROPREQ handling, TSBPD release queue with

@@ -79,6 +79,10 @@ pub enum SrtError {
     /// `km_preannounce <= (km_refresh_rate - 1) / 2`
     /// (docs/spec/encryption.md §2).
     InvalidKmParameters(&'static str),
+    /// Bandwidth/pacing options out of range: rates must be nonzero where
+    /// declared explicitly, `overhead_pct` within 5..=100 — the same ranges
+    /// libsrt rejects with SRT_EINVPARAM (docs/spec/transmission.md §3.3).
+    InvalidBandwidth(&'static str),
 }
 
 impl fmt::Display for SrtError {
@@ -105,6 +109,9 @@ impl fmt::Display for SrtError {
             }
             SrtError::InvalidKmParameters(why) => {
                 write!(f, "invalid key-refresh parameters: {why}")
+            }
+            SrtError::InvalidBandwidth(why) => {
+                write!(f, "invalid bandwidth parameters: {why}")
             }
         }
     }

@@ -52,6 +52,9 @@ pub use self::{
         SrtError,
     },
     listener::SrtListener,
-    options::SrtOptions,
+    options::{
+        Bandwidth,
+        SrtOptions,
+    },
     socket::SrtSocket,
 };

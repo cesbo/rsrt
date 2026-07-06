@@ -164,18 +164,191 @@ Every data packet gets:
 
 ### 3.3 Pacing (LiveCC)
 
-- Inter-packet send interval:
-  `PktSndPeriod_us = 1e6 * (AvgPayloadSize + 44) / MAXBW_Bps`
-  where `AvgPayloadSize` = `avg_iir<128>` over sent payload lengths (init = config
-  payload size, 1316) and 44 = `SRT_DATA_HDR_SIZE` (28 UDP/IPv4 + 16 SRT header). `MAXBW` = `SRTO_MAXBW`, default
-  `BW_INFINITE` = 1 Gbps = 125 000 000 B/s ⇒ ~10.7 µs period, i.e. effectively
-  unpaced at typical live bitrates. Recomputed on every ACK and RTO event.
+#### 3.3.1 Send interval (PktSndPeriod)
+
+- Inter-packet send interval (`updatePktSndPeriod`, congctl.cpp:173-181):
+  `PktSndPeriod_us = 1e6 * (AvgPayloadSize + 44) / max_bw`
+  where `AvgPayloadSize` = `avg_iir<128>` over *emitted* payload lengths — new
+  transmissions AND retransmissions (the TEV_SEND hook, congctl.cpp:141-155) —
+  init = config payload size (`SRTO_PAYLOADSIZE`, live default 1316, or the max
+  payload size when 0; congctl.cpp:79-82); 44 = `SRT_DATA_HDR_SIZE`
+  (28 UDP/IPv4 + 16 SRT header, packet.h:404-410); `max_bw` = the effective
+  ceiling of §3.3.2 (with the default `SRTO_MAXBW = -1`: `BW_INFINITE` = 1 Gbps
+  = 125 000 000 B/s ⇒ 10.88 µs, i.e. effectively unpaced at typical live
+  bitrates).
+- The interval is computed in floating point (`m_dPktSndPeriod`) but takes
+  effect **truncated to whole µs**: the copy into `m_tdSendInterval` casts
+  through `(int64_t)` (core.cpp:7374-7379). The double carries no cross-event
+  state — it is fully re-derived from `AvgPayloadSize`/`max_bw` at each
+  recompute, so a whole-µs representation is exactly equivalent.
+- Recompute events, precisely: full ACK (TEV_ACK, via LiveCC's `onAck` slot)
+  and the ≤ 10 ms `checkTimers` tick (TEV_CHECKTIMER, core.cpp:10967, via
+  `onRTO`) — the only two slots LiveCC connects besides TEV_SEND
+  (congctl.cpp:93-100). A loss report (TEV_LOSSREPORT) recomputes **in auto
+  mode only**: there is no TEV_LOSSREPORT slot, so on a NAK the interval can
+  change only through the auto-mode ceiling refresh
+  (`updateBandwidth → setMaxBW → updatePktSndPeriod`, core.cpp:7344-7364,
+  §3.3.2); with a fixed ceiling (`MAXBW > 0` or `INPUTBW > 0`) the copy-out
+  merely re-copies the stale double and a NAK changes nothing until the next
+  ACK/`checkTimers`. Light ACKs — and, in libsrt, non-advancing duplicate full
+  ACKs (the `SndLastFullAck` gate, core.cpp:8099-8105) — return before
+  `updateCC` and never recompute (core.cpp:8026-8042, 8249). TEV_SEND updates
+  only the payload IIR, never the interval (excluded from the interval
+  copy-out, core.cpp:7374). **This implementation** recomputes on NAK in all
+  modes: for a fixed ceiling that only lets the interval pick up avg-payload
+  IIR drift one event earlier than libsrt (bounded by the next ≤ 10 ms
+  refresh either way).
+- Retransmissions are paced under the same interval — they bypass the flow
+  window (§3.2) only, NOT pacing — and never trigger probe pairs (§3.3.4).
 - Unused send-slot time is *credited* (`SendTimeDiff`): if the sender fell behind,
-  packets go out back-to-back until the debt is repaid.
+  packets go out back-to-back until the debt is repaid (mechanics in §3.3.4).
 - **Probe pairs**: a packet whose sequence satisfies `seqno & 0xF == 0` is followed
   by the next packet immediately (no pacing delay). The receiver measures link
   capacity on these pairs (§4.4).
 - Sending anything refreshes the keepalive timer (`LastSndTime`).
+
+**Divergence (this implementation):** the `AvgPayloadSize` IIR inits at
+`min(1316, max_payload)` — this crate has no `SRTO_PAYLOADSIZE` option, so the
+"config payload size" above does not exist here (D3, NOTES.md §6.3). Exact
+parity against default-configured libsrt whenever the negotiated max payload
+is ≥ 1316; below that the init is capped where libsrt would keep 1316, and
+the IIR converges within ~128 packets regardless.
+
+#### 3.3.2 Bandwidth ceiling resolution (SRTO_MAXBW / SRTO_INPUTBW / SRTO_MININPUTBW / SRTO_OHEADBW)
+
+Defaults: `SRTO_MAXBW = -1`, `SRTO_INPUTBW = 0`, `SRTO_MININPUTBW = 0`,
+`SRTO_OHEADBW = 25` (socketconfig.h:262, 275-277). Setter ranges, all rejected
+with `SRT_EINVPARAM` outside: `MAXBW >= -1`; `INPUTBW`, `MININPUTBW >= 0`;
+`OHEADBW` **5..=100** — 0–4 are not settable (socketconfig.cpp:226-236,
+291-322). All rates are bytes/s and denote the *wire* budget (the §3.3.1
+formula and the §3.3.3 estimator both charge +44 bytes/packet).
+
+Exactly four configurations are reachable (`updateCC` TEV_INIT resolution,
+core.cpp:7294-7341):
+
+| Configuration | Effective ceiling `max_bw` (bytes/s) | Estimator |
+|---|---|---|
+| `MAXBW = -1` (default) | `BW_INFINITE` (125 000 000) | off |
+| `MAXBW = n > 0` | `n`, fixed | off |
+| `MAXBW = 0, INPUTBW = n > 0, OHEADBW = p` | `withOverhead(n)`, fixed | off |
+| `MAXBW = 0, INPUTBW = 0, MININPUTBW = m, OHEADBW = p` | `withOverhead(max(m, estimate))`, refreshed | on (§3.3.3) |
+
+- `withOverhead(b) = b·(100 + OHEADBW)/100` — integer-truncating division
+  (core.h:656-659).
+- Auto mode (last row) refreshes the ceiling on the §3.3.1 recompute events:
+  `updateBandwidth(0, withOverhead(max(SRTO_MININPUTBW, estimate)))`
+  (core.cpp:7344-7364). LiveCC `updateBandwidth(maxbw, bw)` semantics
+  (congctl.cpp:199-216): `maxbw != 0` wins outright; else `bw == 0` ⇒
+  **keep the previous ceiling** (`if (bw == 0) return;` — reachable when the
+  estimate is 0 and `MININPUTBW = 0`); else adopt `bw`. `setMaxBW` maps any
+  value ≤ 0 to `BW_INFINITE` (congctl.cpp:185).
+- Every `setMaxBW` also re-pins the congestion window to the maximum
+  (flow-window) size (congctl.cpp:196) — live mode never cwnd-throttles below
+  the peer's flow window (§3.2).
+
+**This implementation** exposes the four modes as one sentinel-free enum
+(`Bandwidth` in `src/options.rs`):
+
+| `Bandwidth` variant | libsrt equivalent |
+|---|---|
+| `Unlimited` (default) | `MAXBW = -1` |
+| `Max { bytes_per_sec }` | `MAXBW = n > 0` |
+| `Input { bytes_per_sec, overhead_pct }` | `MAXBW = 0, INPUTBW = n, OHEADBW = p` |
+| `Estimated { min_bytes_per_sec, overhead_pct }` | `MAXBW = 0, INPUTBW = 0, MININPUTBW = m, OHEADBW = p` |
+
+**Divergence (this implementation):** `Unlimited` disables the pacer
+structurally instead of pacing at `BW_INFINITE`. libsrt's default still runs
+the gate at a ~10.9 µs period — far below any achievable timer resolution and
+indistinguishable on the wire below 1 Gbps sustained; disabling it keeps the
+default path byte-identical to the pre-pacing implementation. Anyone wanting
+libsrt's literal default gate sets `Max { bytes_per_sec: 125_000_000 }`.
+
+**Divergence (this implementation):** the mode is fixed at connect time and
+validated at `connect`/`bind` (`InvalidBandwidth`, same ranges as the
+`SRT_EINVPARAM` rejections above). libsrt's four options are runtime-settable
+(post-bind changes re-enter TEV_INIT with `only_input` stages,
+core.cpp:384-401); this crate has no runtime option mutation, so the `Input`
+ceiling is computed once and never re-derived.
+
+#### 3.3.3 Sender input-rate estimation (CSndBuffer::updateInputRate)
+
+Drives the auto (`Estimated`) mode only. State machine
+(buffer.cpp:299-333):
+
+- Fed **exclusively at application submit** (`addBuffer`, buffer.cpp:277):
+  payload bytes, no headers. Retransmissions never feed it (`readData` has no
+  feed), and it is never sourced from ACK words 4–6 (which this implementation
+  sends as 0 — §4.4).
+- The **first sample** after (re)start only stamps the window start; its bytes
+  are NOT counted (buffer.cpp:305-309).
+- The window closes on `elapsed > period` (strict, buffer.cpp:318) or on the
+  fast-start early trigger `pkts > 2000` (strict, `INPUTRATE_MAX_PACKETS`,
+  buffer.cpp:315). `elapsed` enters the comparison **truncated to whole µs**
+  (`count_microseconds`, buffer.cpp:317) — a window effectively closes only
+  once true elapsed reaches period + 1 µs, and the close division below uses
+  the same truncated value. On close (buffer.cpp:321-330):
+  `rate_Bps = trunc((bytes + pkts·44)·1e6 / elapsed_us)` — the +44/packet
+  header charge is added once, at close; the window restarts at the closing
+  sample's time.
+- Window length: 500 ms fast-start (`INPUTRATE_FAST_START_US`) until the first
+  close, 1 s (`INPUTRATE_RUNNING_US`) from then on (buffer.h:204-205).
+- Initial value: `BW_INFINITE` (`INPUTRATE_INITIAL_BYTESPS`, buffer.h:207) —
+  until the first window closes the auto ceiling is effectively unpaced
+  (fast-start grace).
+- The rate is recomputed **only** inside the feed: a stale value persists
+  through arbitrarily long silence (`SRTO_MININPUTBW` is the operator's floor,
+  and it acts in the auto path only — it never floors an explicit `INPUTBW`).
+
+**First-implementation simplification (safe):** a window never closes with
+`elapsed < 1 µs`. libsrt divides by a possibly-zero elapsed (buffer.cpp:322) —
+firing the `> 2000` early close at zero elapsed would take over 2000 separate
+submit calls within one clock microsecond there, but this crate's
+establish-time flush of buffered-while-connecting packets submits up to 8192
+packets with one identical `now` and trips it deterministically. When the
+guard suppresses a close, counters keep accumulating and the next
+distinct-instant submit closes normally.
+
+**First-implementation simplification (safe):** the ceiling is refreshed on
+*every* full ACK rather than only sequence-advancing ones (libsrt's
+`SndLastFullAck` gate, §3.3.1) — the refresh is idempotent, and libsrt's own
+`checkTimers` path refreshes at ≥ the same 10 ms cadence regardless.
+
+**First-implementation simplification (safe):** there is no `onRTO` recompute
+hook (congctl.cpp:158-163) — this crate has no RTO/FASTREXMIT machinery
+(§7.6) — and the TEV_CHECKTIMER cadence is the sender's `on_timer` (pace /
+TLPKTDROP / keepalive deadlines) rather than libsrt's per-received-packet
+`checkTimers`. The estimate itself changes at most once per sampling window,
+so the observable ceiling trajectory is identical at ≥ 10 ms granularity.
+
+#### 3.3.4 Pacing gate (CUDT::packData scheduling)
+
+Only the data send path paces; control packets are never gated (in libsrt only
+the data send queue runs `packData`). Per send slot (core.cpp:8966-9252):
+
+- **Entry lateness accrual**: if a next-send schedule is armed and `packData`
+  enters past it, the overshoot is credited into `SendTimeDiff`
+  (core.cpp:8978-8981).
+- **Spend-credit-or-wait** (the non-busy-wait tail, core.cpp:9231-9247), after
+  a data packet is emitted: if `credit >= interval`, the next send is due
+  *now* (back-to-back catch-up) and `credit -= interval`; else the next send
+  is due at `now + (interval − credit)` and `credit = 0`.
+- **Idle/congested reset**: a due slot that finds nothing sendable — send
+  buffer empty (core.cpp:9106-9108) or flow-window-blocked
+  (core.cpp:9115-9117) — zeroes the schedule AND the credit. Credit never
+  survives an idle or blocked state.
+- **Probe exception**: a NEW packet whose `seq & 0xF == 0`
+  (`PUMASK_SEQNO_PROBE`, packet.h:215; flag set only in the new-packet branch,
+  core.cpp:9098-9100) schedules the next send at `now` with the credit
+  untouched (core.cpp:9221-9226) — the follower goes out back-to-back for the
+  peer's capacity estimator (§4.4). The follower may itself be a
+  retransmission; the peer's estimator discards such pairs.
+
+Sans-I/O mapping (this implementation): the armed next-send instant is
+surfaced through the sender's `next_deadline()`, and the runtime's
+deadline-batched drains realize the credit catch-up bursts — packets whose
+schedules are `<= now` go out back-to-back within one drain turn, absorbing
+the runtime's ~1 ms timer coarseness; no per-packet 10 µs sleeps are
+attempted.
 
 ---
 
@@ -357,7 +530,9 @@ Order of operations on receiving ACK with `ackseq` = CIF word 0:
     `DeliveryRate = avg_iir<8>(DeliveryRate, word4)`,
     `ByteDeliveryRate = avg_iir<8>(ByteDeliveryRate, word6 or word4*payload_size)`
     — statistics only in live mode.
-11. Notify congestion control (`TEV_ACK`) — LiveCC recomputes the pacing period.
+11. Notify congestion control (`TEV_ACK`) — LiveCC recomputes the pacing
+    period; in auto mode (`MAXBW = 0`, `INPUTBW = 0`) the ceiling is first
+    refreshed to `withOverhead(max(MININPUTBW, measured input rate))` (§3.3.2).
 
 **In-flight limit recap:** a *new* packet may be emitted only while
 `number_in_flight < min(FlowWindowSize, CongestionWindow)` where
@@ -752,8 +927,12 @@ only the explicitly listed attack/bug conditions (§6 step 5, §7.4) do that.
 | `SRTO_SNDDROPDELAY` default | 0 (−1 disables sender drop) | §8.1 |
 | ACK avail-buffer floor | 2 packets | §4.3 |
 | Receive-rate window / probe window | 16 / 64 samples, median-filter (÷8, ×8) | §4.4 |
-| Probe pair | after packet with `seq & 0xF == 0` | §3.3 |
-| LiveCC pacing | `1e6·(avg_payload+44)/MAXBW` µs; `MAXBW` default 125 000 000 B/s | §3.3 |
+| Probe pair | after packet with `seq & 0xF == 0` | §3.3.4 |
+| LiveCC pacing | `1e6·(avg_payload+44)/max_bw` µs, truncated to whole µs | §3.3.1 |
+| `SRTO_MAXBW` default | −1 → `BW_INFINITE` = 125 000 000 B/s | §3.3.2 |
+| `SRTO_OHEADBW` | default 25 %, range 5..=100 | §3.3.2 |
+| `SRTO_INPUTBW` / `SRTO_MININPUTBW` defaults | 0 / 0 | §3.3.2 |
+| Input-rate sampler | 500 ms fast-start / 1 s running windows, >2000-pkt early close, init `BW_INFINITE` | §3.3.3 |
 | Payload sizes | max 1456; live default 1316 | §3.1 |
 | Keepalive | 1 s since last send | §10 |
 | Peer idle timeout | `EXPCount > 16` AND > 5000 ms silence | §10 |

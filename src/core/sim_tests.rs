@@ -35,6 +35,10 @@ use crate::{
         Listener,
         ListenerAction,
         Timebase,
+        pacing::{
+            BW_INFINITE,
+            with_overhead,
+        },
     },
     packet::{
         ControlPacket,
@@ -45,6 +49,7 @@ use crate::{
         SeqNumber,
         SocketId,
     },
+    Bandwidth,
     CloseReason,
     SrtOptions,
 };
@@ -1028,4 +1033,290 @@ fn clock_drift_with_loss_keeps_arq_alive() {
         sim.caller.stats().pkts_retransmitted > 0,
         "caller must have retransmitted"
     );
+}
+
+// ---- LiveCC pacing (transmission.md §3.3) ----
+
+/// [`payload`] stretched to 1316 bytes (the libsrt live default payload
+/// size): with every packet at the avg-payload IIR's min(1316, max_payload)
+/// init the pacing period never moves, so the expected rates in the tests
+/// below are exact (transmission.md §3.3.1).
+fn payload_1316(tag: u8, index: u32) -> Vec<u8> {
+    let mut v = payload(tag, index);
+    v.resize(1316, tag ^ 0xC3);
+    v
+}
+
+/// A fixed `Bandwidth::Max` ceiling offered ~2.2× its rate: the wire output
+/// must hold the configured 200_000 B/s (payload bytes over 200 ms windows,
+/// both bounds) instead of following the input, and the backlog must still
+/// deliver everything in order. The latency is sized above the worst-case
+/// backlog lag so neither too-late valve (sender TLPKTDROP §8.1, receiver
+/// TSBPD drop) interferes with the rate measurement.
+#[test]
+fn paced_sender_holds_configured_rate() {
+    let t0 = Instant::now();
+    let latency = Duration::from_millis(3_000);
+    let copts = SrtOptions::default()
+        .latency(latency)
+        .bandwidth(Bandwidth::Max { bytes_per_sec: 200_000 });
+    let lopts = SrtOptions::default().latency(latency);
+    let mut sim = Sim::new(t0, copts, lopts, 0x9ACE);
+    sim.run_until(100, "handshake", Sim::both_established);
+
+    // One 1316-byte payload per 3 ms ≈ 438_667 B/s payload against the
+    // 200_000 B/s wire ceiling. Period = trunc(1e6·(1316+44)/200_000) =
+    // 6800 µs (§3.3.1): a 200 ms window holds ~29.4 paced slots plus one
+    // free probe slot per 16 new packets (`seq & 0xF == 0` schedules the
+    // follower at the same instant, §3.3.4) — 31±1 packets.
+    let mut i: u32 = 0;
+    let mut marks = Vec::new();
+    for tick in 0u64 .. 2_000 {
+        if tick.is_multiple_of(3) {
+            sim.send_caller(payload_1316(0xA, i));
+            i += 1;
+        }
+        if tick >= 600 && tick.is_multiple_of(200) {
+            marks.push(sim.caller.stats().bytes_sent);
+        }
+        sim.step();
+    }
+
+    let st = sim.caller.stats();
+    assert_eq!(st.snd_max_bw, 200_000, "a fixed ceiling must never move");
+    assert_eq!(st.snd_period_us, 6_800, "period must match the §3.3.1 formula");
+    assert_eq!(st.snd_input_rate, 0, "Max mode never runs the estimator");
+    for (n, w) in marks.windows(2).enumerate() {
+        let sent = w[1] - w[0];
+        assert!(
+            (39_000 ..= 44_000).contains(&sent),
+            "window {n} sent {sent} payload B/200 ms: must hold ≈200_000 B/s \
+             on the wire (30-33 packets), not the ~438_667 B/s input"
+        );
+    }
+
+    // The feed stops at 2 s with a ~350-packet backlog; it drains at the
+    // ceiling (~2.3 s worst-case send lag, inside the 3 s latency budget),
+    // so every payload still arrives in order with zero drops anywhere.
+    sim.run_for(3_400);
+    assert_contiguous(&sim.listener_rx, 0xA, i);
+    assert_eq!(sim.listener_rx.len(), i as usize);
+    let cs = sim.caller.stats();
+    let ls = sim.accepted_mut().stats();
+    assert_eq!(cs.pkts_send_dropped, 0, "backlog must fit the latency budget");
+    assert_eq!(ls.pkts_recv_dropped, 0, "paced packets must beat their deadlines");
+    assert_eq!(cs.pkts_retransmitted, 0, "clean link needs no rexmits");
+}
+
+/// The SRTO_OHEADBW target mode end to end: a CBR feed converges the
+/// estimator to the exact input rate and the ceiling follows
+/// withOverhead(measured) (§3.3.2-§3.3.3); after a short outage the rexmit
+/// backlog drains paced at ≈1.25× the input — across many steps, never as a
+/// one-step burst — with zero drops on either side.
+#[test]
+fn estimated_rate_with_overhead_drains_backlog_paced() {
+    let t0 = Instant::now();
+    // 400 ms latency is the ARQ budget for the 250 ms outage below: the
+    // oldest lost packet is retransmitted ~30 ms after the link returns.
+    let latency = Duration::from_millis(400);
+    let copts = SrtOptions::default()
+        .latency(latency)
+        .bandwidth(Bandwidth::Estimated { min_bytes_per_sec: 0, overhead_pct: 25 });
+    let lopts = SrtOptions::default().latency(latency);
+    let mut sim = Sim::new(t0, copts, lopts, 0xE571);
+    sim.run_until(100, "handshake", Sim::both_established);
+
+    // CBR: one 1316-byte payload per 10 ms = 131_600 B/s payload =
+    // 136_000 B/s on the wire (+44/pkt, §3.3.3). Every estimator window
+    // closes on the same 10 ms grid, so the measured rate is exactly
+    // 136_000 wherever the window boundaries fall.
+    let mut i: u32 = 0;
+    let feed = |sim: &mut Sim, ms: u64, i: &mut u32| {
+        for tick in 0 .. ms {
+            if tick.is_multiple_of(10) {
+                sim.send_caller(payload_1316(0xA, *i));
+                *i += 1;
+            }
+            sim.step();
+        }
+    };
+
+    // ≥ 1.5 s: the 500 ms fast-start window and at least one 1 s running
+    // window close, and full ACKs refresh the ceiling (§3.3.2).
+    feed(&mut sim, 1_800, &mut i);
+    let st = sim.caller.stats();
+    assert_eq!(
+        st.snd_input_rate, 136_000,
+        "the estimator must measure the CBR feed exactly"
+    );
+    assert_eq!(
+        st.snd_max_bw,
+        with_overhead(136_000, 25),
+        "ceiling must be withOverhead(measured) = 170_000"
+    );
+    assert_eq!(st.snd_period_us, 8_000, "period = trunc(1e6·(1316+44)/170_000)");
+
+    // Outage shorter than every drop budget: ~25 in-flight packets die on
+    // the wire and the feed keeps going.
+    sim.to_listener.down = true;
+    sim.to_caller.down = true;
+    feed(&mut sim, 250, &mut i);
+    sim.to_listener.down = false;
+    sim.to_caller.down = false;
+
+    // 100 ms for the gap NAK to land, then measure the drain: the 170_000
+    // B/s ceiling caps rexmits + new data at ≈1.25× the input (25-27
+    // packets per 200 ms incl. probe slots). The closed range excludes
+    // both no-drain (input-only 26_320 B/200 ms) and a one-step flush.
+    feed(&mut sim, 100, &mut i);
+    let mut marks = vec![sim.caller.stats().bytes_sent];
+    for _ in 0 .. 3 {
+        feed(&mut sim, 200, &mut i);
+        marks.push(sim.caller.stats().bytes_sent);
+    }
+    for (n, w) in marks.windows(2).enumerate() {
+        let sent = w[1] - w[0];
+        assert!(
+            (30_000 ..= 38_500).contains(&sent),
+            "drain window {n} sent {sent} payload B/200 ms: the backlog must \
+             drain paced at ≈1.25× the 26_320 B/200 ms input, not in a burst"
+        );
+    }
+
+    // Let the backlog finish and the last TSBPD windows flush.
+    feed(&mut sim, 400, &mut i);
+    sim.run_for(600);
+
+    assert_contiguous(&sim.listener_rx, 0xA, i);
+    let cs = sim.caller.stats();
+    let ls = sim.accepted_mut().stats();
+    assert!(cs.pkts_retransmitted > 0, "the outage must have cost rexmits");
+    assert!(sim.to_caller.naks > 0, "recovery must be NAK-driven");
+    assert_eq!(cs.pkts_send_dropped, 0, "backlog sized inside the drop budget");
+    assert_eq!(ls.pkts_recv_dropped, 0, "every rexmit must beat its deadline");
+}
+
+/// `Bandwidth::Estimated` before the first 500 ms estimator window closes:
+/// the ceiling is BW_INFINITE (libsrt fast-start grace, §3.3.3) whose
+/// ~10 µs period vanishes inside a 1 ms step — a burst right after
+/// establish must drain like the unpaced default.
+#[test]
+fn estimated_grace_is_unpaced_before_first_window() {
+    let t0 = Instant::now();
+    let copts = SrtOptions::default()
+        .bandwidth(Bandwidth::Estimated { min_bytes_per_sec: 0, overhead_pct: 25 });
+    let mut sim = Sim::new(t0, copts, SrtOptions::default(), 0x62ACE);
+    sim.run_until(100, "handshake", Sim::both_established);
+
+    let before = sim.caller.stats().pkts_sent;
+    for i in 0 .. 100u32 {
+        sim.send_caller(payload(0xA, i));
+    }
+    // Step 1 emits the first packet and arms the ~10 µs schedule; step 2
+    // arrives with ~1 ms of lateness credit, so the rest of the burst goes
+    // out back-to-back (the spec-blessed catch-up burst, §3.3.4).
+    sim.step();
+    sim.step();
+    assert_eq!(
+        sim.caller.stats().pkts_sent - before,
+        100,
+        "fast-start grace must be effectively unpaced"
+    );
+
+    sim.run_for(300);
+    let st = sim.caller.stats();
+    assert_eq!(st.snd_input_rate, 0, "no estimator window closed within 500 ms");
+    assert_eq!(
+        st.snd_max_bw,
+        with_overhead(BW_INFINITE, 25),
+        "grace ceiling = withOverhead(BW_INFINITE) after the first refresh"
+    );
+    assert_contiguous(&sim.listener_rx, 0xA, 100);
+    assert_eq!(sim.accepted_mut().stats().pkts_recv_dropped, 0);
+}
+
+/// Default options in the sim: no pacer exists, a 200-packet burst still
+/// drains within a single 1 ms step and the pacing gauges stay 0. Pins
+/// divergence D1 (transmission.md §3.3.2) against future default flips:
+/// `Unlimited` disables the gate outright instead of pacing at libsrt's
+/// BW_INFINITE default.
+#[test]
+fn default_options_remain_unpaced_in_sim() {
+    let t0 = Instant::now();
+    let mut sim = Sim::new(t0, SrtOptions::default(), SrtOptions::default(), 0xDEFA);
+    sim.run_until(100, "handshake", Sim::both_established);
+
+    let before = sim.caller.stats().pkts_sent;
+    for i in 0 .. 200u32 {
+        sim.send_caller(payload(0xA, i));
+    }
+    sim.step();
+    assert_eq!(
+        sim.caller.stats().pkts_sent - before,
+        200,
+        "an unpaced burst must hit the wire within one step"
+    );
+    let st = sim.caller.stats();
+    assert_eq!(st.snd_period_us, 0, "pacing disabled reports a 0 period");
+    assert_eq!(st.snd_max_bw, 0, "pacing disabled reports a 0 ceiling");
+    assert_eq!(st.snd_input_rate, 0, "no estimator without a pacer");
+
+    sim.run_for(300);
+    assert_contiguous(&sim.listener_rx, 0xA, 200);
+    assert_eq!(sim.accepted_mut().stats().pkts_recv_dropped, 0);
+}
+
+/// 5% loss + reorder under a fixed ceiling with ≈1.3× headroom over the
+/// input: retransmissions share the paced budget (rexmits are gated by the
+/// same period as new data, §3.3.4) and every payload must still beat its
+/// TSBPD deadline.
+#[test]
+fn pacing_with_loss_keeps_arq_alive() {
+    let t0 = Instant::now();
+    // Latency high enough to absorb NAK retry cycles (including the
+    // initial 300 ms periodic-NAK interval before the first RTT-based
+    // recompute), as in five_percent_loss_recovers_everything.
+    let latency = Duration::from_millis(400);
+    let copts = SrtOptions::default()
+        .latency(latency)
+        .bandwidth(Bandwidth::Max { bytes_per_sec: 180_000 });
+    let lopts = SrtOptions::default().latency(latency);
+    let mut sim = Sim::new(t0, copts, lopts, 0xA21F);
+    sim.to_listener.loss_pct = 5;
+    sim.to_caller.loss_pct = 5;
+    sim.to_listener.jitter_us = 2_000;
+    sim.to_caller.jitter_us = 2_000;
+
+    sim.run_until(2_000, "handshake under loss", Sim::both_established);
+
+    // 100 pkt/s of 1316-byte payloads = 136_000 B/s wire against the
+    // 180_000 B/s ceiling (~132 pkt/s): ~1.3× headroom for rexmits.
+    const N: u32 = 300;
+    for i in 0 .. N {
+        sim.send_caller(payload_1316(0xA, i));
+        sim.run_for(10);
+    }
+    // Trailing traffic so a lost tail packet still gets its gap detected.
+    for i in N .. N + 10 {
+        sim.send_caller(payload_1316(0xA, i));
+        sim.run_for(20);
+    }
+    sim.run_for(1_500);
+
+    assert_contiguous(&sim.listener_rx, 0xA, N);
+    let cs = sim.caller.stats();
+    let ls = sim.accepted_mut().stats();
+    assert_eq!(cs.snd_max_bw, 180_000);
+    assert_eq!(
+        cs.snd_period_us, 7_555,
+        "pacing must be engaged: trunc(1e6·(1316+44)/180_000)"
+    );
+    assert!(cs.pkts_retransmitted > 0, "caller must have retransmitted");
+    assert!(ls.pkts_recv_lost > 0, "losses must have been detected");
+    assert!(sim.to_caller.naks > 0, "recovery must be NAK-driven");
+    assert_eq!(
+        ls.pkts_recv_dropped, 0,
+        "recovery must beat every deadline while sharing the paced budget"
+    );
+    assert_eq!(cs.pkts_send_dropped, 0);
 }

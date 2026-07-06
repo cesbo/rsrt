@@ -14,12 +14,13 @@
 //! - §7.1 guard: a packet landing beyond the capacity of an EMPTY buffer is an unrecoverable
 //!   sequence discrepancy — flagged via [`Receiver::sequence_discrepancy`] so the owner breaks the
 //!   connection;
-//! - TSBPD: release a buffered packet when `anchor_local + (extended_ts - anchor_ts) + rcv_latency
-//!   + drift_correction` is reached; missing packets whose deadline passed are skipped (counted
-//!   dropped). Peer timestamps go through [`super::time::TimestampExtender`] — mandatory for
-//!   streams longer than ~71.6 minutes — and the anchor is drift-compensated from ACKACK samples by
-//!   [`super::time::DriftTracer`], without which quartz-level clock skew (µs/minute) exhausts the
-//!   whole latency budget on multi-hour streams;
+//! - TSBPD: release a buffered packet when
+//!   `anchor_local + (extended_ts - anchor_ts) + rcv_latency + drift_correction` is reached;
+//!   missing packets whose deadline passed are skipped (counted dropped). Peer timestamps go
+//!   through [`super::time::TimestampExtender`] — mandatory for streams longer than ~71.6 minutes —
+//!   and the anchor is drift-compensated from ACKACK samples by [`super::time::DriftTracer`],
+//!   without which quartz-level clock skew (µs/minute) exhausts the whole latency budget on
+//!   multi-hour streams;
 //! - undecryptable data (encryption.md §9.4): the packet occupies its sequence slot and is ACKed
 //!   like any arrival, but is freed undelivered at its TSBPD deadline; a gap it reveals is never
 //!   NAKed.

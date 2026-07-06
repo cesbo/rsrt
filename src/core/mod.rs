@@ -14,6 +14,7 @@
 //! `poll_deliver` until `None`.
 
 pub mod handshake;
+mod pacing;
 pub mod receiver;
 pub mod sender;
 pub mod time;
@@ -133,6 +134,22 @@ pub struct Stats {
     pub rtt_var_us: u32,
     /// Net TSBPD clock-drift correction.
     pub tsbpd_drift_us: i64,
+    /// Current inter-packet send interval, µs (libsrt usPktSndPeriod).
+    /// 0 = pacing disabled (Bandwidth::Unlimited).
+    pub snd_period_us: u64,
+    /// Effective pacing ceiling, bytes/s (libsrt mbpsMaxBW analog, kept in
+    /// bytes/s to match the option units). In Estimated mode this is
+    /// max(min, measured)·(100+overhead)/100 once the estimator has closed
+    /// a window; before that the fast-start grace reads the overheaded
+    /// BW_INFINITE·(100+overhead)/100 (156_250_000 at the default 25 %)
+    /// from the first refresh event (full ACK / NAK / timer tick) on —
+    /// plain BW_INFINITE (125_000_000) appears only until that first
+    /// refresh. 0 = pacing disabled.
+    pub snd_max_bw: u64,
+    /// Last measured sender input rate, bytes/s incl. +44/pkt header charge
+    /// (crate extension — libsrt 1.4.4 bstats has no such field).
+    /// 0 unless Bandwidth::Estimated and at least one window has closed.
+    pub snd_input_rate: u64,
 }
 
 // One `State` lives per connection (never stored in collections), so boxing
@@ -971,6 +988,7 @@ fn transmission_pair(
         snd_latency: negotiated.snd_latency,
         max_payload,
         buffer_pkts: opts.send_buffer_pkts,
+        bandwidth: opts.bandwidth,
         timebase,
     });
     let mut receiver = Receiver::new(
@@ -1052,6 +1070,9 @@ fn merge_stats(sender: &Sender, receiver: &Receiver, crypto: Option<&Crypto>) ->
         rtt_us: r.rtt_us,
         rtt_var_us: r.rtt_var_us,
         tsbpd_drift_us: r.tsbpd_drift_us,
+        snd_period_us: s.snd_period_us,
+        snd_max_bw: s.snd_max_bw,
+        snd_input_rate: s.snd_input_rate,
     }
 }
 

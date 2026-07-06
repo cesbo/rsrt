@@ -17,6 +17,63 @@ use crate::{
     error::SrtError,
 };
 
+/// Sender pacing mode: libsrt's SRTO_MAXBW / SRTO_INPUTBW /
+/// SRTO_MININPUTBW / SRTO_OHEADBW collapsed into one sentinel-free enum.
+/// All rates are bytes per second and denote the wire budget: the pacing
+/// formula charges payload + 44 bytes of UDP/IPv4+SRT header per packet
+/// (docs/spec/transmission.md §3.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Bandwidth {
+    /// No pacing (the default). libsrt equivalent: SRTO_MAXBW = -1, which
+    /// paces at BW_INFINITE (125_000_000 B/s, ~10.9 µs period) — below any
+    /// achievable timer resolution, i.e. effectively unpaced. This
+    /// implementation disables the pacer outright (spec-marked divergence).
+    #[default]
+    Unlimited,
+    /// Absolute ceiling. libsrt: SRTO_MAXBW = bytes_per_sec (> 0).
+    Max { bytes_per_sec: u64 },
+    /// Ceiling relative to a declared constant input rate:
+    /// `bytes_per_sec * (100 + overhead_pct) / 100` (integer division),
+    /// fixed at connect. libsrt: SRTO_MAXBW = 0, SRTO_INPUTBW =
+    /// bytes_per_sec, SRTO_OHEADBW = overhead_pct (5..=100).
+    Input { bytes_per_sec: u64, overhead_pct: u8 },
+    /// Ceiling relative to the measured input rate (sampled where the
+    /// application submits payloads), floored by `min_bytes_per_sec`:
+    /// `max(min_bytes_per_sec, measured) * (100 + overhead_pct) / 100`.
+    /// Until the first ~500 ms sample window closes, effectively unpaced
+    /// (libsrt fast-start: initial estimate = BW_INFINITE).
+    /// libsrt: SRTO_MAXBW = 0, SRTO_INPUTBW = 0,
+    /// SRTO_MININPUTBW = min_bytes_per_sec, SRTO_OHEADBW = overhead_pct.
+    Estimated { min_bytes_per_sec: u64, overhead_pct: u8 },
+}
+
+impl Bandwidth {
+    /// libsrt's SRTO_OHEADBW default (25 %).
+    pub const DEFAULT_OVERHEAD_PCT: u8 = 25;
+
+    /// Mirrors libsrt's setter ranges (SRT_EINVPARAM,
+    /// socketconfig.cpp:225-322): explicit rates are nonzero (a libsrt 0
+    /// selects a different mode, which the enum expresses structurally),
+    /// `overhead_pct` within 5..=100 (0-4 are not settable in libsrt
+    /// either), `min_bytes_per_sec` unrestricted.
+    pub(crate) fn validate(&self) -> Result<(), SrtError> {
+        match *self {
+            Bandwidth::Max { bytes_per_sec: 0 } => {
+                Err(SrtError::InvalidBandwidth("max bandwidth must be nonzero"))
+            }
+            Bandwidth::Input { bytes_per_sec: 0, .. } => Err(SrtError::InvalidBandwidth(
+                "explicit input rate must be nonzero (use Bandwidth::Estimated for auto)",
+            )),
+            Bandwidth::Input { overhead_pct, .. } | Bandwidth::Estimated { overhead_pct, .. }
+                if !(5 ..= 100).contains(&overhead_pct) =>
+            {
+                Err(SrtError::InvalidBandwidth("overhead_pct must be within 5..=100"))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 /// Options for callers (`SrtSocket::connect`) and listeners
 /// (`SrtListener::bind`). Defaults follow libsrt 1.4.4 live mode.
 ///
@@ -54,6 +111,12 @@ pub struct SrtOptions {
     /// data keeps the connection alive. `None` (the default) disables the
     /// check. A library extension; the SRT spec has no equivalent timer.
     pub data_idle_timeout: Option<Duration>,
+    /// Sender pacing ceiling (SRTO_MAXBW / SRTO_INPUTBW / SRTO_MININPUTBW /
+    /// SRTO_OHEADBW). Default `Bandwidth::Unlimited` = libsrt's default
+    /// (MAXBW = -1): effectively unpaced. Harmless/inert on receive-only
+    /// sockets. Fixed at connect time (this crate has no runtime option
+    /// mutation; libsrt allows live changes — spec-marked divergence).
+    pub bandwidth: Bandwidth,
     /// UDP socket receive buffer size in bytes (SO_RCVBUF), if set.
     pub udp_recv_buffer: Option<usize>,
     /// Encryption passphrase (SRTO_PASSPHRASE). `None` or empty =
@@ -98,6 +161,7 @@ impl fmt::Debug for SrtOptions {
             .field("connect_timeout", &self.connect_timeout)
             .field("peer_idle_timeout", &self.peer_idle_timeout)
             .field("data_idle_timeout", &self.data_idle_timeout)
+            .field("bandwidth", &self.bandwidth)
             .field("udp_recv_buffer", &self.udp_recv_buffer)
             .field("passphrase", &self.passphrase.as_ref().map(|_| "<redacted>"))
             .field("pbkeylen", &self.pbkeylen)
@@ -120,6 +184,7 @@ impl Default for SrtOptions {
             connect_timeout: Duration::from_secs(3),
             peer_idle_timeout: Duration::from_secs(5),
             data_idle_timeout: None,
+            bandwidth: Bandwidth::Unlimited,
             udp_recv_buffer: None,
             passphrase: None,
             pbkeylen: None,
@@ -162,6 +227,11 @@ impl SrtOptions {
 
     pub fn data_idle_timeout(mut self, timeout: Duration) -> Self {
         self.data_idle_timeout = Some(timeout);
+        self
+    }
+
+    pub fn bandwidth(mut self, bandwidth: Bandwidth) -> Self {
+        self.bandwidth = bandwidth;
         self
     }
 
@@ -276,6 +346,64 @@ mod tests {
         opts.km_preannounce = Some(1000);
         let cfg = opts.crypto_config().unwrap().unwrap();
         assert_eq!(cfg.km_preannounce, 1000);
+    }
+
+    #[test]
+    fn default_bandwidth_is_unlimited() {
+        // Hard design constraint: default behavior stays exactly as before
+        // pacing existed — `Unlimited` must construct no pacer at all
+        // (docs/spec/transmission.md §3.3, spec-marked divergence from
+        // libsrt's BW_INFINITE-paced MAXBW = -1 default).
+        assert_eq!(SrtOptions::default().bandwidth, Bandwidth::Unlimited);
+        assert_eq!(Bandwidth::default(), Bandwidth::Unlimited);
+        // libsrt's SRTO_OHEADBW default (socketconfig.h).
+        assert_eq!(Bandwidth::DEFAULT_OVERHEAD_PCT, 25);
+    }
+
+    #[test]
+    fn bandwidth_validate_rejects_zero_rates() {
+        // libsrt setter semantics: MAXBW = 0 and INPUTBW = 0 select
+        // *different modes* (auto estimation) rather than a zero ceiling;
+        // the enum expresses those modes structurally, so an explicit
+        // zero rate can only be a configuration mistake.
+        assert!(Bandwidth::Unlimited.validate().is_ok());
+        assert!(Bandwidth::Max { bytes_per_sec: 1 }.validate().is_ok());
+        let err = Bandwidth::Max { bytes_per_sec: 0 }.validate().unwrap_err();
+        assert!(matches!(err, SrtError::InvalidBandwidth(_)), "{err:?}");
+        let err = Bandwidth::Input { bytes_per_sec: 0, overhead_pct: 25 }
+            .validate()
+            .unwrap_err();
+        assert!(matches!(err, SrtError::InvalidBandwidth(_)), "{err:?}");
+        // A zero *minimum* is fine: it means "trust the estimator alone"
+        // (libsrt SRTO_MININPUTBW default 0).
+        assert!(Bandwidth::Estimated { min_bytes_per_sec: 0, overhead_pct: 25 }
+            .validate()
+            .is_ok());
+    }
+
+    #[test]
+    fn bandwidth_validate_overhead_pct_range() {
+        // SRTO_OHEADBW accepts exactly 5..=100 (SRT_EINVPARAM outside,
+        // socketconfig.cpp:312-322) — 0-4 are not settable in libsrt
+        // either, so the docs' "avoid 0" advice is moot.
+        for pct in [5, 25, 100] {
+            assert!(Bandwidth::Input { bytes_per_sec: 1, overhead_pct: pct }
+                .validate()
+                .is_ok());
+            assert!(Bandwidth::Estimated { min_bytes_per_sec: 1, overhead_pct: pct }
+                .validate()
+                .is_ok());
+        }
+        for pct in [0, 4, 101, u8::MAX] {
+            let err = Bandwidth::Input { bytes_per_sec: 1, overhead_pct: pct }
+                .validate()
+                .unwrap_err();
+            assert!(matches!(err, SrtError::InvalidBandwidth(_)), "{err:?}");
+            let err = Bandwidth::Estimated { min_bytes_per_sec: 1, overhead_pct: pct }
+                .validate()
+                .unwrap_err();
+            assert!(matches!(err, SrtError::InvalidBandwidth(_)), "{err:?}");
+        }
     }
 
     #[test]

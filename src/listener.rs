@@ -94,13 +94,16 @@ impl SrtListener {
     /// ignored; the caller supplies it).
     ///
     /// Errors: [`SrtError::InvalidPassphrase`],
-    /// [`SrtError::InvalidKmParameters`], [`SrtError::NoIpv4Address`],
-    /// [`SrtError::Io`].
+    /// [`SrtError::InvalidKmParameters`], [`SrtError::InvalidBandwidth`],
+    /// [`SrtError::NoIpv4Address`], [`SrtError::Io`].
     pub async fn bind(addr: impl ToSocketAddrs, opts: SrtOptions) -> Result<SrtListener, SrtError> {
         // Fail fast on invalid encryption options (encryption.md §2),
         // before any I/O: `core::Listener` re-derives this config and
         // would otherwise silently reject every conclusion.
         opts.crypto_config()?;
+        // Same fail-fast for pacing parameters: libsrt rejects them at
+        // setsockopt; bind is this crate's earliest equivalent.
+        opts.bandwidth.validate()?;
         let addr = net::resolve_v4(addr).await?;
         let udp = net::bind_udp(addr, opts.udp_recv_buffer)?;
         let local_addr = match udp.local_addr()? {
