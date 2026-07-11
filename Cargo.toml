@@ -1,11 +1,11 @@
 [package]
 name = "rsrt"
 version = "0.2.1"
-authors = ["Andrey Dyldin <and@cesbo.com>"]
+authors = ["Cesbo Developers <info@cesbo.com>"]
 edition = "2021"
 description = "Pure-Rust implementation of the SRT (Secure Reliable Transport) protocol: live mode with TSBPD, ARQ and HaiCrypt AES-CTR encryption"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/cesbo/libsrt"
+repository = "https://github.com/cesbo/rsrt"
 readme = "README.md"
 keywords = ["srt", "streaming", "live", "udp", "mpeg-ts"]
 categories = ["network-programming", "multimedia"]
