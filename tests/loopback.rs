@@ -11,7 +11,7 @@ use std::{
     },
 };
 
-use srt::{
+use rsrt::{
     CloseReason,
     SrtError,
     SrtListener,

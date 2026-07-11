@@ -42,7 +42,7 @@ use std::{
     time::Duration,
 };
 
-use srt::{
+use rsrt::{
     KeyLength,
     SrtError,
     SrtListener,

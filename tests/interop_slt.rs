@@ -27,7 +27,7 @@ use std::{
     time::Duration,
 };
 
-use srt::{
+use rsrt::{
     Bandwidth,
     SrtListener,
     SrtOptions,
