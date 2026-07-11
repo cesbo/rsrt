@@ -5,9 +5,10 @@
 use std::fmt;
 
 use aes_kw::{
-    KekAes128,
-    KekAes192,
-    KekAes256,
+    KeyInit,
+    KwAes128,
+    KwAes192,
+    KwAes256,
 };
 use zeroize::Zeroize;
 
@@ -118,15 +119,15 @@ pub fn wrap_key(kek: &Kek, plaintext: &[u8]) -> Vec<u8> {
     debug_assert!(!plaintext.is_empty() && plaintext.len().is_multiple_of(8));
     let mut out = vec![0u8; plaintext.len() + 8];
     match kek.0.key_len() {
-        KeyLength::Aes128 => KekAes128::try_from(kek.as_slice())
+        KeyLength::Aes128 => KwAes128::new_from_slice(kek.as_slice())
             .expect("KEK length dispatched")
-            .wrap(plaintext, &mut out),
-        KeyLength::Aes192 => KekAes192::try_from(kek.as_slice())
+            .wrap_key(plaintext, &mut out),
+        KeyLength::Aes192 => KwAes192::new_from_slice(kek.as_slice())
             .expect("KEK length dispatched")
-            .wrap(plaintext, &mut out),
-        KeyLength::Aes256 => KekAes256::try_from(kek.as_slice())
+            .wrap_key(plaintext, &mut out),
+        KeyLength::Aes256 => KwAes256::new_from_slice(kek.as_slice())
             .expect("KEK length dispatched")
-            .wrap(plaintext, &mut out),
+            .wrap_key(plaintext, &mut out),
     }
     .expect("output sized to plaintext + 8-byte ICV");
     out
@@ -148,16 +149,17 @@ pub fn unwrap_key(kek: &Kek, wrapped: &[u8]) -> Result<SecretKey, CryptoError> {
     }
     let mut out = vec![0u8; wrapped.len() - 8];
     let res = match kek.0.key_len() {
-        KeyLength::Aes128 => KekAes128::try_from(kek.as_slice())
+        KeyLength::Aes128 => KwAes128::new_from_slice(kek.as_slice())
             .expect("KEK length dispatched")
-            .unwrap(wrapped, &mut out),
-        KeyLength::Aes192 => KekAes192::try_from(kek.as_slice())
+            .unwrap_key(wrapped, &mut out),
+        KeyLength::Aes192 => KwAes192::new_from_slice(kek.as_slice())
             .expect("KEK length dispatched")
-            .unwrap(wrapped, &mut out),
-        KeyLength::Aes256 => KekAes256::try_from(kek.as_slice())
+            .unwrap_key(wrapped, &mut out),
+        KeyLength::Aes256 => KwAes256::new_from_slice(kek.as_slice())
             .expect("KEK length dispatched")
-            .unwrap(wrapped, &mut out),
-    };
+            .unwrap_key(wrapped, &mut out),
+    }
+    .map(|_| ());
     match res {
         Ok(()) => Ok(SecretKey(out.into_boxed_slice())),
         Err(err) => {
@@ -218,7 +220,10 @@ mod tests {
     fn pbkdf2_kat_all_key_lengths() {
         for (len, expect) in [
             (KeyLength::Aes128, "551b5405cec6898daa3a42a4ddd2ee5a"),
-            (KeyLength::Aes192, "551b5405cec6898daa3a42a4ddd2ee5a61cde5e7fd3b2dd2"),
+            (
+                KeyLength::Aes192,
+                "551b5405cec6898daa3a42a4ddd2ee5a61cde5e7fd3b2dd2",
+            ),
             (
                 KeyLength::Aes256,
                 "551b5405cec6898daa3a42a4ddd2ee5a61cde5e7fd3b2dd20a6d8849490e8ccf",
@@ -280,8 +285,7 @@ mod tests {
     /// RFC 3394 §4.6: 256 bits of key data with a 256-bit KEK.
     #[test]
     fn rfc3394_kat_256() {
-        let kek =
-            kek_from_hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+        let kek = kek_from_hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
         let data = hex("00112233445566778899aabbccddeeff000102030405060708090a0b0c0d0e0f");
         let wrapped = wrap_key(&kek, &data);
         assert_eq!(
@@ -305,7 +309,10 @@ mod tests {
             let sek = SecretKey::generate(len);
             let wrapped = wrap_key(&kek, sek.as_slice());
             assert_eq!(wrapped.len(), len.bytes() + 8);
-            assert_eq!(unwrap_key(&kek, &wrapped).unwrap().as_slice(), sek.as_slice());
+            assert_eq!(
+                unwrap_key(&kek, &wrapped).unwrap().as_slice(),
+                sek.as_slice()
+            );
 
             // Dual-SEK: even first, both keys the same length.
             let odd = SecretKey::generate(len);
@@ -329,7 +336,10 @@ mod tests {
         for byte in [0, wrapped.len() - 1] {
             let mut bad = wrapped.clone();
             bad[byte] ^= 0x01;
-            assert_eq!(unwrap_key(&kek, &bad).unwrap_err(), CryptoError::WrongSecret);
+            assert_eq!(
+                unwrap_key(&kek, &bad).unwrap_err(),
+                CryptoError::WrongSecret
+            );
         }
     }
 

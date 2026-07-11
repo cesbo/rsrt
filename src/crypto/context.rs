@@ -26,11 +26,6 @@ use tracing::{
 };
 use zeroize::Zeroize;
 
-use crate::packet::{
-    EncryptionFlags,
-    SeqNumber,
-};
-
 use super::{
     ctr::CtrCipher,
     keys::{
@@ -49,6 +44,10 @@ use super::{
         KmState,
     },
     CryptoError,
+};
+use crate::packet::{
+    EncryptionFlags,
+    SeqNumber,
 };
 
 /// In-stream KMREQ retransmission budget (`crypto.cpp:SRT_MAX_KMRETRY`;
@@ -101,7 +100,7 @@ impl fmt::Debug for CryptoConfig {
 /// doctest.
 ///
 /// ```compile_fail,E0509
-/// use srt::crypto::{CryptoConfig, KeyLength};
+/// use rsrt::crypto::{CryptoConfig, KeyLength};
 ///
 /// let base = CryptoConfig {
 ///     passphrase: b"correct horse battery".to_vec(),
@@ -285,7 +284,10 @@ impl Crypto {
     /// (§6.2). `Err` carries the failure KM state for the §8 policy
     /// (BadSecret for unwrap failure, NoSecret is decided by the caller
     /// when there is no local passphrase — this constructor requires one).
-    pub fn new_responder(mut cfg: CryptoConfig, kmreq: &[u8]) -> Result<(Crypto, Vec<u8>), KmState> {
+    pub fn new_responder(
+        mut cfg: CryptoConfig,
+        kmreq: &[u8],
+    ) -> Result<(Crypto, Vec<u8>), KmState> {
         // srtcore pre-checks (§6.2 step 1): these two failures are
         // answered BADSECRET by srtcore itself; every later validation
         // failure is NOSECRET class except the unwrap ICV (§3.1).
@@ -380,7 +382,8 @@ impl Crypto {
             .as_mut()
             .expect("active TX SEK installed at construction");
         // §9.2: `seq` is the 32-bit header word 0 (MSB 0 for data).
-        slot.cipher.apply_keystream(&self.salt, seq.value(), payload);
+        slot.cipher
+            .apply_keystream(&self.salt, seq.value(), payload);
         slot.pkt_cnt = slot.pkt_cnt.wrapping_add(1);
         if self.active == EVEN {
             EncryptionFlags::Even
@@ -479,7 +482,10 @@ impl Crypto {
     pub fn handle_kmreq(&mut self, payload: &[u8]) -> KmReqOutcome {
         // srtcore pre-checks (§6.2 step 1): BADSECRET class, rcv only.
         if payload.len() <= KM_HEADER_LEN || payload[15] == 0 {
-            warn!(kmreq_len = payload.len(), "in-stream KMREQ failed pre-checks");
+            warn!(
+                kmreq_len = payload.len(),
+                "in-stream KMREQ failed pre-checks"
+            );
             self.rcv_state = KmState::BadSecret;
             return KmReqOutcome::Failed(KmState::BadSecret);
         }
@@ -552,7 +558,10 @@ impl Crypto {
                     // Ignored-and-keep-retrying converges to SECURED with
                     // no wire-visible difference and no self-inflicted
                     // delivery outage.
-                    warn!(kmrsp_len = echo.len(), "KMRSP echo does not match outstanding KMREQ");
+                    warn!(
+                        kmrsp_len = echo.len(),
+                        "KMRSP echo does not match outstanding KMREQ"
+                    );
                     KmRspOutcome::Ignored
                 }
             },
@@ -660,8 +669,7 @@ impl Crypto {
     /// with stock libsrt peers, whose refreshes reuse both.
     fn install_rx(&mut self, msg: &KmMessage) -> Result<(), CryptoError> {
         let current = self.rx_kek.as_ref().unwrap_or(&self.kek);
-        let fresh = if msg.salt != self.rx_salt || msg.key_len.bytes() != current.as_slice().len()
-        {
+        let fresh = if msg.salt != self.rx_salt || msg.key_len.bytes() != current.as_slice().len() {
             Some(derive_kek(&self.cfg.passphrase, &msg.salt, msg.key_len))
         } else {
             None
@@ -701,9 +709,7 @@ impl Crypto {
             // arrives unencrypted.
             Some(KmState::NoSecret) => (KmState::NoSecret, KmState::Unsecured, KmState::NoSecret),
             // Peer has no crypto at all.
-            Some(KmState::Unsecured) => {
-                (KmState::Unsecured, KmState::NoSecret, KmState::Unsecured)
-            }
+            Some(KmState::Unsecured) => (KmState::Unsecured, KmState::NoSecret, KmState::Unsecured),
             // "anything else": SECURING/SECURED or an unknown word.
             _ => (KmState::NoSecret, KmState::NoSecret, KmState::NoSecret),
         };
@@ -787,11 +793,14 @@ mod tests {
     /// Encrypts on `tx`, decrypts on `rx`, asserting the payload survives
     /// the trip; returns the KK flags the packet carried.
     fn roundtrip(tx: &mut Crypto, rx: &mut Crypto, n: u32) -> EncryptionFlags {
-        let clear: Vec<u8> = (0 .. 100).map(|i| (i as u8).wrapping_mul(31) ^ n as u8).collect();
+        let clear: Vec<u8> = (0 .. 100)
+            .map(|i| (i as u8).wrapping_mul(31) ^ n as u8)
+            .collect();
         let mut buf = clear.clone();
         let flags = tx.encrypt(seq(n), &mut buf);
         assert_ne!(buf, clear, "payload must be transformed");
-        rx.decrypt(seq(n), flags, &mut buf).expect("decrypt must succeed");
+        rx.decrypt(seq(n), flags, &mut buf)
+            .expect("decrypt must succeed");
         assert_eq!(buf, clear, "payload must survive the roundtrip");
         flags
     }
@@ -994,14 +1003,22 @@ mod tests {
         let mut buf = clear.clone();
         let flags = listener.encrypt(seq(5), &mut buf);
         let ct = buf.clone();
-        assert_eq!(caller.decrypt(seq(5), flags, &mut buf), Err(CryptoError::NoKey));
+        assert_eq!(
+            caller.decrypt(seq(5), flags, &mut buf),
+            Err(CryptoError::NoKey)
+        );
         assert_eq!(buf, ct, "payload untouched by the drop");
         assert_eq!(caller.rcv_km_state(), KmState::Securing);
         // Still dropped while SECURING (!= SECURED)...
-        assert_eq!(caller.decrypt(seq(5), flags, &mut buf), Err(CryptoError::NoKey));
+        assert_eq!(
+            caller.decrypt(seq(5), flags, &mut buf),
+            Err(CryptoError::NoKey)
+        );
         // ...but KK=0 passes through the gate untouched (§9.4 trap).
         let mut plain = b"cleartext".to_vec();
-        caller.decrypt(seq(6), EncryptionFlags::None, &mut plain).unwrap();
+        caller
+            .decrypt(seq(6), EncryptionFlags::None, &mut plain)
+            .unwrap();
         assert_eq!(plain, b"cleartext");
 
         // The echo confirmation re-secures RX; the same packet decrypts.
@@ -1050,7 +1067,9 @@ mod tests {
     fn refreshed_pair() -> (Crypto, Crypto) {
         let (mut caller, mut listener) = kmx_pair_with(refresh_config(), config(KeyLength::Aes128));
         let t0 = Instant::now();
-        let kms = drive(&mut caller, &mut listener, 1 ..= 12, t0, |_| EncryptionFlags::Even);
+        let kms = drive(&mut caller, &mut listener, 1 ..= 12, t0, |_| {
+            EncryptionFlags::Even
+        });
         let (_, km) = kms.into_iter().next().expect("pre-announce KM");
         let KmReqOutcome::Installed(echo) = listener.handle_kmreq(&km) else {
             panic!("refresh KM must install");
@@ -1058,28 +1077,35 @@ mod tests {
         assert_eq!(caller.handle_kmrsp(&echo), KmRspOutcome::Confirmed);
         // Packets 13..=16 still even; the switch fires on the ACK after
         // packet 16 (cnt 17 > 16), so 17.. are odd.
-        drive(&mut caller, &mut listener, 13 ..= 16, t0, |_| EncryptionFlags::Even);
-        drive(&mut caller, &mut listener, 17 ..= 17, t0, |_| EncryptionFlags::Odd);
+        drive(&mut caller, &mut listener, 13 ..= 16, t0, |_| {
+            EncryptionFlags::Even
+        });
+        drive(&mut caller, &mut listener, 17 ..= 17, t0, |_| {
+            EncryptionFlags::Odd
+        });
         (caller, listener)
     }
 
     #[test]
     fn refresh_cycle_end_to_end() {
-        let (mut caller, mut listener) =
-            kmx_pair_with(refresh_config(), config(KeyLength::Aes128));
+        let (mut caller, mut listener) = kmx_pair_with(refresh_config(), config(KeyLength::Aes128));
         let t0 = Instant::now();
         let clear = b"replayed dual-window packet".to_vec();
 
         // Packets 1..=11: below every threshold, no KM traffic.
-        assert!(drive(&mut caller, &mut listener, 1 ..= 11, t0, |_| EncryptionFlags::Even)
-            .is_empty());
+        assert!(drive(&mut caller, &mut listener, 1 ..= 11, t0, |_| {
+            EncryptionFlags::Even
+        })
+        .is_empty());
 
         // Packet 12 crosses pre-announce (cnt 13 > 16 − 4): dual-SEK KM.
         // Sent by hand so its ciphertext can be replayed later (a §9.3
         // retransmission of an old-key packet).
         let mut even_ct = clear.clone();
         assert_eq!(caller.encrypt(seq(12), &mut even_ct), EncryptionFlags::Even);
-        let km = caller.on_ack(t0, 100_000).expect("pre-announce at packet 12");
+        let km = caller
+            .on_ack(t0, 100_000)
+            .expect("pre-announce at packet 12");
         let msg = KmMessage::parse(&km).unwrap();
         assert_eq!(msg.keys, KmKeys::Both);
         // §4.1 trap: refresh reuses the salt (same KEK, same IV nonce).
@@ -1096,16 +1122,24 @@ mod tests {
 
         // Dual-key window: old-key (even) packets still decrypt...
         let mut buf = even_ct.clone();
-        listener.decrypt(seq(12), EncryptionFlags::Even, &mut buf).unwrap();
+        listener
+            .decrypt(seq(12), EncryptionFlags::Even, &mut buf)
+            .unwrap();
         assert_eq!(buf, clear);
 
         // Packets 13..=16 stay on the even key (switch is strict cnt > RR,
         // evaluated on the ACK path only, §10.2): the flip shows at 17.
-        drive(&mut caller, &mut listener, 13 ..= 16, t0, |_| EncryptionFlags::Even);
-        drive(&mut caller, &mut listener, 17 ..= 20, t0, |_| EncryptionFlags::Odd);
+        drive(&mut caller, &mut listener, 13 ..= 16, t0, |_| {
+            EncryptionFlags::Even
+        });
+        drive(&mut caller, &mut listener, 17 ..= 20, t0, |_| {
+            EncryptionFlags::Odd
+        });
         // ...and even-key retransmissions decrypt after the switch too.
         let mut buf = even_ct.clone();
-        listener.decrypt(seq(12), EncryptionFlags::Even, &mut buf).unwrap();
+        listener
+            .decrypt(seq(12), EncryptionFlags::Even, &mut buf)
+            .unwrap();
         assert_eq!(buf, clear);
 
         // Counters reset: the odd key counts its own packets (4 so far).
@@ -1114,14 +1148,18 @@ mod tests {
 
         // Decommission: 5th new-key packet (cnt 5 > 4) retires the old
         // TX key — the listener's RX copy lives on (§10.4).
-        drive(&mut caller, &mut listener, 21 ..= 21, t0, |_| EncryptionFlags::Odd);
+        drive(&mut caller, &mut listener, 21 ..= 21, t0, |_| {
+            EncryptionFlags::Odd
+        });
         assert!(caller.tx[EVEN].is_none(), "old key decommissioned");
         assert!(listener.rx[EVEN].is_some(), "RX keys never expire");
 
         // Second cycle: pre-announce at odd cnt 13 (packet 29), switch
         // after packet 33 — the dual KM wraps the NEW even key first
         // (§4.3 trap), which the positional install must honor.
-        let kms = drive(&mut caller, &mut listener, 22 ..= 29, t0, |_| EncryptionFlags::Odd);
+        let kms = drive(&mut caller, &mut listener, 22 ..= 29, t0, |_| {
+            EncryptionFlags::Odd
+        });
         assert_eq!(kms.len(), 1);
         let (n, km2) = &kms[0];
         assert_eq!(*n, 29);
@@ -1132,7 +1170,9 @@ mod tests {
             panic!("second refresh KM must install");
         };
         assert_eq!(caller.handle_kmrsp(&echo2), KmRspOutcome::Confirmed);
-        drive(&mut caller, &mut listener, 30 ..= 32, t0, |_| EncryptionFlags::Odd);
+        drive(&mut caller, &mut listener, 30 ..= 32, t0, |_| {
+            EncryptionFlags::Odd
+        });
 
         // Packet 33 (odd cnt 17 > 16) triggers the second switch; keep its
         // ciphertext for an after-the-switch replay.
@@ -1141,10 +1181,14 @@ mod tests {
         assert!(caller.on_ack(t0, 100_000).is_none(), "switch emits nothing");
 
         // Back on the (new) even key: KK flips and decrypts fine.
-        drive(&mut caller, &mut listener, 34 ..= 38, t0, |_| EncryptionFlags::Even);
+        drive(&mut caller, &mut listener, 34 ..= 38, t0, |_| {
+            EncryptionFlags::Even
+        });
         // Old odd-key packets keep decrypting throughout the window.
         let mut buf = odd_ct.clone();
-        listener.decrypt(seq(33), EncryptionFlags::Odd, &mut buf).unwrap();
+        listener
+            .decrypt(seq(33), EncryptionFlags::Odd, &mut buf)
+            .unwrap();
         assert_eq!(buf, clear);
     }
 
@@ -1153,22 +1197,35 @@ mod tests {
         // §10.1 quirk (b), not copied: with an ACK gap far past RR, the
         // first tick pre-announces (never switching to a non-keyed slot),
         // the second tick switches.
-        let (mut caller, mut listener) =
-            kmx_pair_with(refresh_config(), config(KeyLength::Aes128));
+        let (mut caller, mut listener) = kmx_pair_with(refresh_config(), config(KeyLength::Aes128));
         let t0 = Instant::now();
         for n in 1 ..= 30 {
             // No ACKs at all while cnt runs far past RR = 16.
-            assert_eq!(roundtrip(&mut caller, &mut listener, n), EncryptionFlags::Even);
+            assert_eq!(
+                roundtrip(&mut caller, &mut listener, n),
+                EncryptionFlags::Even
+            );
         }
-        let km = caller.on_ack(t0, 100_000).expect("first tick pre-announces");
+        let km = caller
+            .on_ack(t0, 100_000)
+            .expect("first tick pre-announces");
         assert_eq!(KmMessage::parse(&km).unwrap().keys, KmKeys::Both);
         // Still even until the next tick — one transition per tick.
-        assert_eq!(roundtrip(&mut caller, &mut listener, 31), EncryptionFlags::Even);
+        assert_eq!(
+            roundtrip(&mut caller, &mut listener, 31),
+            EncryptionFlags::Even
+        );
         let KmReqOutcome::Installed(_) = listener.handle_kmreq(&km) else {
             panic!("refresh KM must install");
         };
-        assert!(caller.on_ack(t0, 100_000).is_none(), "second tick switches silently");
-        assert_eq!(roundtrip(&mut caller, &mut listener, 32), EncryptionFlags::Odd);
+        assert!(
+            caller.on_ack(t0, 100_000).is_none(),
+            "second tick switches silently"
+        );
+        assert_eq!(
+            roundtrip(&mut caller, &mut listener, 32),
+            EncryptionFlags::Odd
+        );
     }
 
     #[test]
@@ -1179,9 +1236,15 @@ mod tests {
         // the original (even) SEK, and the caller decrypts it fine even
         // though the caller's own even TX slot was rotated away.
         assert_eq!(caller.active, ODD);
-        assert!(listener.tx[ODD].is_none(), "listener TX untouched by RX install");
+        assert!(
+            listener.tx[ODD].is_none(),
+            "listener TX untouched by RX install"
+        );
         assert_eq!(listener.active, EVEN);
-        assert_eq!(roundtrip(&mut listener, &mut caller, 500), EncryptionFlags::Even);
+        assert_eq!(
+            roundtrip(&mut listener, &mut caller, 500),
+            EncryptionFlags::Even
+        );
         assert_eq!(listener.snd_km_state(), KmState::Secured);
         assert_eq!(listener.rcv_km_state(), KmState::Secured);
     }
@@ -1190,12 +1253,13 @@ mod tests {
     fn duplicate_kmreq_is_reechoed() {
         // §10.4 trap: retried KMREQs are idempotent and always re-answered
         // with the full echo — the initiator's retries depend on it.
-        let (mut caller, mut listener) =
-            kmx_pair_with(refresh_config(), config(KeyLength::Aes128));
+        let (mut caller, mut listener) = kmx_pair_with(refresh_config(), config(KeyLength::Aes128));
         let t0 = Instant::now();
-        let (_, km) = drive(&mut caller, &mut listener, 1 ..= 12, t0, |_| EncryptionFlags::Even)
-            .pop()
-            .expect("pre-announce KM");
+        let (_, km) = drive(&mut caller, &mut listener, 1 ..= 12, t0, |_| {
+            EncryptionFlags::Even
+        })
+        .pop()
+        .expect("pre-announce KM");
         for _ in 0 .. 2 {
             match listener.handle_kmreq(&km) {
                 KmReqOutcome::Installed(echo) => assert_eq!(echo, km),
@@ -1208,12 +1272,13 @@ mod tests {
 
     #[test]
     fn midstream_kmreq_failure_mapping() {
-        let (mut caller, mut listener) =
-            kmx_pair_with(refresh_config(), config(KeyLength::Aes128));
+        let (mut caller, mut listener) = kmx_pair_with(refresh_config(), config(KeyLength::Aes128));
         let t0 = Instant::now();
-        let (_, km) = drive(&mut caller, &mut listener, 1 ..= 12, t0, |_| EncryptionFlags::Even)
-            .pop()
-            .expect("pre-announce KM");
+        let (_, km) = drive(&mut caller, &mut listener, 1 ..= 12, t0, |_| {
+            EncryptionFlags::Even
+        })
+        .pop()
+        .expect("pre-announce KM");
 
         // srtcore pre-checks ⇒ BADSECRET (rcv only, §6.2 step 1).
         let KmReqOutcome::Failed(state) = listener.handle_kmreq(&km[.. 10]) else {
@@ -1282,27 +1347,34 @@ mod tests {
 
     #[test]
     fn retry_pacing_and_exhaustion() {
-        let (mut caller, mut listener) =
-            kmx_pair_with(refresh_config(), config(KeyLength::Aes128));
+        let (mut caller, mut listener) = kmx_pair_with(refresh_config(), config(KeyLength::Aes128));
         let t0 = Instant::now();
         let srtt = 100_000u32; // 100 ms ⇒ pace 150 ms
         let pace = Duration::from_millis(150);
 
-        let (_, km) = drive(&mut caller, &mut listener, 1 ..= 12, t0, |_| EncryptionFlags::Even)
-            .pop()
-            .expect("pre-announce KM");
+        let (_, km) = drive(&mut caller, &mut listener, 1 ..= 12, t0, |_| {
+            EncryptionFlags::Even
+        })
+        .pop()
+        .expect("pre-announce KM");
         assert_eq!(caller.kmreq().as_deref(), Some(&km[..]));
 
         // Not due before 1.5 × SRTT has elapsed since the initial send.
         assert!(caller.on_ack(t0, srtt).is_none());
-        assert!(caller.on_ack(t0 + pace - Duration::from_millis(1), srtt).is_none());
+        assert!(caller
+            .on_ack(t0 + pace - Duration::from_millis(1), srtt)
+            .is_none());
 
         // Exactly 10 paced resends, byte-identical, then silence forever
         // (§11.2) — while the key material stays in place.
         let mut now = t0;
         for retry in 1 ..= KM_MAX_RETRY {
             now += pace;
-            assert_eq!(caller.on_ack(now, srtt).as_deref(), Some(&km[..]), "retry {retry}");
+            assert_eq!(
+                caller.on_ack(now, srtt).as_deref(),
+                Some(&km[..]),
+                "retry {retry}"
+            );
         }
         now += pace;
         assert!(caller.on_ack(now, srtt).is_none(), "retries exhausted");
@@ -1311,7 +1383,10 @@ mod tests {
         // §11.2 trap: the sender still switches at RR with the KMREQ
         // unconfirmed; a receiver that truly lost it drops new-key data.
         for n in 13 ..= 16 {
-            assert_eq!(roundtrip(&mut caller, &mut listener, n), EncryptionFlags::Even);
+            assert_eq!(
+                roundtrip(&mut caller, &mut listener, n),
+                EncryptionFlags::Even
+            );
         }
         caller.on_ack(now, srtt); // switch tick
         let mut buf = [0x5Au8; 24];
@@ -1374,7 +1449,9 @@ mod tests {
     #[test]
     fn kmrsp_without_outstanding_is_ignored() {
         let (mut caller, _) = kmx_pair(KeyLength::Aes128);
-        let stray = Crypto::new_initiator(config(KeyLength::Aes128)).kmreq().unwrap();
+        let stray = Crypto::new_initiator(config(KeyLength::Aes128))
+            .kmreq()
+            .unwrap();
         assert_eq!(caller.handle_kmrsp(&stray), KmRspOutcome::Ignored);
         assert_eq!(caller.snd_km_state(), KmState::Secured);
     }
@@ -1397,14 +1474,39 @@ mod tests {
         // §6.3 table; §5.1 trap: the status word is little-endian.
         let cases: [(&[u8; 4], KmState, KmState, KmState); 5] = [
             // wire word (LE)      outcome              snd                  rcv
-            (&[4, 0, 0, 0], KmState::BadSecret, KmState::BadSecret, KmState::BadSecret),
-            (&[3, 0, 0, 0], KmState::NoSecret, KmState::NoSecret, KmState::Unsecured),
-            (&[0, 0, 0, 0], KmState::Unsecured, KmState::Unsecured, KmState::NoSecret),
+            (
+                &[4, 0, 0, 0],
+                KmState::BadSecret,
+                KmState::BadSecret,
+                KmState::BadSecret,
+            ),
+            (
+                &[3, 0, 0, 0],
+                KmState::NoSecret,
+                KmState::NoSecret,
+                KmState::Unsecured,
+            ),
+            (
+                &[0, 0, 0, 0],
+                KmState::Unsecured,
+                KmState::Unsecured,
+                KmState::NoSecret,
+            ),
             // "anything else": a known-but-nonsensical state...
-            (&[1, 0, 0, 0], KmState::NoSecret, KmState::NoSecret, KmState::NoSecret),
+            (
+                &[1, 0, 0, 0],
+                KmState::NoSecret,
+                KmState::NoSecret,
+                KmState::NoSecret,
+            ),
             // ...and BADSECRET's big-endian bytes = unknown word 0x04000000
             // — an implementation reading BE would confuse the two rows.
-            (&[0, 0, 0, 4], KmState::NoSecret, KmState::NoSecret, KmState::NoSecret),
+            (
+                &[0, 0, 0, 4],
+                KmState::NoSecret,
+                KmState::NoSecret,
+                KmState::NoSecret,
+            ),
         ];
         for (wire, outcome, snd, rcv) in cases {
             let mut initiator = Crypto::new_initiator(config(KeyLength::Aes128));
@@ -1427,8 +1529,7 @@ mod tests {
     fn kmrsp_unsecured_gates_on_ack_entirely() {
         // §11.2: `sendKeysToPeer` skips when SndKmState == UNSECURED; the
         // refresh machine must not run for a peer without crypto.
-        let (mut caller, mut listener) =
-            kmx_pair_with(refresh_config(), config(KeyLength::Aes128));
+        let (mut caller, mut listener) = kmx_pair_with(refresh_config(), config(KeyLength::Aes128));
         assert_eq!(
             caller.handle_kmrsp(&[0, 0, 0, 0]),
             KmRspOutcome::Failed(KmState::Unsecured)

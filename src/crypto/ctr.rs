@@ -8,9 +8,7 @@ use aes::{
 use ctr::{
     cipher::{
         consts::U16,
-        BlockCipher,
-        BlockEncrypt,
-        BlockSizeUser,
+        BlockCipherEncrypt,
         InnerIvInit,
         KeyInit,
         StreamCipher,
@@ -103,7 +101,7 @@ pub fn apply_keystream(key: &SecretKey, salt: &[u8; 16], seq: u32, payload: &mut
 /// is byte-identical (§9.2).
 fn xor_keystream<C>(cipher: &C, iv: &[u8; 16], payload: &mut [u8])
 where
-    C: BlockEncrypt + BlockCipher + BlockSizeUser<BlockSize = U16> + Clone,
+    C: BlockCipherEncrypt<BlockSize = U16> + Clone,
 {
     StreamCipherCoreWrapper::from_core(CtrCore::<C, flavors::Ctr128BE>::inner_iv_init(
         cipher.clone(),

@@ -15,8 +15,8 @@
 //! # Receiving (caller)
 //!
 //! ```no_run
-//! # async fn demo() -> Result<(), srt::SrtError> {
-//! let mut sock = srt::SrtSocket::connect("bg.cesbo.com:10101", srt::SrtOptions::default()).await?;
+//! # async fn demo() -> Result<(), rsrt::SrtError> {
+//! let mut sock = rsrt::SrtSocket::connect("example.com:10101", rsrt::SrtOptions::default()).await?;
 //! while let Some(payload) = sock.recv().await? {
 //!     // one live-mode message, e.g. up to 7 MPEG-TS packets
 //! }
@@ -26,8 +26,8 @@
 //! # Serving (listener)
 //!
 //! ```no_run
-//! # async fn demo() -> Result<(), srt::SrtError> {
-//! let mut listener = srt::SrtListener::bind("0.0.0.0:10101", srt::SrtOptions::default()).await?;
+//! # async fn demo() -> Result<(), rsrt::SrtError> {
+//! let mut listener = rsrt::SrtListener::bind("0.0.0.0:10101", rsrt::SrtOptions::default()).await?;
 //! let (mut sock, peer) = listener.accept().await?;
 //! sock.send(b"...").await?;
 //! # Ok(()) }
