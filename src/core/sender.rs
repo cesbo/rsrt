@@ -296,9 +296,7 @@ impl Sender {
         let encryption = match crypto {
             // §9.4: never encrypt a zero-length payload (HaiCrypt reports
             // it as failure; live mode never produces one).
-            Some(crypto) if !payload.is_empty() => {
-                crypto.encrypt(self.seq_at(index), &mut payload)
-            }
+            Some(crypto) if !payload.is_empty() => crypto.encrypt(self.seq_at(index), &mut payload),
             _ => EncryptionFlags::None,
         };
 
@@ -342,6 +340,17 @@ impl Sender {
             is_light,
             "ACK received"
         );
+
+        // ACK for data never sent: attack or bug.
+        if ack_ext > self.next_send_index as i64 {
+            warn!(
+                ack_seq = cif.last_ack_seq.value(),
+                highest_sent = self.seq_at(self.next_send_index).prev().value(),
+                "ACK beyond highest sent sequence: breaking connection"
+            );
+            self.protocol_violation = true;
+            return Err(SrtError::Closed(CloseReason::Local));
+        }
 
         // Release the send buffer below the ACKed sequence — done for light
         // and full ACKs alike (docs/spec/transmission.md §6 step 2).
@@ -405,18 +414,6 @@ impl Sender {
         } else {
             None
         };
-
-        // ACK for data never sent: attack or bug — break the connection
-        // (docs/spec/transmission.md §6 step 5).
-        if ack_ext > self.next_send_index as i64 {
-            warn!(
-                ack_seq = cif.last_ack_seq.value(),
-                highest_sent = self.seq_at(self.next_send_index).prev().value(),
-                "ACK beyond highest sent sequence: breaking connection"
-            );
-            self.protocol_violation = true;
-            return Err(SrtError::Closed(CloseReason::Local));
-        }
 
         if ack_ext >= self.last_ack_index as i64 {
             // Adopt the peer's advertised available buffer as the flow
@@ -637,9 +634,7 @@ impl Sender {
     pub fn next_deadline(&self) -> Option<Instant> {
         let threshold = self.drop_threshold();
         let drop = match (self.buffer.front(), self.buffer.back()) {
-            (Some(front), Some(back))
-                if back.origin.duration_since(front.origin) > threshold =>
-            {
+            (Some(front), Some(back)) if back.origin.duration_since(front.origin) > threshold => {
                 Some(front.origin + threshold)
             }
             _ => None,
@@ -875,7 +870,8 @@ mod tests {
     /// them all; returns the transmitted packets.
     fn push_and_send(s: &mut Sender, start: Instant, n: usize) -> Vec<DataPacket> {
         for i in 0 .. n {
-            s.push(start + MS * i as u32, vec![i as u8; 3], None).unwrap();
+            s.push(start + MS * i as u32, vec![i as u8; 3], None)
+                .unwrap();
         }
         let mut out = Vec::new();
         while let Some(p) = s.poll_transmit(start + MS * n as u32) {
@@ -996,6 +992,29 @@ mod tests {
             other => panic!("expected protocol-violation error, got {other:?}"),
         }
         assert!(s.protocol_violation());
+    }
+
+    #[test]
+    fn light_ack_beyond_highest_sent_is_protocol_violation_without_releasing_buffer() {
+        let t0 = Instant::now();
+        let mut s = sender(t0);
+        s.push(t0, vec![1; 8], None).unwrap();
+        s.push(t0 + MS, vec![2; 8], None).unwrap();
+        assert_eq!(
+            s.poll_transmit(t0 + MS * 2).unwrap().seq,
+            SeqNumber::new(ISN)
+        );
+        assert_eq!(s.buffered_pkts(), 2);
+
+        // Only seq 100 was sent, so ACK 102 confirms seq 101 before it was
+        // transmitted. A Light ACK must hit the same protocol-violation gate
+        // as a full ACK and must not mutate the send buffer first.
+        match s.handle_ack(t0 + MS * 3, 0, &light_ack(ISN + 2)) {
+            Err(SrtError::Closed(_)) => {}
+            other => panic!("expected protocol-violation error, got {other:?}"),
+        }
+        assert!(s.protocol_violation());
+        assert_eq!(s.buffered_pkts(), 2);
     }
 
     #[test]
@@ -1608,7 +1627,13 @@ mod tests {
     /// packets (the counter starts at 1, so 12 pushes reach the
     /// pre-announce threshold and 16 the switch threshold), the dual-SEK
     /// KM installed on `rx`, then `extra` odd-key packets past the switch.
-    fn push_through_key_switch(s: &mut Sender, tx: &mut Crypto, rx: &mut Crypto, t0: Instant, extra: u32) {
+    fn push_through_key_switch(
+        s: &mut Sender,
+        tx: &mut Crypto,
+        rx: &mut Crypto,
+        t0: Instant,
+        extra: u32,
+    ) {
         push_encrypted(s, tx, t0, 0 .. 12);
         // Refresh ticks run on the ACK path (§10.2); the Connection layer
         // owns that wiring, so the tests tick the engine directly.
@@ -1803,7 +1828,12 @@ mod tests {
         // the first packet after establish goes immediately (zero
         // m_tsNextSendTime), then the gate holds until the exact tick.
         let t0 = Instant::now();
-        let mut s = paced(t0, Bandwidth::Max { bytes_per_sec: 1_360_000 });
+        let mut s = paced(
+            t0,
+            Bandwidth::Max {
+                bytes_per_sec: 1_360_000,
+            },
+        );
         for _ in 0 .. 3 {
             s.push(t0, vec![0; 1316], None).unwrap();
         }
@@ -1824,13 +1854,18 @@ mod tests {
         // to send back-to-back — the catch-up burst that absorbs coarse
         // driver wakes (packData core.cpp:8978-8981, 9221-9248).
         let t0 = Instant::now();
-        let mut s = paced(t0, Bandwidth::Max { bytes_per_sec: 1_360_000 });
+        let mut s = paced(
+            t0,
+            Bandwidth::Max {
+                bytes_per_sec: 1_360_000,
+            },
+        );
         for _ in 0 .. 6 {
             s.push(t0, vec![0; 1316], None).unwrap();
         }
         assert!(s.poll_transmit(t0).is_some()); // schedule armed at +1000
-        // The driver comes back 3.5 periods late: 3500 µs of credit buys
-        // 3 whole periods plus the due slot — 4 packets back-to-back.
+                                                // The driver comes back 3.5 periods late: 3500 µs of credit buys
+                                                // 3 whole periods plus the due slot — 4 packets back-to-back.
         let late = t0 + us(4500);
         let burst: Vec<DataPacket> = std::iter::from_fn(|| s.poll_transmit(late)).collect();
         assert_eq!(burst.len(), 4, "3 whole credits + the due slot");
@@ -1847,7 +1882,12 @@ mod tests {
         // schedule (packData core.cpp:9106-9117) — a push arriving much
         // later starts fresh instead of burning stale credit as a burst.
         let t0 = Instant::now();
-        let mut s = paced(t0, Bandwidth::Max { bytes_per_sec: 1_360_000 });
+        let mut s = paced(
+            t0,
+            Bandwidth::Max {
+                bytes_per_sec: 1_360_000,
+            },
+        );
         s.push(t0, vec![0; 1316], None).unwrap();
         assert!(s.poll_transmit(t0).is_some());
         assert_eq!(s.next_deadline(), Some(t0 + us(1000)));
@@ -1875,7 +1915,9 @@ mod tests {
         let t0 = Instant::now();
         let mut s = Sender::new(SenderConfig {
             flow_window: 2,
-            bandwidth: Bandwidth::Max { bytes_per_sec: 1_360_000 },
+            bandwidth: Bandwidth::Max {
+                bytes_per_sec: 1_360_000,
+            },
             ..config(t0)
         });
         for _ in 0 .. 4 {
@@ -1888,9 +1930,13 @@ mod tests {
         assert_eq!(s.next_deadline(), None, "window-blocked reset");
         // 8 ms later an ACK releases the window: the next send is
         // immediate (schedule disarmed), the one after a full period.
-        s.handle_ack(t0 + us(10_000), 1, &full_ack(ISN + 2)).unwrap();
+        s.handle_ack(t0 + us(10_000), 1, &full_ack(ISN + 2))
+            .unwrap();
         assert!(s.poll_transmit(t0 + us(10_000)).is_some());
-        assert!(s.poll_transmit(t0 + us(10_000)).is_none(), "credit was zeroed");
+        assert!(
+            s.poll_transmit(t0 + us(10_000)).is_none(),
+            "credit was zeroed"
+        );
         assert_eq!(s.next_deadline(), Some(t0 + us(11_000)));
         assert!(s.poll_transmit(t0 + us(11_000)).is_some());
     }
@@ -1903,7 +1949,9 @@ mod tests {
         let t0 = Instant::now();
         let mut s = Sender::new(SenderConfig {
             initial_seq: SeqNumber::new(112), // 112 & 0xF == 0
-            bandwidth: Bandwidth::Max { bytes_per_sec: 1_360_000 },
+            bandwidth: Bandwidth::Max {
+                bytes_per_sec: 1_360_000,
+            },
             ..config(t0)
         });
         for _ in 0 .. 3 {
@@ -1915,7 +1963,10 @@ mod tests {
         assert_eq!(s.poll_transmit(t0).unwrap().seq, SeqNumber::new(113));
         assert!(s.poll_transmit(t0).is_none(), "after the pair: gated");
         assert_eq!(s.next_deadline(), Some(t0 + us(1000)));
-        assert_eq!(s.poll_transmit(t0 + us(1000)).unwrap().seq, SeqNumber::new(114));
+        assert_eq!(
+            s.poll_transmit(t0 + us(1000)).unwrap().seq,
+            SeqNumber::new(114)
+        );
         // A RETRANSMISSION of the & 0xF == 0 sequence does not arm a
         // probe: no same-instant follower after the rexmit.
         s.handle_nak(t0 + us(1500), &nak(112, 112));
@@ -1923,7 +1974,10 @@ mod tests {
         let rex = s.poll_transmit(t0 + us(2000)).unwrap();
         assert_eq!(rex.seq, SeqNumber::new(112));
         assert!(rex.retransmitted);
-        assert!(s.poll_transmit(t0 + us(2000)).is_none(), "rexmit never probes");
+        assert!(
+            s.poll_transmit(t0 + us(2000)).is_none(),
+            "rexmit never probes"
+        );
         assert_eq!(s.next_deadline(), Some(t0 + us(3000)));
     }
 
@@ -1933,14 +1987,22 @@ mod tests {
         // one packet per period across classes, rexmit first (§3.2
         // ordering preserved under the gate).
         let t0 = Instant::now();
-        let mut s = paced(t0, Bandwidth::Max { bytes_per_sec: 1_360_000 });
+        let mut s = paced(
+            t0,
+            Bandwidth::Max {
+                bytes_per_sec: 1_360_000,
+            },
+        );
         for _ in 0 .. 4 {
             s.push(t0, vec![0; 1316], None).unwrap();
         }
         assert!(s.poll_transmit(t0).is_some()); // seq 100 out
-        // NAK while gated: nothing is emitted, the loss entry is retained.
+                                                // NAK while gated: nothing is emitted, the loss entry is retained.
         s.handle_nak(t0 + us(100), &nak(ISN, ISN));
-        assert!(s.poll_transmit(t0 + us(100)).is_none(), "gate blocks rexmits too");
+        assert!(
+            s.poll_transmit(t0 + us(100)).is_none(),
+            "gate blocks rexmits too"
+        );
         // At the tick the retransmission takes the paced slot ...
         let rex = s.poll_transmit(t0 + us(1000)).unwrap();
         assert_eq!(rex.seq, SeqNumber::new(ISN));
@@ -1959,7 +2021,12 @@ mod tests {
         // ACK / NAK / timer); light ACKs never reach updateCC
         // (core.cpp:7371-7379, 8027-8042).
         let t0 = Instant::now();
-        let mut s = paced(t0, Bandwidth::Max { bytes_per_sec: 1_360_000 });
+        let mut s = paced(
+            t0,
+            Bandwidth::Max {
+                bytes_per_sec: 1_360_000,
+            },
+        );
         s.push(t0, vec![0; 100], None).unwrap();
         s.push(t0, vec![0; 100], None).unwrap();
         // Two 100-byte sends move the IIR (1316 → 1306 → 1296), yet the
@@ -1985,7 +2052,10 @@ mod tests {
         let t0 = Instant::now();
         let mut s = paced(
             t0,
-            Bandwidth::Estimated { min_bytes_per_sec: 5_000, overhead_pct: 25 },
+            Bandwidth::Estimated {
+                min_bytes_per_sec: 5_000,
+                overhead_pct: 25,
+            },
         );
         // Construction parity with updateBandwidth(0, 0) at TEV_INIT: the
         // LiveCC ctor ceiling, period trunc(1e6·1360/125e6) = 10 µs.
@@ -1996,15 +2066,19 @@ mod tests {
         // Before the first window closes a refresh overheads the grace
         // value: 125e6·125/100 — still effectively unpaced.
         s.push(t0, vec![0; 1000], None).unwrap(); // stamps the window only
-        s.handle_ack(t0 + Duration::from_millis(100), 1, &full_ack(ISN)).unwrap();
+        s.handle_ack(t0 + Duration::from_millis(100), 1, &full_ack(ISN))
+            .unwrap();
         let st = s.stats();
         assert_eq!(st.snd_max_bw, 156_250_000);
         assert_eq!(st.snd_input_rate, 0, "no fictitious grace rate in stats");
         // First window closes at 501 ms with 2 counted 1000-byte pushes:
         // rate = (2000 + 2·44)·1e6/501_000 = 4167 — below the 5000 floor.
-        s.push(t0 + Duration::from_millis(250), vec![0; 1000], None).unwrap();
-        s.push(t0 + Duration::from_millis(501), vec![0; 1000], None).unwrap();
-        s.handle_ack(t0 + Duration::from_millis(502), 2, &full_ack(ISN)).unwrap();
+        s.push(t0 + Duration::from_millis(250), vec![0; 1000], None)
+            .unwrap();
+        s.push(t0 + Duration::from_millis(501), vec![0; 1000], None)
+            .unwrap();
+        s.handle_ack(t0 + Duration::from_millis(502), 2, &full_ack(ISN))
+            .unwrap();
         let st = s.stats();
         assert_eq!(st.snd_input_rate, 4167);
         assert_eq!(st.snd_max_bw, with_overhead(5_000, 25), "floor wins");
@@ -2012,11 +2086,17 @@ mod tests {
         // Second (1 s) window measures above the floor: 5 pushes of 1000
         // bytes over 1.001 s → (5000 + 5·44)·1e6/1_001_000 = 5214.
         for i in 1 ..= 4u64 {
-            s.push(t0 + Duration::from_millis(501 + 200 * i), vec![0; 1000], None)
-                .unwrap();
+            s.push(
+                t0 + Duration::from_millis(501 + 200 * i),
+                vec![0; 1000],
+                None,
+            )
+            .unwrap();
         }
-        s.push(t0 + Duration::from_millis(1502), vec![0; 1000], None).unwrap();
-        s.handle_ack(t0 + Duration::from_millis(1503), 3, &full_ack(ISN)).unwrap();
+        s.push(t0 + Duration::from_millis(1502), vec![0; 1000], None)
+            .unwrap();
+        s.handle_ack(t0 + Duration::from_millis(1503), 3, &full_ack(ISN))
+            .unwrap();
         let st = s.stats();
         assert_eq!(st.snd_input_rate, 5214);
         assert_eq!(st.snd_max_bw, with_overhead(5214, 25), "estimate wins");
@@ -2033,7 +2113,12 @@ mod tests {
         // the two components and the gate survives the drop untouched.
         let t0 = Instant::now();
         // 1360 B/s: period = 1e6·(1316+44)/1360 = exactly 1 s.
-        let mut s = paced(t0, Bandwidth::Max { bytes_per_sec: 1360 });
+        let mut s = paced(
+            t0,
+            Bandwidth::Max {
+                bytes_per_sec: 1360,
+            },
+        );
         s.push(t0, vec![0; 1316], None).unwrap();
         s.push(t0, vec![0; 1316], None).unwrap();
         assert!(s.poll_transmit(t0).is_some());
@@ -2041,7 +2126,8 @@ mod tests {
         // Third push stretches the timespan past the 1020 ms threshold:
         // the drop deadline (t0 + 1020 ms) arms, but the pace tick
         // (t0 + 1000 ms) is earlier and wins the min.
-        s.push(t0 + Duration::from_millis(1030), vec![0; 1316], None).unwrap();
+        s.push(t0 + Duration::from_millis(1030), vec![0; 1316], None)
+            .unwrap();
         assert_eq!(s.next_deadline(), Some(t0 + Duration::from_millis(1000)));
         // Pace tick: nothing is droppable yet (both t0 packets are 1000 ms
         // old < 1020 ms); the paced slot emits and re-arms at +2 s, so the
@@ -2058,7 +2144,10 @@ mod tests {
             s.poll_control(),
             Some(ControlType::DropRequest { .. })
         ));
-        assert!(s.poll_transmit(t0 + Duration::from_millis(1020)).is_none(), "still gated");
+        assert!(
+            s.poll_transmit(t0 + Duration::from_millis(1020)).is_none(),
+            "still gated"
+        );
         assert_eq!(s.next_deadline(), Some(t0 + Duration::from_secs(2)));
         // The survivor goes out at the tick, as a first transmission.
         let p = s.poll_transmit(t0 + Duration::from_secs(2)).unwrap();
@@ -2073,7 +2162,12 @@ mod tests {
         // future (gated) — the driver never busy-loops, and the one extra
         // wake at burst end performs the reset itself.
         let t0 = Instant::now();
-        let mut s = paced(t0, Bandwidth::Max { bytes_per_sec: 1_360_000 });
+        let mut s = paced(
+            t0,
+            Bandwidth::Max {
+                bytes_per_sec: 1_360_000,
+            },
+        );
         assert!(s.poll_transmit(t0).is_none());
         assert_eq!(s.next_deadline(), None, "idle sender advertises nothing");
         s.push(t0, vec![0; 1316], None).unwrap();
