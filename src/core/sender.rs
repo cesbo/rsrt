@@ -36,6 +36,7 @@ use std::{
     },
 };
 
+use bytes::Bytes;
 use tracing::{
     debug,
     trace,
@@ -152,7 +153,9 @@ struct BufEntry {
     /// ciphertext, never re-encrypted (docs/spec/encryption.md §9.3).
     encryption: EncryptionFlags,
     /// Payload as it goes on the wire: ciphertext when crypto is active.
-    payload: Vec<u8>,
+    /// Refcounted: the per-send clone in `packet_at` is a refcount bump,
+    /// not a copy.
+    payload: Bytes,
 }
 
 /// Live-mode sender state machine. All methods are non-blocking; time only
@@ -314,7 +317,7 @@ impl Sender {
             ts,
             last_rexmit: None,
             encryption,
-            payload,
+            payload: payload.into(),
         });
         Ok(())
     }
@@ -788,6 +791,7 @@ impl Sender {
     /// Builds the wire packet for a buffered index. Retransmissions reuse
     /// the ORIGINAL sequence, message number, timestamp and KK bits with
     /// R=1 — same ciphertext, never re-encrypted (encryption.md §9.3).
+    /// The payload clone is an O(1) refcount bump, not a copy.
     fn packet_at(&self, index: u64, retransmitted: bool) -> DataPacket {
         let entry = &self.buffer[(index - self.base_index) as usize];
         DataPacket {
@@ -1195,6 +1199,20 @@ mod tests {
         assert!(rex.retransmitted, "R flag must be set");
         assert!(!sent[1].retransmitted);
         assert!(s.poll_transmit(t0 + MS * 500).is_none());
+    }
+
+    #[test]
+    fn transmit_and_rexmit_share_payload_allocation() {
+        let t0 = Instant::now();
+        let mut s = sender(t0);
+        s.push(t0, vec![7u8; 100], None).unwrap();
+        let first = s.poll_transmit(t0).unwrap();
+        s.handle_nak(t0 + MS, &nak(ISN, ISN));
+        let rex = s.poll_transmit(t0 + MS).unwrap();
+        assert!(rex.retransmitted);
+        assert_eq!(rex.payload, first.payload);
+        // Same allocation: packet_at's clone is a refcount bump, not a copy.
+        assert_eq!(rex.payload.as_ptr(), first.payload.as_ptr());
     }
 
     #[test]
@@ -1662,7 +1680,7 @@ mod tests {
         assert_eq!(p.payload.len(), clear.len());
         // The final wire seqno went into the IV: the peer's decrypt with
         // the packet's own seq and KK bits restores the plaintext.
-        let mut buf = p.payload.clone();
+        let mut buf = p.payload.to_vec();
         rx.decrypt(p.seq, p.encryption, &mut buf).unwrap();
         assert_eq!(buf, clear);
     }
@@ -1716,7 +1734,7 @@ mod tests {
         // The peer holds both SEKs from the dual KM (§10.4): every packet
         // decrypts with its own (seq, KK) pair.
         for (i, p) in sent.iter().enumerate() {
-            let mut buf = p.payload.clone();
+            let mut buf = p.payload.to_vec();
             rx.decrypt(p.seq, p.encryption, &mut buf).unwrap();
             assert_eq!(buf, vec![i as u8; 24], "packet {i}");
         }
@@ -1769,7 +1787,7 @@ mod tests {
             ]
         );
         for (i, p) in sent.iter().enumerate() {
-            let mut buf = p.payload.clone();
+            let mut buf = p.payload.to_vec();
             rx.decrypt(p.seq, p.encryption, &mut buf).unwrap();
             assert_eq!(buf, vec![(14 + i) as u8; 24], "packet {i}");
         }

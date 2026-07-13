@@ -39,6 +39,7 @@ use std::{
 };
 
 use rsrt::{
+    Bytes,
     KeyLength,
     SrtListener,
     SrtOptions,
@@ -160,7 +161,7 @@ async fn open(url: &SrtUrl, opts: SrtOptions) -> Result<SrtSocket, Box<dyn Error
 }
 
 /// Queue handle plus join handle for the blocking output thread.
-type Writer = (mpsc::Sender<Vec<u8>>, thread::JoinHandle<io::Result<()>>);
+type Writer = (mpsc::Sender<Bytes>, thread::JoinHandle<io::Result<()>>);
 
 /// Spawns the blocking output thread: file/stdout writes never stall the
 /// async runtime, and the bounded queue applies backpressure to `recv`
@@ -170,7 +171,7 @@ fn spawn_writer(path: Option<String>) -> io::Result<Writer> {
         Some(path) => Box::new(fs::File::create(path)?),
         None => Box::new(io::stdout()),
     };
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
+    let (tx, mut rx) = mpsc::channel::<Bytes>(256);
     let writer = thread::spawn(move || -> io::Result<()> {
         let mut out = BufWriter::new(out);
         while let Some(payload) = rx.blocking_recv() {
@@ -212,8 +213,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("out.bin");
         let (tx, writer) = spawn_writer(Some(path.to_str().unwrap().to_string())).unwrap();
-        tx.blocking_send(b"hello ".to_vec()).unwrap();
-        tx.blocking_send(b"world".to_vec()).unwrap();
+        tx.blocking_send(Bytes::from_static(b"hello ")).unwrap();
+        tx.blocking_send(Bytes::from_static(b"world")).unwrap();
         drop(tx);
         writer.join().unwrap().unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"hello world");

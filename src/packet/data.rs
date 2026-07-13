@@ -1,5 +1,7 @@
 //! Data packet: wire layout per docs/spec/packets.md.
 
+use bytes::Bytes;
+
 use super::{
     put_u32,
     read_u32,
@@ -77,7 +79,9 @@ pub struct DataPacket {
     pub msg_number: MsgNumber,
     pub timestamp: Timestamp,
     pub dst_socket_id: SocketId,
-    pub payload: Vec<u8>,
+    /// Wire payload. Refcounted: cloning is O(1), so the send buffer and
+    /// the outgoing packet share one allocation.
+    pub payload: Bytes,
 }
 
 impl DataPacket {
@@ -106,7 +110,7 @@ impl DataPacket {
             msg_number: MsgNumber::new(word1 & MsgNumber::MASK),
             timestamp: Timestamp(read_u32(buf, 8)),
             dst_socket_id: SocketId(read_u32(buf, 12)),
-            payload: buf[Self::HEADER_SIZE ..].to_vec(),
+            payload: Bytes::copy_from_slice(&buf[Self::HEADER_SIZE ..]),
         })
     }
 
@@ -141,7 +145,7 @@ mod tests {
             msg_number: MsgNumber::new(5),
             timestamp: Timestamp(0x0000_0100),
             dst_socket_id: SocketId(0x0000_00AB),
-            payload: vec![0xDE, 0xAD],
+            payload: Bytes::from_static(&[0xDE, 0xAD]),
         }
     }
 
@@ -241,13 +245,23 @@ mod tests {
     #[test]
     fn empty_payload_round_trip() {
         let p = DataPacket {
-            payload: Vec::new(),
+            payload: Bytes::new(),
             ..sample()
         };
         let mut out = Vec::new();
         p.encode(&mut out);
         assert_eq!(out.len(), 16);
         assert_eq!(DataPacket::parse(&out).unwrap(), p);
+    }
+
+    #[test]
+    fn parsed_payload_is_unique_and_mutable_without_copy() {
+        // The connection layer decrypts in place via Bytes::try_into_mut
+        // (zero-copy only while the parsed payload stays unique & vec-backed).
+        let mut buf = Vec::new();
+        sample().encode(&mut buf);
+        let p = DataPacket::parse(&buf).unwrap();
+        assert!(p.payload.try_into_mut().is_ok());
     }
 
     #[test]
@@ -259,7 +273,7 @@ mod tests {
     #[test]
     fn max_payload_round_trip() {
         let p = DataPacket {
-            payload: vec![0x47; 1456],
+            payload: vec![0x47; 1456].into(),
             ..sample()
         };
         let mut out = Vec::new();

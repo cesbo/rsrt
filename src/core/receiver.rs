@@ -32,6 +32,7 @@ use std::{
     },
 };
 
+use bytes::Bytes;
 use tracing::{
     debug,
     error,
@@ -139,7 +140,7 @@ struct Anchor {
 
 /// One buffered, not-yet-delivered data packet.
 struct Slot {
-    payload: Vec<u8>,
+    payload: Bytes,
     msg_number: MsgNumber,
     /// Extended peer timestamp; the TSBPD release deadline (anchor +
     /// timestamp delta + latency + drift correction) is computed from it on
@@ -602,7 +603,7 @@ impl Receiver {
     /// order. Skips over lost packets once their deadline passes, and
     /// frees undecryptable packets at their play time without delivering
     /// them (encryption.md §9.4).
-    pub fn poll_deliver(&mut self, now: Instant) -> Option<Vec<u8>> {
+    pub fn poll_deliver(&mut self, now: Instant) -> Option<Bytes> {
         let anchor = self.anchor?;
         loop {
             let first = match self
@@ -929,7 +930,7 @@ mod tests {
             msg_number: MsgNumber::new(1),
             timestamp: Timestamp(ts_us),
             dst_socket_id: SocketId(1),
-            payload: vec![seq as u8],
+            payload: vec![seq as u8].into(),
         }
     }
 
@@ -986,7 +987,7 @@ mod tests {
         r.handle_data(t0, data(ISN, 0));
         assert_eq!(r.poll_deliver(t0), None);
         assert_eq!(r.poll_deliver(t0 + LATENCY - us(1)), None);
-        assert_eq!(r.poll_deliver(t0 + LATENCY), Some(vec![ISN as u8]));
+        assert_eq!(r.poll_deliver(t0 + LATENCY), Some(vec![ISN as u8].into()));
         assert_eq!(r.poll_deliver(t0 + LATENCY), None);
 
         // Second packet stamped 20 ms later on the peer clock: releases
@@ -995,7 +996,7 @@ mod tests {
         assert_eq!(r.poll_deliver(t0 + LATENCY + ms(20) - us(1)), None);
         assert_eq!(
             r.poll_deliver(t0 + LATENCY + ms(20)),
-            Some(vec![(ISN + 1) as u8])
+            Some(vec![(ISN + 1) as u8].into())
         );
     }
 
@@ -1007,7 +1008,7 @@ mod tests {
         let t0 = Instant::now();
         let mut r = rx(t0);
         r.handle_data(t0, data(ISN, 0));
-        assert_eq!(r.poll_deliver(t0 + LATENCY), Some(vec![ISN as u8]));
+        assert_eq!(r.poll_deliver(t0 + LATENCY), Some(vec![ISN as u8].into()));
         // Hole at ISN+1..=ISN+2, occupied at ISN+3 (offset 2).
         r.handle_data(t0 + us(300), data(ISN + 3, 300));
         // Nothing due yet: this poll walks to offset 2 and caches it.
@@ -1016,7 +1017,7 @@ mod tests {
         r.handle_data(t0 + us(500), rexmit(ISN + 1, 100));
         assert_eq!(
             r.poll_deliver(t0 + LATENCY + us(100)),
-            Some(vec![(ISN + 1) as u8])
+            Some(vec![(ISN + 1) as u8].into())
         );
         // …and next_deadline tracks the front slot (ISN+2 still missing,
         // ISN+3 due at anchor + 300 µs + latency).
@@ -1024,7 +1025,7 @@ mod tests {
         assert!(!ctl.is_empty()); // NAKs for the holes were emitted
         assert_eq!(
             r.poll_deliver(t0 + LATENCY + us(300)),
-            Some(vec![(ISN + 3) as u8])
+            Some(vec![(ISN + 3) as u8].into())
         );
     }
 
@@ -1042,7 +1043,10 @@ mod tests {
         // every deadline for the rest of the connection.
         r.handle_data(t0 + ms(50), data(ISN, 10_000));
         assert_eq!(r.poll_deliver(t0 + LATENCY + ms(10) - us(1)), None);
-        assert_eq!(r.poll_deliver(t0 + LATENCY + ms(10)), Some(vec![ISN as u8]));
+        assert_eq!(
+            r.poll_deliver(t0 + LATENCY + ms(10)),
+            Some(vec![ISN as u8].into())
+        );
     }
 
     #[test]
@@ -1055,7 +1059,10 @@ mod tests {
         r.set_hs_anchor(t0 + ms(500), Timestamp(400_000));
         r.handle_data(t0 + ms(5), data(ISN, 1_000));
         assert_eq!(r.poll_deliver(t0 + LATENCY + ms(1) - us(1)), None);
-        assert_eq!(r.poll_deliver(t0 + LATENCY + ms(1)), Some(vec![ISN as u8]));
+        assert_eq!(
+            r.poll_deliver(t0 + LATENCY + ms(1)),
+            Some(vec![ISN as u8].into())
+        );
 
         // Once data has already anchored the time base (no seed at
         // establishment), a late seed is ignored too.
@@ -1063,7 +1070,7 @@ mod tests {
         r.handle_data(t0, data(ISN, 0));
         r.set_hs_anchor(t0 + ms(1), Timestamp(7_000));
         assert_eq!(r.poll_deliver(t0 + LATENCY - us(1)), None);
-        assert_eq!(r.poll_deliver(t0 + LATENCY), Some(vec![ISN as u8]));
+        assert_eq!(r.poll_deliver(t0 + LATENCY), Some(vec![ISN as u8].into()));
     }
 
     #[test]
@@ -1075,7 +1082,10 @@ mod tests {
         r.set_hs_anchor(t0, Timestamp(ts0));
         r.handle_data(t0 + ms(20), data(ISN, ts0.wrapping_add(20_000)));
         assert_eq!(r.poll_deliver(t0 + LATENCY + ms(20) - us(1)), None);
-        assert_eq!(r.poll_deliver(t0 + LATENCY + ms(20)), Some(vec![ISN as u8]));
+        assert_eq!(
+            r.poll_deliver(t0 + LATENCY + ms(20)),
+            Some(vec![ISN as u8].into())
+        );
     }
 
     #[test]
@@ -1087,14 +1097,14 @@ mod tests {
         // The hole is repaired (plain reordering) well before any deadline.
         r.handle_data(t0 + ms(3), data(ISN + 1, 1_000));
 
-        assert_eq!(r.poll_deliver(t0 + LATENCY), Some(vec![ISN as u8]));
+        assert_eq!(r.poll_deliver(t0 + LATENCY), Some(vec![ISN as u8].into()));
         assert_eq!(
             r.poll_deliver(t0 + LATENCY + ms(1)),
-            Some(vec![(ISN + 1) as u8])
+            Some(vec![(ISN + 1) as u8].into())
         );
         assert_eq!(
             r.poll_deliver(t0 + LATENCY + ms(2)),
-            Some(vec![(ISN + 2) as u8])
+            Some(vec![(ISN + 2) as u8].into())
         );
         assert_eq!(r.stats().pkts_dropped, 0);
         // The loss list is clean: the next full ACK covers everything.
@@ -1111,12 +1121,12 @@ mod tests {
         r.handle_data(t0 + ms(1), data(ISN + 3, 3_000)); // hole: ISN+1, ISN+2
         drain(&mut r, t0 + ms(1)); // discard the immediate NAK
 
-        assert_eq!(r.poll_deliver(t0 + LATENCY), Some(vec![ISN as u8]));
+        assert_eq!(r.poll_deliver(t0 + LATENCY), Some(vec![ISN as u8].into()));
         // ISN+3's deadline is t0 + 123 ms; the hole holds delivery until then.
         assert_eq!(r.poll_deliver(t0 + LATENCY + ms(3) - us(1)), None);
         assert_eq!(
             r.poll_deliver(t0 + LATENCY + ms(3)),
-            Some(vec![(ISN + 3) as u8])
+            Some(vec![(ISN + 3) as u8].into())
         );
         assert_eq!(r.stats().pkts_dropped, 2);
         // The skipped range left the loss list: no periodic NAK, ACK advances.
@@ -1131,7 +1141,7 @@ mod tests {
         let t0 = Instant::now();
         let mut r = rx(t0);
         r.handle_data(t0, data(ISN, 0));
-        assert_eq!(r.poll_deliver(t0 + LATENCY), Some(vec![ISN as u8]));
+        assert_eq!(r.poll_deliver(t0 + LATENCY), Some(vec![ISN as u8].into()));
 
         r.handle_data(t0 + LATENCY + ms(1), data(ISN, 0));
         assert_eq!(r.stats().pkts_belated, 1);
@@ -1146,7 +1156,7 @@ mod tests {
         r.handle_data(t0 + ms(1), data(ISN, 0)); // still buffered → duplicate
         assert_eq!(r.stats().pkts_recv, 2);
         assert_eq!(r.stats().pkts_belated, 0);
-        assert_eq!(r.poll_deliver(t0 + LATENCY), Some(vec![ISN as u8]));
+        assert_eq!(r.poll_deliver(t0 + LATENCY), Some(vec![ISN as u8].into()));
         assert_eq!(r.poll_deliver(t0 + LATENCY), None);
     }
 
@@ -1189,7 +1199,7 @@ mod tests {
         );
         // Deliver and fully drain the buffer.
         r.handle_data(t0, data(ISN, 0));
-        assert_eq!(r.poll_deliver(t0 + LATENCY), Some(vec![ISN as u8]));
+        assert_eq!(r.poll_deliver(t0 + LATENCY), Some(vec![ISN as u8].into()));
         assert!(!r.sequence_discrepancy());
 
         // "Outage": the sender's sequence advanced ≥ buffer capacity while
@@ -1293,15 +1303,15 @@ mod tests {
         assert_eq!(acks(&ctl)[0].1.last_ack_seq, SeqNumber::new(ISN + 3));
 
         // Delivery in order, each exactly at its original-timestamp deadline.
-        assert_eq!(r.poll_deliver(t0 + LATENCY), Some(vec![ISN as u8]));
+        assert_eq!(r.poll_deliver(t0 + LATENCY), Some(vec![ISN as u8].into()));
         assert_eq!(r.poll_deliver(t0 + LATENCY + ms(1) - us(1)), None);
         assert_eq!(
             r.poll_deliver(t0 + LATENCY + ms(1)),
-            Some(vec![(ISN + 1) as u8])
+            Some(vec![(ISN + 1) as u8].into())
         );
         assert_eq!(
             r.poll_deliver(t0 + LATENCY + ms(2)),
-            Some(vec![(ISN + 2) as u8])
+            Some(vec![(ISN + 2) as u8].into())
         );
         assert_eq!(r.stats().pkts_dropped, 0);
 
@@ -1566,7 +1576,7 @@ mod tests {
     }
 
     /// Releases everything due at `t` and returns the last payload.
-    fn drain_due(r: &mut Receiver, t: Instant) -> Option<Vec<u8>> {
+    fn drain_due(r: &mut Receiver, t: Instant) -> Option<Bytes> {
         let mut last = None;
         while let Some(p) = r.poll_deliver(t) {
             last = Some(p);
@@ -1579,8 +1589,12 @@ mod tests {
     /// and draining at the deadline yields precisely this packet.
     fn assert_released_at(r: &mut Receiver, deadline: Instant, byte: u8) {
         let before = drain_due(r, deadline - us(1));
-        assert_ne!(before, Some(vec![byte]), "released before its deadline");
-        assert_eq!(drain_due(r, deadline), Some(vec![byte]));
+        assert_ne!(
+            before,
+            Some(vec![byte].into()),
+            "released before its deadline"
+        );
+        assert_eq!(drain_due(r, deadline), Some(vec![byte].into()));
     }
 
     /// 999 samples are not a batch: deadlines still follow the raw (skewed)
@@ -1816,11 +1830,11 @@ mod tests {
             SeqNumber::new(ISN + 1),
         );
 
-        assert_eq!(r.poll_deliver(t0 + LATENCY), Some(vec![ISN as u8]));
+        assert_eq!(r.poll_deliver(t0 + LATENCY), Some(vec![ISN as u8].into()));
         // ISN+1 was dropped: at ISN+2's deadline the hole is skipped.
         assert_eq!(
             r.poll_deliver(t0 + LATENCY + ms(2)),
-            Some(vec![(ISN + 2) as u8])
+            Some(vec![(ISN + 2) as u8].into())
         );
         assert_eq!(r.stats().pkts_dropped, 1);
     }
@@ -1843,16 +1857,16 @@ mod tests {
         r.handle_data(t0 + ms(40), data(ISN + 2, ts2));
 
         assert_eq!(r.poll_deliver(t0 + LATENCY - us(1)), None);
-        assert_eq!(r.poll_deliver(t0 + LATENCY), Some(vec![ISN as u8]));
+        assert_eq!(r.poll_deliver(t0 + LATENCY), Some(vec![ISN as u8].into()));
         assert_eq!(r.poll_deliver(t0 + LATENCY + ms(20) - us(1)), None);
         assert_eq!(
             r.poll_deliver(t0 + LATENCY + ms(20)),
-            Some(vec![(ISN + 1) as u8])
+            Some(vec![(ISN + 1) as u8].into())
         );
         assert_eq!(r.poll_deliver(t0 + LATENCY + ms(40) - us(1)), None);
         assert_eq!(
             r.poll_deliver(t0 + LATENCY + ms(40)),
-            Some(vec![(ISN + 2) as u8])
+            Some(vec![(ISN + 2) as u8].into())
         );
         assert_eq!(r.stats().pkts_dropped, 0);
         assert_eq!(r.stats().pkts_belated, 0);
@@ -1879,7 +1893,7 @@ mod tests {
         for (i, s) in seqs.iter().enumerate() {
             assert_eq!(
                 r.poll_deliver(t0 + LATENCY + ms(i as u64)),
-                Some(vec![*s as u8]),
+                Some(vec![*s as u8].into()),
                 "packet {i}"
             );
         }
@@ -1964,11 +1978,11 @@ mod tests {
 
         // ISN delivers on time; ISN+1 is freed (never delivered) at its
         // own deadline; ISN+2 still delivers exactly at its deadline.
-        assert_eq!(r.poll_deliver(t0 + LATENCY), Some(vec![ISN as u8]));
+        assert_eq!(r.poll_deliver(t0 + LATENCY), Some(vec![ISN as u8].into()));
         assert_eq!(r.poll_deliver(t0 + LATENCY + ms(1)), None);
         assert_eq!(
             r.poll_deliver(t0 + LATENCY + ms(2)),
-            Some(vec![(ISN + 2) as u8])
+            Some(vec![(ISN + 2) as u8].into())
         );
         assert_eq!(r.undecrypted_count(), 1);
         assert_eq!(r.stats().pkts_dropped, 1); // folded into the drop count
@@ -2114,8 +2128,8 @@ mod tests {
         // Delivery: ISN and ISN+2 only; the filled-but-undecryptable slot
         // is freed as a drop in the same scan.
         let t = t0 + ms(700);
-        assert_eq!(r.poll_deliver(t), Some(vec![ISN as u8]));
-        assert_eq!(r.poll_deliver(t), Some(vec![(ISN + 2) as u8]));
+        assert_eq!(r.poll_deliver(t), Some(vec![ISN as u8].into()));
+        assert_eq!(r.poll_deliver(t), Some(vec![(ISN + 2) as u8].into()));
         assert_eq!(r.poll_deliver(t), None);
         assert_eq!(r.stats().pkts_dropped, 1);
     }
@@ -2146,7 +2160,7 @@ mod tests {
 
         // Delivery: ISN, then the two-hole gap and the undecryptable
         // packet are all skipped in one scan at its play time.
-        assert_eq!(r.poll_deliver(t0 + LATENCY), Some(vec![ISN as u8]));
+        assert_eq!(r.poll_deliver(t0 + LATENCY), Some(vec![ISN as u8].into()));
         assert_eq!(r.poll_deliver(t0 + LATENCY + ms(3)), None);
         assert_eq!(r.stats().pkts_dropped, 3);
         assert_eq!(r.undecrypted_count(), 1);

@@ -34,6 +34,8 @@ use std::{
     },
 };
 
+use bytes::Bytes;
+
 use crate::{
     core::{
         ConnState,
@@ -240,7 +242,7 @@ struct Sim {
     /// listener → caller.
     to_caller: Link,
     /// Payloads delivered to the listener application.
-    listener_rx: Vec<(Instant, Vec<u8>)>,
+    listener_rx: Vec<(Instant, Bytes)>,
 }
 
 impl Sim {
@@ -399,7 +401,7 @@ fn payload_index(data: &[u8]) -> u32 {
 
 /// Asserts `rx` is exactly payloads `0..count`, in order — i.e. every one
 /// of them decrypted back to the original bytes.
-fn assert_contiguous(rx: &[(Instant, Vec<u8>)], count: u32) {
+fn assert_contiguous(rx: &[(Instant, Bytes)], count: u32) {
     assert_eq!(
         rx.len(),
         count as usize,

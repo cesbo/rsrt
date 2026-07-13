@@ -37,12 +37,15 @@ Support files: `src/error.rs` (`SrtError`), `src/options.rs` (`SrtOptions`),
 `src/lib.rs` (re-exports only). Layers 1–3 (`packet`, `crypto`, `core`) are
 crate-private; the only public surface is the root re-exports in `src/lib.rs`
 (`SrtSocket`, `SrtListener`, `SrtOptions`, `Bandwidth`, `SrtError`,
-`CloseReason`, `Stats`, `KeyLength`).
+`CloseReason`, `Stats`, `KeyLength`, plus `Bytes` re-exported from the
+`bytes` crate).
 
 ### Layer 1 — packet codec (`src/packet/`)
 
 Pure functions and types; **no I/O, no `Instant`, no allocation-free ambition**
-(payloads are `Vec<u8>`). Everything round-trips: `parse(encode(p)) == p`.
+(payloads are refcounted `bytes::Bytes` — the send buffer and every
+(re)transmission share one allocation). Everything round-trips:
+`parse(encode(p)) == p`.
 
 - `types.rs` — `SeqNumber` (31-bit, wrapping), `MsgNumber` (26-bit, wrapping),
   `SocketId`, `Timestamp` (u32 µs since socket start). Wrap-aware arithmetic
@@ -126,7 +129,7 @@ This makes every protocol rule unit-testable with a fake clock.
   - inputs: `handle_packet(now, pkt)`, `handle_timer(now)`, `send(now, &[u8])`,
     `close(now)`
   - outputs: `poll_transmit() -> Option<Packet>` (drain queue),
-    `poll_deliver(now) -> Option<Vec<u8>>` (TSBPD-released payloads),
+    `poll_deliver(now) -> Option<Bytes>` (TSBPD-released payloads),
   - scheduling: `next_deadline(now) -> Option<Instant>` (min over all timers).
 
 ### Layer 4 — runtime (`src/socket.rs`, `src/listener.rs`)
@@ -142,7 +145,7 @@ select! {
 then: drain poll_transmit -> socket.send_to, drain poll_deliver -> data mpsc
 ```
 
-- `SrtSocket` — public handle: `connect(addr, opts)`, `async recv() -> Result<Vec<u8>>`
+- `SrtSocket` — public handle: `connect(addr, opts)`, `async recv() -> Result<Option<Bytes>>`
   (one SRT message, e.g. up to 1456 bytes), `async send(&[u8])`, `stats()`,
   `streamid()`, `close()`. Cloning/splitting not required in v0.
 - `SrtListener` — public handle: `bind(addr, opts)`, `async accept() ->

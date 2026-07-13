@@ -41,6 +41,7 @@ use std::{
     },
 };
 
+use bytes::Bytes;
 use tokio::{
     net::{
         ToSocketAddrs,
@@ -155,7 +156,7 @@ pub(crate) struct DriverState {
     pub conn: Connection,
     pub io: DriverIo,
     pub cmd_rx: mpsc::Receiver<Cmd>,
-    pub data_tx: mpsc::Sender<Vec<u8>>,
+    pub data_tx: mpsc::Sender<Bytes>,
     pub stats: Arc<Mutex<Stats>>,
     pub close_reason: Arc<Mutex<Option<CloseReason>>>,
     /// Caller mode: signalled once on establishment (Ok) or terminal
@@ -320,7 +321,7 @@ async fn drive(state: DriverState) {
 /// Forwards one released payload to the handle. Never blocks the driver:
 /// an application that stopped reading loses data (live semantics), not
 /// protocol liveness.
-fn deliver(data_tx: &mpsc::Sender<Vec<u8>>, payload: Vec<u8>) {
+fn deliver(data_tx: &mpsc::Sender<Bytes>, payload: Bytes) {
     match data_tx.try_send(payload) {
         Ok(()) => {}
         Err(mpsc::error::TrySendError::Full(_)) => {
@@ -361,7 +362,7 @@ fn connect_error(reason: CloseReason) -> SrtError {
 /// Dropping the handle closes the connection (the driver sends SHUTDOWN).
 pub struct SrtSocket {
     cmd_tx: mpsc::Sender<Cmd>,
-    data_rx: mpsc::Receiver<Vec<u8>>,
+    data_rx: mpsc::Receiver<Bytes>,
     stats: Arc<Mutex<Stats>>,
     close_reason: Arc<Mutex<Option<CloseReason>>>,
     driver: Option<JoinHandle<()>>,
@@ -431,11 +432,14 @@ impl SrtSocket {
 
     /// Receives the next data message in TSBPD order.
     ///
+    /// The returned payload is a [`bytes::Bytes`]: cheap to clone and
+    /// slice (refcounted, no copy).
+    ///
     /// `Ok(None)` = clean end of stream (peer SHUTDOWN or local close);
     /// other terminations surface as [`SrtError::Closed`].
     ///
     /// Cancel-safe: no message is lost if the future is dropped.
-    pub async fn recv(&mut self) -> Result<Option<Vec<u8>>, SrtError> {
+    pub async fn recv(&mut self) -> Result<Option<Bytes>, SrtError> {
         match self.data_rx.recv().await {
             Some(payload) => Ok(Some(payload)),
             // The driver always records the reason before finishing; a
@@ -631,12 +635,12 @@ mod tests {
     #[test]
     fn deliver_drops_on_full_without_blocking() {
         let (tx, mut rx) = mpsc::channel(1);
-        deliver(&tx, vec![1]);
-        deliver(&tx, vec![2]); // dropped, must not panic or block
+        deliver(&tx, vec![1].into());
+        deliver(&tx, vec![2].into()); // dropped, must not panic or block
         assert_eq!(rx.try_recv().unwrap(), vec![1]);
         assert!(rx.try_recv().is_err());
         drop(rx);
-        deliver(&tx, vec![3]); // closed, must not panic
+        deliver(&tx, vec![3].into()); // closed, must not panic
     }
 
     /// The driver senses a dropped handle and closes the connection even
@@ -720,8 +724,8 @@ mod tests {
         let r = tokio::time::timeout(Duration::from_secs(5), socket.recv())
             .await
             .expect("recv timed out");
-        assert_eq!(r.unwrap(), Some(b"one".to_vec()));
-        assert_eq!(socket.recv().await.unwrap(), Some(b"two".to_vec()));
+        assert_eq!(r.unwrap(), Some(Bytes::from_static(b"one")));
+        assert_eq!(socket.recv().await.unwrap(), Some(Bytes::from_static(b"two")));
         assert_eq!(socket.recv().await.unwrap(), None, "clean EOF after drain");
     }
 

@@ -12,6 +12,7 @@ use std::{
 };
 
 use rsrt::{
+    Bytes,
     CloseReason,
     SrtError,
     SrtListener,
@@ -239,7 +240,7 @@ async fn clean_close_yields_none_after_drain() {
     let run = async {
         for i in 0 .. COUNT {
             let payload = accepted.recv().await.expect("recv");
-            assert_eq!(payload, Some(message(i, 100)), "message {i}");
+            assert_eq!(payload, Some(Bytes::from(message(i, 100))), "message {i}");
         }
         // Peer SHUTDOWN is a clean end of stream, not an error.
         assert_eq!(accepted.recv().await.expect("recv after close"), None);

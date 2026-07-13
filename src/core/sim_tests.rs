@@ -28,17 +28,19 @@ use std::{
     },
 };
 
+use bytes::Bytes;
+
 use crate::{
     core::{
+        pacing::{
+            with_overhead,
+            BW_INFINITE,
+        },
         ConnState,
         Connection,
         Listener,
         ListenerAction,
         Timebase,
-        pacing::{
-            BW_INFINITE,
-            with_overhead,
-        },
     },
     packet::{
         ControlPacket,
@@ -235,8 +237,8 @@ struct Sim {
     /// listener → caller.
     to_caller: Link,
     /// Payloads delivered to each application, with delivery instants.
-    caller_rx: Vec<(Instant, Vec<u8>)>,
-    listener_rx: Vec<(Instant, Vec<u8>)>,
+    caller_rx: Vec<(Instant, Bytes)>,
+    listener_rx: Vec<(Instant, Bytes)>,
 }
 
 impl Sim {
@@ -391,12 +393,9 @@ impl Sim {
                         self.listener_opts.clone(),
                         tb,
                     ),
-                    None => Connection::accepted(
-                        l_now,
-                        *negotiated,
-                        reply,
-                        self.listener_opts.clone(),
-                    ),
+                    None => {
+                        Connection::accepted(l_now, *negotiated, reply, self.listener_opts.clone())
+                    }
                 };
                 self.accepted = Some(conn);
             }
@@ -452,7 +451,7 @@ fn payload_index(data: &[u8], tag: u8) -> u32 {
 }
 
 /// Asserts `rx` is exactly payloads `0..count` of `tag`, in order.
-fn assert_contiguous(rx: &[(Instant, Vec<u8>)], tag: u8, count: u32) {
+fn assert_contiguous(rx: &[(Instant, Bytes)], tag: u8, count: u32) {
     assert!(
         rx.len() >= count as usize,
         "only {} of {count} payloads delivered (tag {tag:#x})",
@@ -828,10 +827,7 @@ fn data_idle_closes_silent_sender_shutdown_crosses() {
 
     // The caller, alive on keepalives alone, sees a clean SHUTDOWN.
     sim.run_for(50);
-    assert_eq!(
-        sim.caller.state(),
-        ConnState::Closed(CloseReason::Shutdown)
-    );
+    assert_eq!(sim.caller.state(), ConnState::Closed(CloseReason::Shutdown));
 }
 
 /// Long-run wrap: the shared timebase starts ~71 minutes in the fake past,
@@ -1059,7 +1055,9 @@ fn paced_sender_holds_configured_rate() {
     let latency = Duration::from_millis(3_000);
     let copts = SrtOptions::default()
         .latency(latency)
-        .bandwidth(Bandwidth::Max { bytes_per_sec: 200_000 });
+        .bandwidth(Bandwidth::Max {
+            bytes_per_sec: 200_000,
+        });
     let lopts = SrtOptions::default().latency(latency);
     let mut sim = Sim::new(t0, copts, lopts, 0x9ACE);
     sim.run_until(100, "handshake", Sim::both_established);
@@ -1084,7 +1082,10 @@ fn paced_sender_holds_configured_rate() {
 
     let st = sim.caller.stats();
     assert_eq!(st.snd_max_bw, 200_000, "a fixed ceiling must never move");
-    assert_eq!(st.snd_period_us, 6_800, "period must match the §3.3.1 formula");
+    assert_eq!(
+        st.snd_period_us, 6_800,
+        "period must match the §3.3.1 formula"
+    );
     assert_eq!(st.snd_input_rate, 0, "Max mode never runs the estimator");
     for (n, w) in marks.windows(2).enumerate() {
         let sent = w[1] - w[0];
@@ -1103,8 +1104,14 @@ fn paced_sender_holds_configured_rate() {
     assert_eq!(sim.listener_rx.len(), i as usize);
     let cs = sim.caller.stats();
     let ls = sim.accepted_mut().stats();
-    assert_eq!(cs.pkts_send_dropped, 0, "backlog must fit the latency budget");
-    assert_eq!(ls.pkts_recv_dropped, 0, "paced packets must beat their deadlines");
+    assert_eq!(
+        cs.pkts_send_dropped, 0,
+        "backlog must fit the latency budget"
+    );
+    assert_eq!(
+        ls.pkts_recv_dropped, 0,
+        "paced packets must beat their deadlines"
+    );
     assert_eq!(cs.pkts_retransmitted, 0, "clean link needs no rexmits");
 }
 
@@ -1121,7 +1128,10 @@ fn estimated_rate_with_overhead_drains_backlog_paced() {
     let latency = Duration::from_millis(400);
     let copts = SrtOptions::default()
         .latency(latency)
-        .bandwidth(Bandwidth::Estimated { min_bytes_per_sec: 0, overhead_pct: 25 });
+        .bandwidth(Bandwidth::Estimated {
+            min_bytes_per_sec: 0,
+            overhead_pct: 25,
+        });
     let lopts = SrtOptions::default().latency(latency);
     let mut sim = Sim::new(t0, copts, lopts, 0xE571);
     sim.run_until(100, "handshake", Sim::both_established);
@@ -1154,7 +1164,10 @@ fn estimated_rate_with_overhead_drains_backlog_paced() {
         with_overhead(136_000, 25),
         "ceiling must be withOverhead(measured) = 170_000"
     );
-    assert_eq!(st.snd_period_us, 8_000, "period = trunc(1e6·(1316+44)/170_000)");
+    assert_eq!(
+        st.snd_period_us, 8_000,
+        "period = trunc(1e6·(1316+44)/170_000)"
+    );
 
     // Outage shorter than every drop budget: ~25 in-flight packets die on
     // the wire and the feed keeps going.
@@ -1190,10 +1203,19 @@ fn estimated_rate_with_overhead_drains_backlog_paced() {
     assert_contiguous(&sim.listener_rx, 0xA, i);
     let cs = sim.caller.stats();
     let ls = sim.accepted_mut().stats();
-    assert!(cs.pkts_retransmitted > 0, "the outage must have cost rexmits");
+    assert!(
+        cs.pkts_retransmitted > 0,
+        "the outage must have cost rexmits"
+    );
     assert!(sim.to_caller.naks > 0, "recovery must be NAK-driven");
-    assert_eq!(cs.pkts_send_dropped, 0, "backlog sized inside the drop budget");
-    assert_eq!(ls.pkts_recv_dropped, 0, "every rexmit must beat its deadline");
+    assert_eq!(
+        cs.pkts_send_dropped, 0,
+        "backlog sized inside the drop budget"
+    );
+    assert_eq!(
+        ls.pkts_recv_dropped, 0,
+        "every rexmit must beat its deadline"
+    );
 }
 
 /// `Bandwidth::Estimated` before the first 500 ms estimator window closes:
@@ -1203,8 +1225,10 @@ fn estimated_rate_with_overhead_drains_backlog_paced() {
 #[test]
 fn estimated_grace_is_unpaced_before_first_window() {
     let t0 = Instant::now();
-    let copts = SrtOptions::default()
-        .bandwidth(Bandwidth::Estimated { min_bytes_per_sec: 0, overhead_pct: 25 });
+    let copts = SrtOptions::default().bandwidth(Bandwidth::Estimated {
+        min_bytes_per_sec: 0,
+        overhead_pct: 25,
+    });
     let mut sim = Sim::new(t0, copts, SrtOptions::default(), 0x62ACE);
     sim.run_until(100, "handshake", Sim::both_established);
 
@@ -1225,7 +1249,10 @@ fn estimated_grace_is_unpaced_before_first_window() {
 
     sim.run_for(300);
     let st = sim.caller.stats();
-    assert_eq!(st.snd_input_rate, 0, "no estimator window closed within 500 ms");
+    assert_eq!(
+        st.snd_input_rate, 0,
+        "no estimator window closed within 500 ms"
+    );
     assert_eq!(
         st.snd_max_bw,
         with_overhead(BW_INFINITE, 25),
@@ -1279,7 +1306,9 @@ fn pacing_with_loss_keeps_arq_alive() {
     let latency = Duration::from_millis(400);
     let copts = SrtOptions::default()
         .latency(latency)
-        .bandwidth(Bandwidth::Max { bytes_per_sec: 180_000 });
+        .bandwidth(Bandwidth::Max {
+            bytes_per_sec: 180_000,
+        });
     let lopts = SrtOptions::default().latency(latency);
     let mut sim = Sim::new(t0, copts, lopts, 0xA21F);
     sim.to_listener.loss_pct = 5;

@@ -11,6 +11,7 @@ use std::{
 };
 
 use rsrt::{
+    Bytes,
     KeyLength,
     SrtError,
     SrtListener,
@@ -162,7 +163,7 @@ async fn wrong_passphrase_rejected_listener_keeps_serving() {
         caller.send(b"still serving").await.expect("send");
         assert_eq!(
             accepted.recv().await.expect("recv"),
-            Some(b"still serving".to_vec())
+            Some(Bytes::from_static(b"still serving"))
         );
         caller.close().await.expect("caller close");
         accepted.close().await.expect("accepted close");
@@ -206,13 +207,10 @@ async fn encrypted_caller_rejected_by_plain_listener() {
         let listener = SrtListener::bind("127.0.0.1:0", SrtOptions::default())
             .await
             .expect("listener bind");
-        let err = SrtSocket::connect(
-            listener.local_addr(),
-            SrtOptions::default().passphrase(PW),
-        )
-        .await
-        .err()
-        .expect("encrypted caller must not connect to a plain listener");
+        let err = SrtSocket::connect(listener.local_addr(), SrtOptions::default().passphrase(PW))
+            .await
+            .err()
+            .expect("encrypted caller must not connect to a plain listener");
         assert!(matches!(err, SrtError::EncryptionUnsupported), "{err:?}");
     };
     tokio::time::timeout(Duration::from_secs(9), run)

@@ -44,6 +44,8 @@ mod options;
 mod packet;
 mod socket;
 
+pub use bytes::Bytes;
+
 pub use self::{
     core::Stats,
     crypto::KeyLength,

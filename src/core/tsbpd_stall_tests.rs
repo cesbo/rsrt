@@ -61,7 +61,7 @@ fn data(seq: u32, ts_us: u32) -> DataPacket {
         msg_number: MsgNumber::new(1),
         timestamp: Timestamp(ts_us),
         dst_socket_id: SocketId(1),
-        payload: vec![seq as u8],
+        payload: vec![seq as u8].into(),
     }
 }
 
@@ -77,7 +77,7 @@ fn post_stall_packet_held_full_latency() {
     let mut r = rx(t0);
 
     r.handle_data(t0, data(ISN, 0));
-    assert_eq!(r.poll_deliver(t0 + LATENCY), Some(vec![ISN as u8]));
+    assert_eq!(r.poll_deliver(t0 + LATENCY), Some(vec![ISN as u8].into()));
 
     // Source stalls for 45 min (keepalives, which never reach the receiver's
     // extender, hold the connection up), then resumes.
@@ -90,7 +90,7 @@ fn post_stall_packet_held_full_latency() {
     assert_eq!(r.poll_deliver(resume + LATENCY - us(1)), None);
     assert_eq!(
         r.poll_deliver(resume + LATENCY),
-        Some(vec![(ISN + 1) as u8])
+        Some(vec![(ISN + 1) as u8].into())
     );
     assert_eq!(r.stats().pkts_dropped, 0);
 }
@@ -103,7 +103,7 @@ fn post_stall_hole_survives_until_real_deadline() {
     let mut r = rx(t0);
 
     r.handle_data(t0, data(ISN, 0));
-    assert_eq!(r.poll_deliver(t0 + LATENCY), Some(vec![ISN as u8]));
+    assert_eq!(r.poll_deliver(t0 + LATENCY), Some(vec![ISN as u8].into()));
 
     // Post-stall burst arrives with its first packet (ISN+1) lost in
     // transit: ISN+2 creates the hole and triggers an immediate NAK.
@@ -133,12 +133,12 @@ fn post_stall_hole_survives_until_real_deadline() {
     assert_eq!(r.poll_deliver(resume + LATENCY - us(1)), None);
     assert_eq!(
         r.poll_deliver(resume + LATENCY),
-        Some(vec![(ISN + 1) as u8])
+        Some(vec![(ISN + 1) as u8].into())
     );
     assert_eq!(r.poll_deliver(resume + LATENCY + us(999)), None);
     assert_eq!(
         r.poll_deliver(resume + LATENCY + us(1_000)),
-        Some(vec![(ISN + 2) as u8])
+        Some(vec![(ISN + 2) as u8].into())
     );
     assert_eq!(r.stats().pkts_dropped, 0);
 }

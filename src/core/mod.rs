@@ -35,6 +35,10 @@ use std::{
     },
 };
 
+use bytes::{
+    Bytes,
+    BytesMut,
+};
 use tracing::{
     debug,
     trace,
@@ -530,7 +534,7 @@ impl Connection {
     }
 
     /// Next in-order payload released by TSBPD.
-    pub fn poll_deliver(&mut self, now: Instant) -> Option<Vec<u8>> {
+    pub fn poll_deliver(&mut self, now: Instant) -> Option<Bytes> {
         match &mut self.state {
             State::Established { receiver, .. } => receiver.poll_deliver(now),
             // Data received before a close may still drain (§11).
@@ -1021,14 +1025,11 @@ fn transmission_pair(
     (sender, receiver)
 }
 
-/// Feeds one data packet to the receiver through the decrypt step
-/// (docs/spec/encryption.md §9.4). KK = None passes through untouched —
-/// cleartext is accepted even on a secured link, a rule owned by
-/// [`Crypto::decrypt`]. An unkeyed SEK slot, or any KK ≠ None without a
-/// crypto context (unencrypted endpoint receiving encrypted data,
-/// packets.md §5.10), makes the packet undecryptable: it still occupies
-/// its sequence slot and is ACKed, but is never delivered and never
-/// NAK-repaired.
+/// Feeds one data packet to the receiver through the decrypt step.
+/// Cleartext (KK = None) is accepted even on a secured link — a rule owned
+/// by [`Crypto::decrypt`]. An undecryptable packet (no usable key for its
+/// KK slot) still occupies its sequence slot and is ACKed, but is never
+/// delivered and never NAK-repaired.
 fn ingest_data(
     now: Instant,
     receiver: &mut Receiver,
@@ -1036,13 +1037,20 @@ fn ingest_data(
     mut data: DataPacket,
 ) {
     let decrypted = match crypto {
-        Some(crypto) => crypto
-            .decrypt(data.seq, data.encryption, &mut data.payload)
-            .is_ok(),
+        Some(crypto) => {
+            let mut payload = match std::mem::take(&mut data.payload).try_into_mut() {
+                Ok(buf) => buf,
+                Err(shared) => BytesMut::from(&shared[..]),
+            };
+            let ok = crypto
+                .decrypt(data.seq, data.encryption, &mut payload)
+                .is_ok();
+            data.payload = payload.freeze();
+            ok
+        }
         None => data.encryption == EncryptionFlags::None,
     };
     if decrypted {
-        // §9.4: the KK bits are cleared once the payload is plaintext.
         data.encryption = EncryptionFlags::None;
         receiver.handle_data(now, data);
         return;
@@ -1152,7 +1160,7 @@ mod tests {
             msg_number: MsgNumber::new(1),
             timestamp: Timestamp(0),
             dst_socket_id: dst,
-            payload,
+            payload: payload.into(),
         }
     }
 
@@ -1347,7 +1355,7 @@ mod tests {
             Packet::Data(d) => {
                 assert_eq!(d.dst_socket_id, ACCEPT_ID);
                 assert_eq!(d.seq, ISN);
-                assert_eq!(d.payload, b"hello");
+                assert_eq!(d.payload, b"hello".as_slice());
             }
             other => panic!("expected data, got {other:?}"),
         }
@@ -1386,7 +1394,7 @@ mod tests {
             };
         c.handle_packet(t0, reply);
         assert_eq!(c.state(), ConnState::Established);
-        let payloads: Vec<Vec<u8>> = drain(&mut c, t0)
+        let payloads: Vec<Bytes> = drain(&mut c, t0)
             .into_iter()
             .filter_map(|p| match p {
                 Packet::Data(d) => Some(d.payload),
@@ -1430,7 +1438,7 @@ mod tests {
         assert!(c.poll_deliver(t1 + Duration::from_millis(119)).is_none());
         assert_eq!(
             c.poll_deliver(t1 + Duration::from_millis(121)),
-            Some(vec![42; 8])
+            Some(Bytes::from(vec![42; 8]))
         );
     }
 
@@ -1815,7 +1823,7 @@ mod tests {
         assert_eq!(a.state(), ConnState::Closed(CloseReason::Shutdown));
         // The payload is still released at its TSBPD deadline.
         let due = t0 + Duration::from_millis(125);
-        assert_eq!(a.poll_deliver(due), Some(b"last words".to_vec()));
+        assert_eq!(a.poll_deliver(due), Some(Bytes::from_static(b"last words")));
     }
 
     #[test]
@@ -1863,7 +1871,7 @@ mod tests {
         let due = t0 + Duration::from_millis(125);
         assert_eq!(
             c.poll_deliver(due),
-            Some(vec![8; 4]),
+            Some(Bytes::from(vec![8; 4])),
             "stream resumes past the freed undecryptable slot"
         );
         assert!(c.poll_deliver(due).is_none());
@@ -2203,7 +2211,7 @@ mod tests {
         assert_eq!(data.encryption, EncryptionFlags::Even);
         assert_ne!(data.payload, clear, "payload must be encrypted on the wire");
         a.handle_packet(t0 + MS, Packet::Data(data));
-        assert_eq!(a.poll_deliver(due), Some(clear));
+        assert_eq!(a.poll_deliver(due), Some(Bytes::from(clear)));
 
         // Listener → caller: §1 — the caller's one SEK serves both
         // directions after the handshake KMX.
@@ -2219,7 +2227,7 @@ mod tests {
         assert_eq!(data.encryption, EncryptionFlags::Even);
         assert_ne!(data.payload, clear);
         c.handle_packet(t0 + MS, Packet::Data(data));
-        assert_eq!(c.poll_deliver(due), Some(clear));
+        assert_eq!(c.poll_deliver(due), Some(Bytes::from(clear)));
 
         assert_eq!(c.stats().undecrypted_pkts, 0);
         assert_eq!(a.stats().undecrypted_pkts, 0);
@@ -2261,7 +2269,7 @@ mod tests {
 
         // Every payload decrypts and delivers, in order, across the switch.
         let due = t0 + Duration::from_secs(2);
-        let delivered: Vec<Vec<u8>> = std::iter::from_fn(|| a.poll_deliver(due)).collect();
+        let delivered: Vec<Bytes> = std::iter::from_fn(|| a.poll_deliver(due)).collect();
         assert_eq!(delivered.len(), 24);
         for (i, p) in delivered.iter().enumerate() {
             assert_eq!(p, &msg(i as u32 + 1), "payload {}", i + 1);
@@ -2296,7 +2304,7 @@ mod tests {
             "every odd-key packet is undecryptable"
         );
         let due = t0 + Duration::from_secs(2);
-        let delivered: Vec<Vec<u8>> = std::iter::from_fn(|| a.poll_deliver(due)).collect();
+        let delivered: Vec<Bytes> = std::iter::from_fn(|| a.poll_deliver(due)).collect();
         assert_eq!(delivered.len(), 16, "only even-key packets delivered");
     }
 
