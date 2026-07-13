@@ -506,11 +506,14 @@ receiver's own NAK/ACK-repeat periods.
 
 ## 6. Sender: processing an ACK (`processCtrlAck`)
 
-Order of operations on receiving ACK with `ackseq` = CIF word 0:
+Order of operations on receiving ACK with `ackseq` = CIF word 0 (libsrt's
+`processCtrlAck` order; **this crate hoists the step-5 sanity check ahead of steps
+2–4** — see step 5):
 
 1. `ackseq < 0` (MSB set — invalid) ⇒ ignore packet.
 2. **Release the send buffer** (`updateSndLossListOnACK`, done for light and full
-   ACKs alike): if `seqoff(SndLastDataAck, ackseq) > 0`:
+   ACKs alike; in this crate the step-5 sanity check has already run, so `ackseq`
+   is known to be within the sent range here): if `seqoff(SndLastDataAck, ackseq) > 0`:
    `SndLastDataAck = ackseq`; remove all sender-loss-list entries older than
    `decseq(SndLastDataAck)`; free that many packets from the front of the send
    buffer; unblock any waiting `srt_sendmsg2`/epoll-out.
@@ -520,6 +523,17 @@ Order of operations on receiving ACK with `ackseq` = CIF word 0:
 4. **ACKACK decision** (§5.1).
 5. **Sanity**: if `seqcmp(ackseq, incseq(SndCurrSeqNo)) > 0` — ACK for something
    never sent ⇒ **break the connection** (attack/bug; `m_bBroken = true`).
+
+   **Deviation (this crate):** this check is evaluated *first* — before the buffer
+   release (step 2) and before the light-ACK short-circuit (step 3) — not at this
+   position. In libsrt's order a light ACK returns at step 3 and so never reaches
+   this gate: a light ACK naming a never-sent sequence would slip through, release
+   (and thereby **silently discard**) not-yet-transmitted send-buffer entries, and
+   leave the sender in a state where `SndCurrSeqNo` trails `SndLastDataAck`.
+   Hoisting the check makes light and full ACKs hit the same gate and guarantees
+   the send buffer is never mutated on a rejected ACK. The rule itself (which
+   sequence counts as "never sent") is unchanged; only its ordering moves, so the
+   step-5 reference used elsewhere still identifies this condition.
 6. If `seqcmp(ackseq, SndLastAck) >= 0`:
    **`FlowWindowSize = CIF word 3`** (peer's available buffer, in packets);
    `SndLastAck = ackseq`; `LastRspAckTime = now`; `ReXmitCount = 1`.
