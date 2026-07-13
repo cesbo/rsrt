@@ -128,6 +128,9 @@ pub struct Stats {
     pub pkts_recv_dropped: u64,
     /// Gaps detected on the receive path.
     pub pkts_recv_lost: u64,
+    /// Data packets dropped on receive because the payload exceeded the
+    /// negotiated maximum (MSS − 44).
+    pub pkts_recv_oversized: u64,
     /// Undecryptable data packets received (docs/spec/encryption.md §9.4):
     /// each occupied its sequence slot and was ACKed, but is never delivered.
     pub undecrypted_pkts: u64,
@@ -626,16 +629,17 @@ impl Connection {
     }
 
     fn handle_data_packet(&mut self, now: Instant, data: DataPacket) {
-        // Data arrival, decryptable or not, resets the data-idle window.
         self.last_data = now;
+        let early_limit = self.opts.max_payload();
         let discrepancy = match &mut self.state {
             State::Connecting { early_data, .. } => {
-                // Data can race ahead of the conclusion response
-                // (handshake.md §5.5); buffer a little, drop the rest (NAK
-                // recovery fetches it after establishment). Encrypted
-                // packets are buffered too: the crypto context arrives with
-                // the negotiated handshake and decrypts them at establish.
-                if early_data.len() < EARLY_DATA_MAX {
+                if data.payload.len() > early_limit {
+                    trace!(
+                        seq = data.seq.value(),
+                        len = data.payload.len(),
+                        "oversized early data dropped"
+                    );
+                } else if early_data.len() < EARLY_DATA_MAX {
                     trace!(
                         seq = data.seq.value(),
                         "early data buffered while connecting"
@@ -1090,6 +1094,7 @@ fn merge_stats(sender: &Sender, receiver: &Receiver, crypto: Option<&Crypto>) ->
         pkts_send_dropped: s.pkts_dropped,
         pkts_recv_dropped: r.pkts_dropped,
         pkts_recv_lost: r.pkts_lost,
+        pkts_recv_oversized: r.pkts_oversized,
         undecrypted_pkts: receiver.undecrypted_count(),
         km_refreshes: crypto.map_or(0, Crypto::key_switches),
         rtt_us: r.rtt_us,
@@ -1292,6 +1297,24 @@ mod tests {
                 ..
             })
         )));
+    }
+
+    #[test]
+    fn oversized_data_packet_dropped_on_established_connection() {
+        let t0 = Instant::now();
+        let (_c, mut a) = establish_pair(t0, SrtOptions::default(), SrtOptions::default());
+        let _ = drain(&mut a, t0);
+        // A payload well past the negotiated MSS (1456 at default MSS 1500)
+        // must not occupy a receive slot or be delivered.
+        a.handle_packet(
+            t0,
+            Packet::Data(data_packet(ISN.value(), ACCEPT_ID, vec![0u8; 2000])),
+        );
+        assert!(a.poll_deliver(t0 + Duration::from_millis(200)).is_none());
+        assert_eq!(a.stats().pkts_recv_oversized, 1);
+        assert_eq!(a.stats().pkts_recv, 0);
+        // The drop is inert: the connection stays up.
+        assert_eq!(a.state(), ConnState::Established);
     }
 
     #[test]

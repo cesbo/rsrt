@@ -120,6 +120,9 @@ pub struct ReceiverStats {
     pub pkts_dropped: u64,
     /// Belated packets discarded (already delivered past them).
     pub pkts_belated: u64,
+    /// Data packets dropped because their payload exceeded the negotiated
+    /// maximum (MSS − 44).
+    pub pkts_oversized: u64,
     pub rtt_us: u32,
     pub rtt_var_us: u32,
     /// Net TSBPD drift correction applied to delivery deadlines (µs,
@@ -209,7 +212,8 @@ pub struct Receiver {
     first_rtt_us: u32,
     drift: DriftTracer,
 
-    /// Negotiated maximum payload size, bounding the NAK CIF (§7.3).
+    /// Negotiated maximum payload size (min of both sides' MSS − 44). Bounds
+    /// BOTH the NAK CIF (§7.3) AND incoming payload admission.
     max_payload: usize,
 
     /// Unrecoverable sequence discrepancy (§7.1): a data packet landed at
@@ -332,6 +336,28 @@ impl Receiver {
     /// timestamp extension / TSBPD anchoring, buffering, light-ACK
     /// self-clocking.
     fn ingest(&mut self, now: Instant, pkt: DataPacket, undecryptable: bool) {
+        // Drop a payload larger than the negotiated packet size before it can
+        // occupy a receive slot.
+        if pkt.payload.len() > self.max_payload {
+            let first = self.stats.pkts_oversized == 0;
+            self.stats.pkts_oversized += 1;
+            if first {
+                warn!(
+                    seq = pkt.seq.value(),
+                    len = pkt.payload.len(),
+                    max = self.max_payload,
+                    "oversized data packet dropped (payload exceeds negotiated MSS); further ones at trace"
+                );
+            } else {
+                trace!(
+                    seq = pkt.seq.value(),
+                    len = pkt.payload.len(),
+                    max = self.max_payload,
+                    "oversized data packet dropped"
+                );
+            }
+            return;
+        }
         self.stats.pkts_recv += 1;
         self.stats.bytes_recv += pkt.payload.len() as u64;
         self.pkt_count += 1;
@@ -2192,5 +2218,45 @@ mod tests {
         // and freed as drops; the last three are still buffered.
         assert_eq!(r.stats().pkts_dropped, 13);
         assert_eq!(r.stats().pkts_lost, 0);
+    }
+
+    // ---- oversized payload admission ----
+
+    #[test]
+    fn oversized_payload_dropped_without_occupying_slot() {
+        let t0 = Instant::now();
+        let mut r = rx(t0);
+        r.set_max_payload(100);
+        // A payload past the negotiated limit must not take a slot.
+        let big = DataPacket {
+            payload: vec![0u8; 101].into(),
+            ..data(ISN, 0)
+        };
+        r.handle_data(t0, big);
+        assert_eq!(r.stats().pkts_oversized, 1);
+        assert_eq!(r.stats().pkts_recv, 0);
+        // No NAK/ACK side effects were produced by the drop.
+        assert!(drain(&mut r, t0).is_empty());
+        // The sequence slot is still free: a correctly sized packet at the same
+        // seq buffers and delivers normally (the drop did not advance the cursor).
+        r.handle_data(t0, data(ISN, 0));
+        assert_eq!(r.stats().pkts_recv, 1);
+        assert!(r
+            .poll_deliver(t0 + LATENCY + Duration::from_millis(1))
+            .is_some());
+    }
+
+    #[test]
+    fn oversized_undecryptable_payload_also_dropped() {
+        let t0 = Instant::now();
+        let mut r = rx(t0);
+        r.set_max_payload(100);
+        let big = DataPacket {
+            payload: vec![0u8; 200].into(),
+            ..data(ISN, 0)
+        };
+        r.handle_undecryptable(t0, big);
+        assert_eq!(r.stats().pkts_oversized, 1);
+        assert_eq!(r.undecrypted_count(), 0); // never buffered as undecryptable
     }
 }
