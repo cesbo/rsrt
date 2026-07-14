@@ -228,7 +228,10 @@ async fn drive(state: DriverState) {
     } = state;
     // Dropped when this task returns → the listener reaps the demux entry.
     let _reap = reap;
-    let mut buf = vec![0u8; RECV_BUF];
+    let mut buf = match io {
+        DriverIo::Connected(_) => vec![0u8; RECV_BUF],
+        DriverIo::Demux { .. } => Vec::new(),
+    };
     let mut out = Vec::with_capacity(2048);
     let mut cmd_open = true;
     let mut announced = matches!(conn.state(), ConnState::Established);
@@ -727,7 +730,10 @@ mod tests {
             .await
             .expect("recv timed out");
         assert_eq!(r.unwrap(), Some(Bytes::from_static(b"one")));
-        assert_eq!(socket.recv().await.unwrap(), Some(Bytes::from_static(b"two")));
+        assert_eq!(
+            socket.recv().await.unwrap(),
+            Some(Bytes::from_static(b"two"))
+        );
         assert_eq!(socket.recv().await.unwrap(), None, "clean EOF after drain");
     }
 
