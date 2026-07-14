@@ -314,11 +314,9 @@ mod tests {
         };
         let mut out = Vec::new();
         p.encode(&mut out);
+        // Capture the Vec's allocation before ownership passes through Bytes.
+        let base = out.as_ptr();
         let datagram = Bytes::from(out);
-        // Base of the owned datagram allocation, captured before it is moved
-        // into parse_owned (Bytes::from keeps the Vec's buffer, so this is the
-        // Vec's data pointer).
-        let base = datagram.as_ptr();
         let parsed = DataPacket::parse_owned(datagram).unwrap();
         assert_eq!(parsed.payload.len(), 1200);
         // Zero-copy: the payload is a view at offset HEADER_SIZE into that very
