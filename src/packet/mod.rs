@@ -17,6 +17,8 @@ mod types;
 
 use std::fmt;
 
+use bytes::Bytes;
+
 #[cfg(test)]
 pub use self::handshake::SRT_CMD_SID;
 pub use self::{
@@ -85,6 +87,22 @@ impl Packet {
             Ok(Packet::Data(DataPacket::parse(buf)?))
         } else {
             Ok(Packet::Control(ControlPacket::parse(buf)?))
+        }
+    }
+
+    /// Parses one OWNED UDP datagram as an SRT packet, slicing a data
+    /// packet's payload with no copy (see [`DataPacket::parse_owned`]).
+    /// Control packets decode their fields out and drop the buffer, so this is
+    /// equivalent to [`Packet::parse`] for them.
+    pub fn parse_owned(buf: Bytes) -> Result<Packet, PacketError> {
+        if buf.len() < HEADER_SIZE {
+            return Err(PacketError::TooShort);
+        }
+        // F bit: MSB of the first byte. 0 = data, 1 = control.
+        if buf[0] & 0x80 == 0 {
+            Ok(Packet::Data(DataPacket::parse_owned(buf)?))
+        } else {
+            Ok(Packet::Control(ControlPacket::parse(&buf)?))
         }
     }
 
@@ -164,6 +182,30 @@ mod tests {
             }
             other => panic!("expected control packet, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_owned_dispatches_on_f_bit() {
+        let data = [
+            0x00, 0x00, 0x00, 0x01, 0xC0, 0x00, 0x00, 0x01, //
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05,
+        ];
+        assert!(matches!(
+            Packet::parse_owned(Bytes::copy_from_slice(&data)),
+            Ok(Packet::Data(_))
+        ));
+        let ctrl = [
+            0x80, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05,
+        ];
+        assert!(matches!(
+            Packet::parse_owned(Bytes::copy_from_slice(&ctrl)),
+            Ok(Packet::Control(_))
+        ));
+        assert_eq!(
+            Packet::parse_owned(Bytes::from_static(&[0x80; 15])),
+            Err(PacketError::TooShort)
+        );
     }
 
     #[test]

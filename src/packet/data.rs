@@ -88,30 +88,54 @@ impl DataPacket {
     /// Wire size of the data packet header.
     pub const HEADER_SIZE: usize = 16;
 
-    /// Parses a complete data packet. The caller has already checked that
-    /// the F bit (MSB of the first byte) is 0.
-    pub fn parse(buf: &[u8]) -> Result<DataPacket, PacketError> {
-        if buf.len() < Self::HEADER_SIZE {
-            return Err(PacketError::TooShort);
-        }
-        let word0 = read_u32(buf, 0);
-        let word1 = read_u32(buf, 4);
-        tracing::trace!(
-            seq = word0 & SeqNumber::MASK,
-            payload_len = buf.len() - Self::HEADER_SIZE,
-            "data packet parsed"
-        );
-        Ok(DataPacket {
+    /// Builds a data packet from a buffer already known to be ≥ HEADER_SIZE
+    /// and a payload acquired by the caller (copied, or sliced zero-copy).
+    fn from_parts(header: &[u8], payload: Bytes) -> DataPacket {
+        let word0 = read_u32(header, 0);
+        let word1 = read_u32(header, 4);
+        DataPacket {
             seq: SeqNumber::new(word0 & SeqNumber::MASK),
             position: PacketPosition::from_bits(word1 >> 30),
             order: word1 & 0x2000_0000 != 0,
             encryption: EncryptionFlags::from_bits(word1 >> 27),
             retransmitted: word1 & 0x0400_0000 != 0,
             msg_number: MsgNumber::new(word1 & MsgNumber::MASK),
-            timestamp: Timestamp(read_u32(buf, 8)),
-            dst_socket_id: SocketId(read_u32(buf, 12)),
-            payload: Bytes::copy_from_slice(&buf[Self::HEADER_SIZE ..]),
-        })
+            timestamp: Timestamp(read_u32(header, 8)),
+            dst_socket_id: SocketId(read_u32(header, 12)),
+            payload,
+        }
+    }
+
+    /// Parses a data packet from a borrowed buffer, copying the payload into
+    /// its own allocation (the caller path reads into a reused scratch).
+    pub fn parse(buf: &[u8]) -> Result<DataPacket, PacketError> {
+        if buf.len() < Self::HEADER_SIZE {
+            return Err(PacketError::TooShort);
+        }
+        tracing::trace!(
+            seq = read_u32(buf, 0) & SeqNumber::MASK,
+            payload_len = buf.len() - Self::HEADER_SIZE,
+            "data packet parsed"
+        );
+        Ok(Self::from_parts(
+            buf,
+            Bytes::copy_from_slice(&buf[Self::HEADER_SIZE ..]),
+        ))
+    }
+
+    /// Parses a data packet from an owned datagram, slicing the payload with
+    /// no copy (the demux path already owns the buffer).
+    pub fn parse_owned(buf: Bytes) -> Result<DataPacket, PacketError> {
+        if buf.len() < Self::HEADER_SIZE {
+            return Err(PacketError::TooShort);
+        }
+        tracing::trace!(
+            seq = read_u32(&buf, 0) & SeqNumber::MASK,
+            payload_len = buf.len() - Self::HEADER_SIZE,
+            "data packet parsed (owned)"
+        );
+        let payload = buf.slice(Self::HEADER_SIZE ..);
+        Ok(Self::from_parts(&buf, payload))
     }
 
     /// Appends the encoded packet (header + payload) to `out`.
@@ -268,6 +292,58 @@ mod tests {
     fn truncated_header_rejected() {
         assert_eq!(DataPacket::parse(&[0u8; 15]), Err(PacketError::TooShort));
         assert_eq!(DataPacket::parse(&[]), Err(PacketError::TooShort));
+    }
+
+    #[test]
+    fn parse_owned_matches_parse() {
+        // Same wire bytes → identical DataPacket via either entry point.
+        let mut out = Vec::new();
+        sample().encode(&mut out);
+        let borrowed = DataPacket::parse(&out).unwrap();
+        let owned = DataPacket::parse_owned(Bytes::from(out)).unwrap();
+        assert_eq!(borrowed, owned);
+    }
+
+    #[test]
+    fn parse_owned_payload_is_zero_copy_ready() {
+        // The demux path slices the payload out of the owned datagram with no
+        // copy. A Vec-backed source models the real demux buffer.
+        let p = DataPacket {
+            payload: vec![0x47; 1200].into(),
+            ..sample()
+        };
+        let mut out = Vec::new();
+        p.encode(&mut out);
+        let datagram = Bytes::from(out);
+        // Base of the owned datagram allocation, captured before it is moved
+        // into parse_owned (Bytes::from keeps the Vec's buffer, so this is the
+        // Vec's data pointer).
+        let base = datagram.as_ptr();
+        let parsed = DataPacket::parse_owned(datagram).unwrap();
+        assert_eq!(parsed.payload.len(), 1200);
+        // Zero-copy: the payload is a view at offset HEADER_SIZE into that very
+        // allocation — not a fresh copy. A copying implementation would point
+        // at a different allocation and fail this (that is the whole point of
+        // parse_owned; the borrowed parse() copies instead).
+        assert_eq!(
+            parsed.payload.as_ptr(),
+            base.wrapping_add(DataPacket::HEADER_SIZE),
+            "payload must be a zero-copy slice of the source datagram, not a copy"
+        );
+        // And it must be the unique owner so the in-place decrypt path
+        // (Bytes::try_into_mut) stays zero-copy rather than falling back.
+        assert!(
+            parsed.payload.try_into_mut().is_ok(),
+            "sliced payload must be uniquely owned for zero-copy in-place decrypt"
+        );
+    }
+
+    #[test]
+    fn parse_owned_truncated_header_rejected() {
+        assert_eq!(
+            DataPacket::parse_owned(Bytes::from_static(&[0u8; 15])),
+            Err(PacketError::TooShort)
+        );
     }
 
     #[test]

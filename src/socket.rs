@@ -287,7 +287,9 @@ async fn drive(state: DriverState) {
         tokio::select! {
             event = io.recv(&mut buf) => match event {
                 RecvEvent::Buffered(n) => conn.handle_datagram(Instant::now(), &buf[..n]),
-                RecvEvent::Owned(datagram) => conn.handle_datagram(Instant::now(), &datagram),
+                RecvEvent::Owned(datagram) => {
+                    conn.handle_datagram_owned(Instant::now(), Bytes::from(datagram))
+                }
                 RecvEvent::Error => {}
                 RecvEvent::Closed => {
                     warn!("datagram source closed; closing connection");

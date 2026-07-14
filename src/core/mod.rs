@@ -357,8 +357,22 @@ impl Connection {
     }
 
     /// Feeds one raw UDP datagram payload.
+    /// Used on the caller path where the datagram lives in a reused
+    /// scratch buffer.
     pub fn handle_datagram(&mut self, now: Instant, datagram: &[u8]) {
-        match Packet::parse(datagram) {
+        let len = datagram.len();
+        self.dispatch_datagram(now, Packet::parse(datagram), len);
+    }
+
+    /// Feeds one raw UDP datagram the driver already OWNS (demux path). The
+    /// data-packet payload is sliced out with no copy (`DataPacket::parse_owned`).
+    pub fn handle_datagram_owned(&mut self, now: Instant, datagram: Bytes) {
+        let len = datagram.len();
+        self.dispatch_datagram(now, Packet::parse_owned(datagram), len);
+    }
+
+    fn dispatch_datagram(&mut self, now: Instant, parsed: Result<Packet, PacketError>, len: usize) {
+        match parsed {
             Ok(packet) => self.handle_packet(now, packet),
             Err(PacketError::UnknownControlType(t)) => {
                 // Ignored, but still counts as peer activity: libsrt resets
@@ -366,7 +380,7 @@ impl Connection {
                 debug!(control_type = t, "unknown control type ignored");
                 self.touch(now);
             }
-            Err(e) => warn!(%e, len = datagram.len(), "undecodable datagram dropped"),
+            Err(e) => warn!(%e, len, "undecodable datagram dropped"),
         }
     }
 
@@ -1847,6 +1861,22 @@ mod tests {
         // The payload is still released at its TSBPD deadline.
         let due = t0 + Duration::from_millis(125);
         assert_eq!(a.poll_deliver(due), Some(Bytes::from_static(b"last words")));
+    }
+
+    #[test]
+    fn handle_datagram_owned_delivers_end_to_end() {
+        // The demux path feeds an owned datagram whose payload is sliced
+        // zero-copy; it must behave identically to the borrowed path and
+        // deliver the payload at its TSBPD deadline.
+        let t0 = Instant::now();
+        let (mut c, _) = establish_pair(t0, SrtOptions::default(), SrtOptions::default());
+        drain(&mut c, t0);
+        let mut wire = Vec::new();
+        data_packet(ISN.value(), CALLER_ID, b"owned path".to_vec()).encode(&mut wire);
+        c.handle_datagram_owned(t0 + MS, Bytes::from(wire));
+        assert_eq!(c.state(), ConnState::Established);
+        let due = t0 + Duration::from_millis(125);
+        assert_eq!(c.poll_deliver(due), Some(Bytes::from_static(b"owned path")));
     }
 
     #[test]
