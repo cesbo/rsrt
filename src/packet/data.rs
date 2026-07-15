@@ -3,7 +3,6 @@
 use bytes::Bytes;
 
 use super::{
-    put_u32,
     read_u32,
     types::{
         MsgNumber,
@@ -138,19 +137,27 @@ impl DataPacket {
         Ok(Self::from_parts(&buf, payload))
     }
 
-    /// Appends the encoded packet (header + payload) to `out`.
-    pub fn encode(&self, out: &mut Vec<u8>) {
-        out.reserve(Self::HEADER_SIZE + self.payload.len());
+    /// Encodes the fixed-size data-packet header separately from the payload.
+    pub fn encode_header(&self) -> [u8; Self::HEADER_SIZE] {
         // F = 0 is implied: seq is 31-bit, MSB always clear.
-        put_u32(out, self.seq.value());
         let word1 = ((self.position as u32) << 30)
             | ((self.order as u32) << 29)
             | ((self.encryption as u32) << 27)
             | ((self.retransmitted as u32) << 26)
             | self.msg_number.value();
-        put_u32(out, word1);
-        put_u32(out, self.timestamp.0);
-        put_u32(out, self.dst_socket_id.0);
+
+        let mut header = [0u8; Self::HEADER_SIZE];
+        header[0 .. 4].copy_from_slice(&self.seq.value().to_be_bytes());
+        header[4 .. 8].copy_from_slice(&word1.to_be_bytes());
+        header[8 .. 12].copy_from_slice(&self.timestamp.0.to_be_bytes());
+        header[12 .. 16].copy_from_slice(&self.dst_socket_id.0.to_be_bytes());
+        header
+    }
+
+    /// Appends the encoded packet (header + payload) to `out`.
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        out.reserve(Self::HEADER_SIZE + self.payload.len());
+        out.extend_from_slice(&self.encode_header());
         out.extend_from_slice(&self.payload);
     }
 }

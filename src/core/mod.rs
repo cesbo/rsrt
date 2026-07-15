@@ -121,6 +121,12 @@ pub struct Stats {
     pub pkts_recv: u64,
     pub bytes_sent: u64,
     pub bytes_recv: u64,
+    /// UDP send calls that returned an I/O error, across data, retransmission,
+    /// and control packets..
+    pub udp_send_errors: u64,
+    /// UDP send calls, across all packet kinds, that reported fewer bytes than
+    /// the complete datagram.
+    pub udp_short_sends: u64,
     pub pkts_retransmitted: u64,
     /// Sender-side too-late / overflow drops.
     pub pkts_send_dropped: u64,
@@ -1104,6 +1110,8 @@ fn merge_stats(sender: &Sender, receiver: &Receiver, crypto: Option<&Crypto>) ->
         pkts_recv: r.pkts_recv,
         bytes_sent: s.bytes_sent,
         bytes_recv: r.bytes_recv,
+        udp_send_errors: 0,
+        udp_short_sends: 0,
         pkts_retransmitted: s.pkts_retransmitted,
         pkts_send_dropped: s.pkts_dropped,
         pkts_recv_dropped: r.pkts_dropped,

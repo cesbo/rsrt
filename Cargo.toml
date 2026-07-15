@@ -1,6 +1,6 @@
 [package]
 name = "rsrt"
-version = "0.3.0"
+version = "0.3.1"
 authors = ["Cesbo Developers <info@cesbo.com>"]
 edition = "2021"
 description = "Pure-Rust implementation of the SRT (Secure Reliable Transport) protocol: live mode with TSBPD, ARQ and HaiCrypt AES-CTR encryption"

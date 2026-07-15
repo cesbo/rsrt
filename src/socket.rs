@@ -72,7 +72,10 @@ use crate::{
     listener::ReapGuard,
     net,
     options::SrtOptions,
-    packet::reject,
+    packet::{
+        reject,
+        Packet,
+    },
 };
 
 /// Handle → driver command queue depth. Bounded: `send` backpressure is
@@ -120,6 +123,42 @@ enum RecvEvent {
     Closed,
 }
 
+/// Result of one UDP send attempt. The sink classifies transport behavior but
+/// deliberately does not log it; the output driver turns failures into public
+/// counters without producing one event per packet.
+#[must_use = "the output driver must account for every UDP send outcome"]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SendOutcome {
+    Sent,
+    IoError,
+    Short,
+}
+
+/// Transport counters owned by the output driver. The sans-I/O core cannot
+/// observe kernel send results, so these are overlaid onto its [`Stats`]
+/// snapshot before publishing it to the socket handle.
+#[derive(Default)]
+struct OutputStats {
+    udp_send_errors: u64,
+    udp_short_sends: u64,
+}
+
+impl OutputStats {
+    fn record(&mut self, outcome: SendOutcome) {
+        match outcome {
+            SendOutcome::Sent => {}
+            SendOutcome::IoError => self.udp_send_errors += 1,
+            SendOutcome::Short => self.udp_short_sends += 1,
+        }
+    }
+
+    fn snapshot(&self, mut core: Stats) -> Stats {
+        core.udp_send_errors = self.udp_send_errors;
+        core.udp_short_sends = self.udp_short_sends;
+        core
+    }
+}
+
 impl DriverIo {
     /// Cancel-safe: both `UdpSocket::recv` and `mpsc::Receiver::recv` are.
     async fn recv(&mut self, buf: &mut [u8]) -> RecvEvent {
@@ -138,16 +177,68 @@ impl DriverIo {
         }
     }
 
-    /// Sends one encoded packet; UDP loss is a wire property (ARQ recovers
-    /// data, control repeats), so errors are logged and swallowed.
-    async fn send(&self, data: &[u8]) {
+    /// Sends one packet.
+    /// On Unix targets data packets use two segments, avoiding
+    /// the payload copy into `scratch`.
+    /// Control packets and other targets keep the contiguous codec path.
+    async fn send_packet(&self, packet: &Packet, scratch: &mut Vec<u8>) -> SendOutcome {
+        #[cfg(all(unix, not(any(target_os = "horizon", target_os = "redox"))))]
+        if let Packet::Data(data) = packet {
+            return self.send_data_vectored(data).await;
+        }
+
+        scratch.clear();
+        packet.encode(scratch);
+        self.send_contiguous(scratch).await
+    }
+
+    /// Contiguous fallback and control-packet path.
+    async fn send_contiguous(&self, data: &[u8]) -> SendOutcome {
         let result = match self {
             DriverIo::Connected(udp) => udp.send(data).await,
             DriverIo::Demux { udp, remote, .. } => udp.send_to(data, *remote).await,
         };
-        if let Err(e) = result {
-            debug!(%e, "udp send failed; datagram dropped");
-        }
+        classify_send(result, data.len())
+    }
+
+    /// Sends one SRT data packet as a single UDP datagram backed by two I/O
+    /// vectors. `async_io` supplies Tokio readiness while `socket2` performs
+    /// the platform `sendmsg` call without taking ownership of the socket.
+    #[cfg(all(unix, not(any(target_os = "horizon", target_os = "redox"))))]
+    async fn send_data_vectored(&self, data: &crate::packet::DataPacket) -> SendOutcome {
+        let header = data.encode_header();
+        let bufs = [
+            std::io::IoSlice::new(&header),
+            std::io::IoSlice::new(data.payload.as_ref()),
+        ];
+        let expected = header.len() + data.payload.len();
+        let result = match self {
+            DriverIo::Connected(udp) => {
+                udp.async_io(tokio::io::Interest::WRITABLE, || {
+                    socket2::SockRef::from(udp).send_vectored(&bufs)
+                })
+                .await
+            }
+            DriverIo::Demux { udp, remote, .. } => {
+                let remote = socket2::SockAddr::from(std::net::SocketAddr::V4(*remote));
+                udp.async_io(tokio::io::Interest::WRITABLE, || {
+                    socket2::SockRef::from(udp.as_ref()).send_to_vectored(&bufs, &remote)
+                })
+                .await
+            }
+        };
+        classify_send(result, expected)
+    }
+}
+
+/// UDP sends are atomic on the supported platforms, so a short success is a
+/// dropped datagram just as much as an error. The protocol's normal ARQ/control
+/// repetition handles it; the driver must never stop on a transient I/O fault.
+fn classify_send(result: std::io::Result<usize>, expected: usize) -> SendOutcome {
+    match result {
+        Ok(n) if n == expected => SendOutcome::Sent,
+        Ok(_) => SendOutcome::Short,
+        Err(_) => SendOutcome::IoError,
     }
 }
 
@@ -233,6 +324,7 @@ async fn drive(state: DriverState) {
         DriverIo::Demux { .. } => Vec::new(),
     };
     let mut out = Vec::with_capacity(2048);
+    let mut output_stats = OutputStats::default();
     let mut cmd_open = true;
     let mut announced = matches!(conn.state(), ConnState::Established);
 
@@ -242,14 +334,12 @@ async fn drive(state: DriverState) {
         // queued at construction), then refresh the shared stats snapshot.
         let now = Instant::now();
         while let Some(packet) = conn.poll_transmit(now) {
-            out.clear();
-            packet.encode(&mut out);
-            io.send(&out).await;
+            output_stats.record(io.send_packet(&packet, &mut out).await);
         }
         while let Some(payload) = conn.poll_deliver(now) {
             deliver(&data_tx, payload);
         }
-        store(&stats, conn.stats());
+        store(&stats, output_stats.snapshot(conn.stats()));
 
         match conn.state() {
             ConnState::Established if !announced => {
@@ -274,7 +364,7 @@ async fn drive(state: DriverState) {
                 while let Some(payload) = conn.poll_deliver(horizon) {
                     deliver(&data_tx, payload);
                 }
-                store(&stats, conn.stats());
+                store(&stats, output_stats.snapshot(conn.stats()));
                 debug!(%reason, "connection driver finished");
                 return;
             }
@@ -508,14 +598,120 @@ mod tests {
     use crate::{
         core::ConnState,
         packet::{
+            DataPacket,
+            EncryptionFlags,
+            MsgNumber,
             Packet,
+            PacketPosition,
             SeqNumber,
             SocketId,
+            Timestamp,
         },
     };
 
     fn opts() -> SrtOptions {
         SrtOptions::default()
+    }
+
+    fn data_packet(payload: Bytes) -> Packet {
+        Packet::Data(DataPacket {
+            seq: SeqNumber::new(0x1234_5678),
+            position: PacketPosition::Only,
+            order: false,
+            encryption: EncryptionFlags::Even,
+            retransmitted: true,
+            msg_number: MsgNumber::new(7),
+            timestamp: Timestamp(0x0102_0304),
+            dst_socket_id: SocketId(0x0506_0708),
+            payload,
+        })
+    }
+
+    async fn assert_data_datagram(io: DriverIo, receiver: UdpSocket) {
+        let packet = data_packet(Bytes::from_static(b"scatter/gather payload"));
+        let mut expected = Vec::new();
+        packet.encode(&mut expected);
+
+        let sentinel = vec![0xA5; 32];
+        let mut scratch = sentinel.clone();
+        assert_eq!(
+            io.send_packet(&packet, &mut scratch).await,
+            SendOutcome::Sent
+        );
+
+        #[cfg(all(unix, not(any(target_os = "horizon", target_os = "redox"))))]
+        assert_eq!(
+            scratch, sentinel,
+            "vectored data send must not touch the contiguous scratch buffer"
+        );
+        #[cfg(not(all(unix, not(any(target_os = "horizon", target_os = "redox")))))]
+        assert_eq!(scratch, expected, "fallback must use the packet codec");
+
+        let mut received = [0u8; 2048];
+        let (n, _) =
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv_from(&mut received))
+                .await
+                .expect("timed out waiting for vectored datagram")
+                .expect("receive vectored datagram");
+        assert_eq!(&received[.. n], expected);
+    }
+
+    #[test]
+    fn send_outcomes_are_classified_and_published_in_stats() {
+        let io_error = std::io::Error::from(std::io::ErrorKind::Other);
+        assert_eq!(classify_send(Ok(32), 32), SendOutcome::Sent);
+        assert_eq!(classify_send(Ok(31), 32), SendOutcome::Short);
+        assert_eq!(classify_send(Err(io_error), 32), SendOutcome::IoError);
+
+        let mut output = OutputStats::default();
+        output.record(SendOutcome::Sent);
+        output.record(SendOutcome::IoError);
+        output.record(SendOutcome::IoError);
+        output.record(SendOutcome::Short);
+
+        let snapshot = output.snapshot(Stats {
+            pkts_sent: 7,
+            bytes_sent: 700,
+            ..Stats::default()
+        });
+        assert_eq!(snapshot.pkts_sent, 7, "core counters must be preserved");
+        assert_eq!(snapshot.bytes_sent, 700, "core counters must be preserved");
+        assert_eq!(snapshot.udp_send_errors, 2);
+        assert_eq!(snapshot.udp_short_sends, 1);
+    }
+
+    #[tokio::test]
+    async fn connected_data_send_is_one_vectored_datagram() {
+        let sender = net::bind_udp(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), None).unwrap();
+        let receiver = net::bind_udp(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), None).unwrap();
+        sender
+            .connect(receiver.local_addr().unwrap())
+            .await
+            .unwrap();
+
+        assert_data_datagram(DriverIo::Connected(sender), receiver).await;
+    }
+
+    #[tokio::test]
+    async fn demux_data_send_is_one_vectored_datagram() {
+        let sender =
+            Arc::new(net::bind_udp(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), None).unwrap());
+        let receiver = net::bind_udp(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), None).unwrap();
+        let remote = match receiver.local_addr().unwrap() {
+            std::net::SocketAddr::V4(addr) => addr,
+            std::net::SocketAddr::V6(_) => unreachable!(),
+        };
+        let (_tx, rx) = mpsc::channel(1);
+
+        assert_data_datagram(
+            DriverIo::Demux {
+                udp: sender,
+                remote,
+                rx,
+            },
+            receiver,
+        )
+        .await;
     }
 
     /// Runs the in-memory HSv5 dance and returns the established caller
