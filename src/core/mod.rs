@@ -386,7 +386,7 @@ impl Connection {
                 debug!(control_type = t, "unknown control type ignored");
                 self.touch(now);
             }
-            Err(e) => warn!(%e, len, "undecodable datagram dropped"),
+            Err(e) => debug!(%e, len, "undecodable datagram dropped"),
         }
     }
 
@@ -398,7 +398,7 @@ impl Connection {
         }
         let dst = packet.dst_socket_id();
         if dst != SocketId::HANDSHAKE && dst != self.local_socket_id {
-            warn!(
+            debug!(
                 dst = dst.0,
                 local = self.local_socket_id.0,
                 "packet for another socket dropped"
@@ -701,7 +701,7 @@ impl Connection {
                 // Never sent by 1.4.4; pacing is input-driven here — ignore.
                 debug!("congestion warning ignored");
             }
-            ControlType::PeerError { code } => warn!(code, "PEERERROR ignored (live mode)"),
+            ControlType::PeerError { code } => debug!(code, "PEERERROR ignored (live mode)"),
             // In-stream KM refresh KMX (docs/spec/encryption.md §11).
             ControlType::KmReq(payload) => self.handle_kmreq(&payload),
             ControlType::KmRsp(payload) => self.handle_kmrsp(&payload),

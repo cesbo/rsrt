@@ -246,7 +246,7 @@ impl ListenerDriver {
                         }
                     }
                 }
-                Some(_) => warn!(%from, dst = dst.0, "source address mismatch; datagram dropped"),
+                Some(_) => debug!(%from, dst = dst.0, "source address mismatch; datagram dropped"),
                 None => trace!(%from, dst = dst.0, "datagram for unknown socket dropped"),
             }
             return;

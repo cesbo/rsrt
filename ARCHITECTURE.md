@@ -162,9 +162,26 @@ then: drain poll_transmit -> socket.send_to, drain poll_deliver -> data mpsc
 
 - No new external dependencies beyond the pure-Rust RustCrypto stack that
   backs `src/crypto/` (`aes`, `ctr`, `aes-kw`, `pbkdf2`, `sha1`, `zeroize`,
-  `getrandom`). `tracing` for logs (`trace!` per packet, `debug!` for state
-  transitions, `warn!` for protocol anomalies) — never key material,
-  passphrases, salts or KM blob contents.
+  `getrandom`). `tracing` for logs.
+- Log levels are chosen by the *source* of the event, not by how alarming it
+  sounds. A remote peer must never be able to grow the local log: a
+  misconfigured caller retransmits its CONCLUSION every `HS_RETRY_INTERVAL`
+  (250 ms) for as long as it keeps trying, and a lossy link produces
+  anomalies at packet rate.
+  - `trace!` — per-packet detail.
+  - `debug!` — state transitions, plus everything decided by the content of
+    a packet the peer sent: drops, rejections, ignored or malformed input,
+    handshake failures (bad cookie, wrong version, passphrase mismatch,
+    unsupported extensions, KMX failure), decode errors. The reason is not
+    lost — it reaches the application through `SrtError`, and the runtime
+    logs the outcome once per failed handshake.
+  - `warn!` — faults on our own side: invalid local options (once, at
+    construction), resource exhaustion that costs data, and the loss of an
+    already established connection. Anomalies from an authenticated peer on
+    a live connection also warn, but where the trigger can repeat per packet
+    they warn only on the first occurrence and drop to `trace!` after.
+  - `error!` — internal inconsistency that should be impossible.
+  Never key material, passphrases, salts or KM blob contents, at any level.
 - No `unsafe`.
 - Errors: one public `SrtError` in `src/error.rs`.
 - Every module carries unit tests in-file (`#[cfg(test)] mod tests`). The

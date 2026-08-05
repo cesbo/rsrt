@@ -736,7 +736,7 @@ impl Sender {
         debug_assert!(n > 0 && n <= self.buffer.len());
         let first = self.seq_at(self.base_index);
         let last = self.seq_at(self.base_index + n as u64 - 1);
-        warn!(
+        debug!(
             first = first.value(),
             last = last.value(),
             n,

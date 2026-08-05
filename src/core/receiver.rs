@@ -414,7 +414,7 @@ impl Receiver {
                 self.discrepancy = true;
             } else {
                 // Buffer genuinely full/behind: drop only.
-                warn!(
+                debug!(
                     seq = seq.value(),
                     offset, "receive buffer full; packet dropped"
                 );
@@ -482,7 +482,7 @@ impl Receiver {
     pub fn handle_ackack(&mut self, now: Instant, ack_number: u32, ts: Timestamp) {
         let Some(pos) = self.ack_journal.iter().position(|r| r.number == ack_number) else {
             // Unknown, light (0), or already-consumed number.
-            warn!(ack_number, "ACKACK does not match any pending ACK; ignored");
+            debug!(ack_number, "ACKACK does not match any pending ACK; ignored");
             return;
         };
         let rec = self.ack_journal[pos];
@@ -495,7 +495,7 @@ impl Receiver {
             .as_micros()
             .min(u32::MAX as u128) as u32;
         if rtt_us == 0 {
-            warn!(ack_number, "non-positive RTT sample; ignored");
+            debug!(ack_number, "non-positive RTT sample; ignored");
             return;
         }
         if self.rtt_first {
@@ -554,7 +554,7 @@ impl Receiver {
     ) {
         let _ = now;
         if first.diff(last) > 0 {
-            warn!(
+            debug!(
                 first = first.value(),
                 last = last.value(),
                 "DROPREQ with inverted range; ignored"
@@ -654,7 +654,7 @@ impl Receiver {
                 // a hole whose recovery window has closed — skip the hole.
                 let lo = self.base_seq;
                 let hi = self.base_seq.add(first as i32 - 1);
-                warn!(
+                debug!(
                     first = lo.value(),
                     last = hi.value(),
                     skipped = first,

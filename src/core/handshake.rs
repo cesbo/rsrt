@@ -195,6 +195,11 @@ impl CallerHandshake {
     /// - `Ok(None)` — keep going (a follow-up request may be queued);
     /// - `Err(_)` — handshake failed terminally (rejection, version mismatch, peer requires
     ///   encryption, ...).
+    ///
+    /// Log levels: the individual reasons log at `debug!` — each one is
+    /// carried in the returned [`SrtError`], which the runtime logs once as
+    /// "handshake failed" (`core::Connection`). Only anomalies the caller
+    /// *survives* (a PBKEYLEN or crypto surprise from the peer) warn.
     pub fn handle_handshake(
         &mut self,
         now: Instant,
@@ -205,7 +210,7 @@ impl CallerHandshake {
             return Ok(None);
         }
         if let HandshakeType::Rejection(code) = cif.handshake_type {
-            warn!(code, "connection rejected by peer");
+            debug!(code, "connection rejected by peer");
             let encrypting = self.crypto.is_some() || self.crypto_cfg.is_some();
             return self.fail(reject_error(code, encrypting));
         }
@@ -265,7 +270,7 @@ impl CallerHandshake {
         cif: &HandshakeCif,
     ) -> Result<Option<Negotiated>, SrtError> {
         if cif.handshake_type != HandshakeType::Induction {
-            warn!(hs_type = ?cif.handshake_type, "unexpected handshake type during induction; ignored");
+            debug!(hs_type = ?cif.handshake_type, "unexpected handshake type during induction; ignored");
             return Ok(None);
         }
         // libsrt takes any version > 4 as HSv5-capable; 4 or below is an
@@ -322,21 +327,21 @@ impl CallerHandshake {
                 return Ok(None);
             }
             other => {
-                warn!(hs_type = ?other, "unexpected handshake type during conclusion; ignored");
+                debug!(hs_type = ?other, "unexpected handshake type during conclusion; ignored");
                 return Ok(None);
             }
         }
         if cif.version == 0 {
             // Version 0 in a CONCLUSION-phase handshake marks a rejection.
-            warn!("conclusion response version 0: rejected by peer");
+            debug!("conclusion response version 0: rejected by peer");
             return self.fail(SrtError::Rejected(reject::PEER));
         }
         if cif.version <= HS_VERSION_UDT4 {
-            warn!(version = cif.version, "conclusion response is not HSv5");
+            debug!(version = cif.version, "conclusion response is not HSv5");
             return self.fail(SrtError::Rejected(reject::VERSION));
         }
         if !cif_valid(cif) {
-            warn!(
+            debug!(
                 mss = cif.mss,
                 flow_window = cif.flow_window,
                 "invalid conclusion response"
@@ -345,7 +350,7 @@ impl CallerHandshake {
         }
         // Security check: the listener must adopt and echo our ISN.
         if cif.initial_seq != self.initial_seq {
-            warn!(got = %cif.initial_seq, want = %self.initial_seq, "ISN echo mismatch; aborting");
+            debug!(got = %cif.initial_seq, want = %self.initial_seq, "ISN echo mismatch; aborting");
             return self.fail(SrtError::Rejected(reject::ROGUE));
         }
         // Spec §5.4 step 5: the response must carry Extension Field bit 0x1
@@ -354,7 +359,7 @@ impl CallerHandshake {
         // ext_flags == 0 as ROGUE); an HSREQ block here (e.g. our own
         // request reflected back) has swapped latency semantics — ROGUE too.
         if cif.extension_field & HS_EXT_HSREQ == 0 {
-            warn!(
+            debug!(
                 ext = cif.extension_field,
                 "conclusion response lacks the HSREQ extension bit"
             );
@@ -365,11 +370,11 @@ impl CallerHandshake {
             _ => None,
         });
         let Some(hs) = hs_rsp else {
-            warn!("conclusion response without HSRSP");
+            debug!("conclusion response without HSRSP");
             return self.fail(SrtError::Rejected(reject::ROGUE));
         };
         if hs.srt_version < SRT_VERSION_FEAT_HSV5 {
-            warn!(
+            debug!(
                 srt_version = hs.srt_version,
                 "peer SRT version below HSv5 feature level"
             );
@@ -412,7 +417,7 @@ impl CallerHandshake {
                 // always-enforced library, the connection is rejected
                 // instead.
                 outcome => {
-                    warn!(?outcome, "handshake KMX failed; aborting (enforced encryption)");
+                    debug!(?outcome, "handshake KMX failed; aborting (enforced encryption)");
                     return self.fail(SrtError::Rejected(reject::UNSECURE));
                 }
             }
@@ -424,7 +429,7 @@ impl CallerHandshake {
             // §8 row 6: the peer runs encryption, we have no passphrase.
             // Row 7 (non-enforced ignore-and-connect) is not implemented —
             // always-enforced library, the connection is rejected instead.
-            warn!("conclusion response carries key material; aborting (enforced encryption)");
+            debug!("conclusion response carries key material; aborting (enforced encryption)");
             return self.fail(SrtError::EncryptionUnsupported);
         }
         let negotiated = Negotiated {
@@ -583,6 +588,13 @@ impl Listener {
     /// always-enforced library, the connection is rejected instead.
     /// Rendezvous (WAVEAHAND) is dropped; HSv4 conclusions are rejected
     /// with `reject::VERSION`.
+    ///
+    /// Log levels: every drop/rejection decided by the peer's own packet
+    /// (bad cookie, wrong version, malformed extensions, passphrase
+    /// mismatch...) logs at `debug!`, never `warn!` — a misconfigured or
+    /// hostile caller retransmits its CONCLUSION every
+    /// [`HS_RETRY_INTERVAL`] and must not be able to flood the listener's
+    /// log. Only locally-caused faults warn (see [`Listener::new`]).
     pub fn handle_handshake(
         &mut self,
         now: Instant,
@@ -642,7 +654,7 @@ impl Listener {
         // `valid()` runs before the cookie check (NOTES.md); both failures
         // are silent ignores — no response is sent.
         if !cif_valid(cif) {
-            warn!(
+            debug!(
                 %from,
                 version = cif.version,
                 mss = cif.mss,
@@ -652,13 +664,13 @@ impl Listener {
             return ListenerAction::Drop;
         }
         if !self.cookie_ok(now, from, cif.cookie) {
-            warn!(%from, cookie = cif.cookie, "wrong SYN cookie; conclusion dropped");
+            debug!(%from, cookie = cif.cookie, "wrong SYN cookie; conclusion dropped");
             return ListenerAction::Drop;
         }
         if cif.version != HS_VERSION_SRT1 {
             // HSv4 callers are deliberately out of scope (a real libsrt
             // listener would accept them).
-            warn!(%from, version = cif.version, "unsupported conclusion version rejected");
+            debug!(%from, version = cif.version, "unsupported conclusion version rejected");
             return self.rejection(now, cif, reject::VERSION);
         }
         // Extension Field bits must match the attached blocks (both
@@ -674,7 +686,7 @@ impl Listener {
             .any(|e| matches!(e, HsExtension::KmReq(_) | HsExtension::KmRsp(_)));
         let ext = cif.extension_field;
         if ext & HS_EXT_HSREQ == 0 || !has_hs || ((ext & HS_EXT_KMREQ != 0) != has_km) {
-            warn!(%from, ext, has_hs, has_km, "extension field / block mismatch");
+            debug!(%from, ext, has_hs, has_km, "extension field / block mismatch");
             return self.rejection(now, cif, reject::ROGUE);
         }
         // The advertised-PBKEYLEN half of the type word alone is never a
@@ -685,24 +697,24 @@ impl Listener {
         }
         let hs = cif.hs_ext().expect("HSREQ presence checked above");
         if hs.srt_version < SRT_VERSION_FEAT_HSV5 {
-            warn!(%from, srt_version = hs.srt_version, "peer SRT version below HSv5 feature level");
+            debug!(%from, srt_version = hs.srt_version, "peer SRT version below HSv5 feature level");
             return self.rejection(now, cif, reject::ROGUE);
         }
         if hs.flags.contains(HsFlags::STREAM) {
-            warn!(%from, "stream-mode caller rejected (live mode = message API)");
+            debug!(%from, "stream-mode caller rejected (live mode = message API)");
             return self.rejection(now, cif, reject::MESSAGEAPI);
         }
         for block in &cif.extensions {
             match block {
                 HsExtension::Congestion(name) if name != "live" => {
-                    warn!(%from, name, "incompatible congestion controller");
+                    debug!(%from, name, "incompatible congestion controller");
                     return self.rejection(now, cif, reject::CONGESTION);
                 }
                 HsExtension::Unknown {
                     cmd: SRT_CMD_FILTER,
                     ..
                 } => {
-                    warn!(%from, "packet filter unsupported; rejecting");
+                    debug!(%from, "packet filter unsupported; rejecting");
                     return self.rejection(now, cif, reject::FILTER);
                 }
                 HsExtension::Unknown {
@@ -717,7 +729,7 @@ impl Listener {
                 HsExtension::Invalid { cmd, .. } => {
                     // Structurally broken block (bad SID length, short
                     // HSREQ...): libsrt answers with ROGUE, not silence.
-                    warn!(%from, cmd, "malformed handshake extension; rejecting");
+                    debug!(%from, cmd, "malformed handshake extension; rejecting");
                     return self.rejection(now, cif, reject::ROGUE);
                 }
                 _ => {}
@@ -726,7 +738,9 @@ impl Listener {
         // -- KMX (encryption.md §6.2, §8) --
         let Ok(crypto_cfg) = &self.crypto_cfg else {
             // Locally invalid crypto options: fail closed (see field doc).
-            warn!(%from, "invalid local crypto options; rejecting");
+            // `Listener::new` already warned once about the bad option set;
+            // this per-conclusion line stays at debug.
+            debug!(%from, "invalid local crypto options; rejecting");
             return self.rejection(now, cif, reject::UNSECURE);
         };
         let kmreq = cif.extensions.iter().find_map(|e| match e {
@@ -742,7 +756,7 @@ impl Listener {
             // are not implemented — always-enforced library, the
             // connection is rejected instead.
             (None, Some(_)) => {
-                warn!(%from, "caller requires encryption, no local passphrase; rejecting");
+                debug!(%from, "caller requires encryption, no local passphrase; rejecting");
                 return self.rejection(now, cif, reject::UNSECURE);
             }
             // §8 row 5: local passphrase but no KMX from the caller —
@@ -752,7 +766,7 @@ impl Listener {
             // always-enforced library, the connection is rejected
             // instead.
             (Some(_), None) => {
-                warn!(%from, "local passphrase but caller sent no KMREQ; rejecting");
+                debug!(%from, "local passphrase but caller sent no KMREQ; rejecting");
                 return self.rejection(now, cif, reject::UNSECURE);
             }
             (Some(cfg), Some(km)) => match Crypto::new_responder(cfg.clone(), km) {
@@ -770,7 +784,7 @@ impl Listener {
                 // fake TX context) are not implemented — always-enforced
                 // library, the connection is rejected instead.
                 Err(state) => {
-                    warn!(%from, ?state, "handshake KMX failed; rejecting");
+                    debug!(%from, ?state, "handshake KMX failed; rejecting");
                     let code = if state == KmState::BadSecret {
                         reject::BADSECRET
                     } else {
@@ -955,7 +969,7 @@ fn adopt_peer_pbkeylen(cfg: &mut CryptoConfig, advert: u16, own_set: bool) {
         }
         Some(_) => {}
         None if advert == 0 => {}
-        None => warn!(advert, "invalid PBKEYLEN advert ignored"),
+        None => debug!(advert, "invalid PBKEYLEN advert ignored"),
     }
 }
 

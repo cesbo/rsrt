@@ -3,8 +3,8 @@
 use std::net::Ipv4Addr;
 
 use tracing::{
+    debug,
     trace,
-    warn,
 };
 
 use super::{
@@ -376,7 +376,7 @@ impl HsExtFields {
             ));
         }
         if content.len() > 12 {
-            warn!(
+            debug!(
                 len = content.len(),
                 "HSREQ/HSRSP longer than 3 words, extra ignored"
             );
@@ -462,7 +462,7 @@ fn parse_extensions(mut buf: &[u8]) -> Result<Vec<HsExtension>, PacketError> {
     if !buf.is_empty() {
         // libsrt sizes the extension region in whole 32-bit words; 1-3
         // stray trailing bytes after the last block are ignored, not fatal.
-        warn!(
+        debug!(
             len = buf.len(),
             "trailing bytes after extension blocks ignored"
         );
@@ -480,7 +480,7 @@ fn parse_extension(cmd: u16, content: &[u8]) -> HsExtension {
             Ok(fields) if cmd == SRT_CMD_HSREQ => HsExtension::HsReq(fields),
             Ok(fields) => HsExtension::HsRsp(fields),
             Err(e) => {
-                warn!(cmd, len = content.len(), %e, "malformed HSREQ/HSRSP kept as invalid block");
+                debug!(cmd, len = content.len(), %e, "malformed HSREQ/HSRSP kept as invalid block");
                 HsExtension::Invalid {
                     cmd,
                     data: content.to_vec(),
@@ -491,7 +491,7 @@ fn parse_extension(cmd: u16, content: &[u8]) -> HsExtension {
         SRT_CMD_KMRSP => HsExtension::KmRsp(content.to_vec()),
         SRT_CMD_SID => {
             if content.is_empty() || content.len() > 512 {
-                warn!(
+                debug!(
                     len = content.len(),
                     "stream id length out of range; kept as invalid block"
                 );

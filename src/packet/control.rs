@@ -1,8 +1,8 @@
 //! Control packets: wire layout per docs/spec/packets.md.
 
 use tracing::{
+    debug,
     trace,
-    warn,
 };
 
 use super::{
@@ -260,7 +260,7 @@ fn parse_ack_cif(cif: &[u8]) -> Result<AckCif, PacketError> {
         return Err(PacketError::BadCif("ACK CIF shorter than 4 words"));
     }
     if !cif.len().is_multiple_of(4) {
-        warn!(
+        debug!(
             len = cif.len(),
             "ACK CIF length not a multiple of 4; ignoring trailing bytes"
         );
@@ -311,7 +311,7 @@ fn parse_loss_list(cif: &[u8]) -> Result<Vec<LossRange>, PacketError> {
         return Err(PacketError::BadCif("empty NAK loss list"));
     }
     if !cif.len().is_multiple_of(4) {
-        warn!(
+        debug!(
             len = cif.len(),
             "NAK CIF length not a multiple of 4; ignoring trailing bytes"
         );

@@ -292,11 +292,11 @@ impl Crypto {
         // answered BADSECRET by srtcore itself; every later validation
         // failure is NOSECRET class except the unwrap ICV (§3.1).
         if kmreq.len() <= KM_HEADER_LEN || kmreq[15] == 0 {
-            warn!(kmreq_len = kmreq.len(), "handshake KMREQ failed pre-checks");
+            debug!(kmreq_len = kmreq.len(), "handshake KMREQ failed pre-checks");
             return Err(KmState::BadSecret);
         }
         let msg = KmMessage::parse(kmreq).map_err(|err| {
-            warn!(?err, "handshake KMREQ rejected");
+            debug!(?err, "handshake KMREQ rejected");
             KmState::NoSecret
         })?;
         // §6.2 step 2 / §7 trap: adopt the sender's key length for BOTH
@@ -558,7 +558,7 @@ impl Crypto {
                     // Ignored-and-keep-retrying converges to SECURED with
                     // no wire-visible difference and no self-inflicted
                     // delivery outage.
-                    warn!(
+                    debug!(
                         kmrsp_len = echo.len(),
                         "KMRSP echo does not match outstanding KMREQ"
                     );
@@ -566,7 +566,7 @@ impl Crypto {
                 }
             },
             Err(_) => {
-                warn!(kmrsp_len = payload.len(), "malformed KMRSP ignored");
+                debug!(kmrsp_len = payload.len(), "malformed KMRSP ignored");
                 KmRspOutcome::Ignored
             }
         }
