@@ -4,7 +4,10 @@
 //! under full parallel suite load, not performance assertions.
 
 use std::{
-    net::Ipv4Addr,
+    net::{
+        Ipv4Addr,
+        SocketAddrV4,
+    },
     time::{
         Duration,
         Instant,
@@ -62,6 +65,44 @@ async fn connect_and_accept() {
     assert_eq!(accepted.streamid(), None);
     caller.close().await.expect("caller close");
     accepted.close().await.expect("accepted close");
+}
+
+/// Multi-homed/policy-routing support: the caller socket binds the
+/// configured `local_addr` before connecting, and the listener sees
+/// exactly that source (address from the option, kernel-picked port).
+#[tokio::test]
+async fn connect_from_explicit_local_addr() {
+    let mut listener = SrtListener::bind("127.0.0.1:0", SrtOptions::default())
+        .await
+        .expect("listener bind");
+    let addr = listener.local_addr();
+    let copts = SrtOptions::default().local_addr(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+    let handshake = async { tokio::join!(SrtSocket::connect(addr, copts), listener.accept()) };
+    let (caller, accepted) = tokio::time::timeout(Duration::from_secs(5), handshake)
+        .await
+        .expect("handshake timed out");
+    let caller = caller.expect("connect");
+    let (accepted, peer) = accepted.expect("accept");
+    assert_eq!(peer.ip(), &Ipv4Addr::LOCALHOST);
+    caller.close().await.expect("caller close");
+    accepted.close().await.expect("accepted close");
+}
+
+/// A source address the host does not own must surface the kernel's
+/// EADDRNOTAVAIL — never a silent fallback to another interface, which
+/// would defeat policy routing.
+#[tokio::test]
+async fn connect_with_unassigned_local_addr_fails_fast() {
+    // 192.0.2.0/24 is TEST-NET-1 (RFC 5737): never assigned locally.
+    let opts = SrtOptions::default().local_addr(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 0));
+    let err = SrtSocket::connect("127.0.0.1:9", opts)
+        .await
+        .err()
+        .expect("unassigned local address must fail");
+    match err {
+        SrtError::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::AddrNotAvailable, "{e}"),
+        other => panic!("expected Io(AddrNotAvailable), got {other:?}"),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

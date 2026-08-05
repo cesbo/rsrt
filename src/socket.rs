@@ -494,10 +494,10 @@ impl SrtSocket {
         // setsockopt; connect is this crate's earliest equivalent.
         opts.bandwidth.validate()?;
         let remote = net::resolve_v4(addr).await?;
-        let udp = net::bind_udp(
-            SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
-            opts.udp_recv_buffer,
-        )?;
+        let local = opts
+            .local_addr
+            .unwrap_or(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
+        let udp = net::bind_udp(local, opts.udp_recv_buffer)?;
         udp.connect(remote).await?;
         let connect_timeout = opts.connect_timeout;
         let conn = Connection::connect(

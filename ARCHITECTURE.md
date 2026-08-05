@@ -157,6 +157,8 @@ then: drain poll_transmit -> socket.send_to, drain poll_deliver -> data mpsc
   sized before `bind`, deliberately no `SO_REUSEADDR` — a duplicate bind on an
   SRT port must fail instead of hijacking traffic), then
   `set_nonblocking(true)` → `tokio::net::UdpSocket::from_std`. IPv4 only.
+  Callers may pin the source address (`SrtOptions::local_addr`) for
+  multi-homed / policy-routing setups.
 
 ## Conventions
 

@@ -2,6 +2,7 @@
 
 use std::{
     fmt,
+    net::SocketAddrV4,
     time::Duration,
 };
 
@@ -119,6 +120,15 @@ pub struct SrtOptions {
     pub bandwidth: Bandwidth,
     /// UDP socket receive buffer size in bytes (SO_RCVBUF), if set.
     pub udp_recv_buffer: Option<usize>,
+    /// Local UDP address a caller binds to before connecting
+    /// (multi-homed hosts, policy routing): pins the source address
+    /// and/or the local port — the peer then sees exactly this source.
+    /// Port 0 lets the kernel pick an ephemeral port. `None` (default)
+    /// binds `0.0.0.0:0`. Binding an address the host does not own fails
+    /// with `SrtError::Io` (`AddrNotAvailable`); there is no silent
+    /// fallback to another interface. Ignored by `SrtListener::bind`,
+    /// whose bind address is the explicit argument.
+    pub local_addr: Option<SocketAddrV4>,
     /// Encryption passphrase (SRTO_PASSPHRASE). `None` or empty =
     /// unencrypted. When set: 10..=80 bytes (libsrt's code accepts 80
     /// despite `srt.h` documenting 79; docs/spec/encryption.md §2).
@@ -163,6 +173,7 @@ impl fmt::Debug for SrtOptions {
             .field("data_idle_timeout", &self.data_idle_timeout)
             .field("bandwidth", &self.bandwidth)
             .field("udp_recv_buffer", &self.udp_recv_buffer)
+            .field("local_addr", &self.local_addr)
             .field("passphrase", &self.passphrase.as_ref().map(|_| "<redacted>"))
             .field("pbkeylen", &self.pbkeylen)
             .field("km_refresh_rate", &self.km_refresh_rate)
@@ -186,6 +197,7 @@ impl Default for SrtOptions {
             data_idle_timeout: None,
             bandwidth: Bandwidth::Unlimited,
             udp_recv_buffer: None,
+            local_addr: None,
             passphrase: None,
             pbkeylen: None,
             km_refresh_rate: None,
@@ -237,6 +249,11 @@ impl SrtOptions {
 
     pub fn passphrase(mut self, passphrase: impl Into<String>) -> Self {
         self.passphrase = Some(Zeroizing::new(passphrase.into()));
+        self
+    }
+
+    pub fn local_addr(mut self, addr: SocketAddrV4) -> Self {
+        self.local_addr = Some(addr);
         self
     }
 
