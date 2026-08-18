@@ -805,6 +805,133 @@ mod tests {
         flags
     }
 
+    // -- CVE-2026-55869 regression (libsrt KMREQ/KMRSP buffer overflow) ------
+    //
+    // libsrt <= 1.5.5 (core.cpp `processSrtMsg` / crypto.cpp
+    // `processSrtMsg_KMREQ`) copies `len / 4` words of a received KM control
+    // message into a FIXED 104-byte stack array `srtdata_out[SRTDATA_MAXSIZE]`
+    // (crypto.cpp:150-151) with no bounds check, so any KM payload longer than
+    // 104 bytes overflows the stack (CVSS 9.1; fixed in 1.5.6 by adding the
+    // `len <= sizeof srtdata_out` guard). rsrt cannot have this bug class: the
+    // KM payload arrives as a length-carrying `&[u8]` (the slice length IS the
+    // real buffer size — never a separate, larger attacker-supplied count),
+    // every field access is bounds-checked, `KmMessage::parse` pins the exact
+    // total length before use, the ONLY fixed-size destination is the 16-byte
+    // salt (kept in bounds by that length check), and the variable wrap blob
+    // lands in an auto-sized `Vec`. These tests feed the same oversized and
+    // misaligned inputs that overflow libsrt into every rsrt KM ingest
+    // entrypoint and assert they are rejected without a panic, out-of-bounds
+    // access, or unbounded allocation. The matching libsrt overflow is proven
+    // under AddressSanitizer in the analysis writeup accompanying this commit.
+
+    /// The exact byte construction shared with the libsrt AddressSanitizer
+    /// reproduction: a 16-byte even/AES-128 KM header followed by `0xAA`
+    /// filler, sized to `n` bytes. Only the length matters to the overflow.
+    fn malicious_km(n: usize) -> Vec<u8> {
+        #[rustfmt::skip]
+        const HDR: [u8; 16] = [
+            0x12, 0x20, 0x29, 0x01, 0x00, 0x00, 0x00, 0x00,
+            0x02, 0x00, 0x02, 0x00, 0x00, 0x00, 0x04, 0x04,
+        ];
+        let mut v = vec![0xAA_u8; n];
+        for (i, b) in HDR.iter().enumerate().take(n) {
+            v[i] = *b;
+        }
+        v
+    }
+
+    /// libsrt's `srtdata_out` is 104 bytes; anything longer overflows it.
+    /// Sweep from empty through 1 MiB, across the 104-byte boundary and
+    /// several non-word-aligned sizes.
+    #[rustfmt::skip]
+    const CVE_LENGTHS: &[usize] = &[
+        0, 1, 4, 7, 15, 16, 17, 31, 32, 55, 56, 57, 63, 72, 88, 103,
+        104, 105, 107, 108, 128, 256, 1024, 4096, 65536, 65537, 1 << 20,
+    ];
+
+    #[test]
+    fn cve_2026_55869_km_ingest_never_panics_or_overflows() {
+        use std::panic::{
+            catch_unwind,
+            AssertUnwindSafe,
+        };
+
+        // Reused across lengths: the handlers re-parse each payload, so their
+        // prior state is irrelevant to the panic/rejection invariant, and this
+        // keeps the (PBKDF2) key setup out of the hot loop.
+        let (_caller, mut responder) = kmx_pair(KeyLength::Aes128);
+        let mut initiator = Crypto::new_initiator(config(KeyLength::Aes128));
+
+        for &n in CVE_LENGTHS {
+            let buf = malicious_km(n);
+
+            // 1. Codec — the direct analogue of libsrt's overflowing copy.
+            assert!(
+                catch_unwind(|| KmMessage::parse(&buf)).is_ok(),
+                "KmMessage::parse panicked at len {n}"
+            );
+            // 2. Handshake KMREQ handler (responder side).
+            assert!(
+                catch_unwind(|| Crypto::new_responder(config(KeyLength::Aes128), &buf)).is_ok(),
+                "Crypto::new_responder panicked at len {n}"
+            );
+            // 3. In-stream KMREQ handler.
+            let inflight = catch_unwind(AssertUnwindSafe(|| responder.handle_kmreq(&buf)));
+            assert!(inflight.is_ok(), "handle_kmreq panicked at len {n}");
+            assert!(
+                matches!(inflight.unwrap(), KmReqOutcome::Failed(_)),
+                "bogus KMREQ at len {n} must be rejected, never installed"
+            );
+            // 4. KMRSP paths (also hardened by the CVE fix).
+            assert!(
+                catch_unwind(|| KmResponse::parse(&buf)).is_ok(),
+                "KmResponse::parse panicked at len {n}"
+            );
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| initiator.handle_kmrsp(&buf))).is_ok(),
+                "handle_kmrsp panicked at len {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn cve_2026_55869_oversized_kmreq_is_rejected() {
+        // Every payload longer than a legal KM (max 104 bytes, dual AES-256) —
+        // the ones that overflow libsrt — must be refused, never processed as
+        // if valid.
+        for &n in CVE_LENGTHS {
+            let buf = malicious_km(n);
+            let parse = KmMessage::parse(&buf);
+            if n == 56 {
+                // 56 bytes is a structurally valid single-key length: it must
+                // still PARSE (proving we reject on length, not blanket-fail),
+                // though its 0xAA wrap fails the crypto unwrap in new_responder.
+                assert!(parse.is_ok(), "valid 56-byte shape must parse");
+            } else {
+                assert!(parse.is_err(), "malformed/oversized len {n} must be rejected");
+            }
+            // The handshake responder — the exact path that overflows libsrt —
+            // rejects all of them (bad length or bogus crypto).
+            assert!(
+                Crypto::new_responder(config(KeyLength::Aes128), &buf).is_err(),
+                "new_responder must reject malicious KMREQ at len {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn cve_2026_55869_valid_kmreq_still_accepted() {
+        // The length hardening must not break legitimate key exchange: a real
+        // 56-byte even/AES-128 KMREQ must parse, unwrap and echo. Positive
+        // control — the analogue of libsrt's len=56 case that fits the buffer.
+        let initiator = Crypto::new_initiator(config(KeyLength::Aes128));
+        let kmreq = initiator.kmreq().expect("initial KMREQ");
+        assert_eq!(kmreq.len(), 56);
+        let (_responder, echo) = Crypto::new_responder(config(KeyLength::Aes128), &kmreq)
+            .expect("valid KMREQ must be accepted");
+        assert_eq!(echo, kmreq, "success KMRSP is the byte-exact echo");
+    }
+
     // -- Handshake KMX through the public API (§1, §6) ------------------------
 
     #[test]
