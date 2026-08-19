@@ -363,7 +363,7 @@ impl Sender {
             self.base_index += n;
             // Loss entries below the released region are obsolete.
             self.loss_list = self.loss_list.split_off(&self.base_index);
-            debug!(
+            trace!(
                 released = n,
                 ack_seq = cif.last_ack_seq.value(),
                 "send buffer released"
