@@ -531,9 +531,15 @@ benign race between sampling `kflg` and encrypting — do not copy it).
 Call site: `core.cpp:processData`, after the unit is inserted into the receive
 buffer.
 
-* **KK = 0** → `decrypt()` not even called; the packet is **delivered as
-  cleartext**. libsrt 1.4.4 performs no enforcement against unencrypted packets on
-  a secured link.
+* **KK = 0** → in libsrt 1.4.4 `decrypt()` is not even called and the packet is
+  **delivered as cleartext** — 1.4.4 performs no enforcement against unencrypted
+  packets on a secured link. **rsrt DIVERGES (CVE-2026-55868 hardening): a
+  cleartext data packet on an encrypted link is rejected as undecryptable and
+  never delivered.** A secured link's legitimate data always carries KK=Even/Odd
+  (the peer encrypts from the first packet; a mismatched peer is rejected at the
+  handshake, §8), so a KK=0 data packet is necessarily foreign/injected — accepting
+  it would let an on-path attacker inject cleartext into a "secured" stream. libsrt
+  1.5.6 adopted the same rejection ("unencrypted packets are not allowed").
 * **KK ≠ 0** → `crypto.cpp:CCryptoControl::decrypt`:
   * `RcvKmState == UNSECURED` + local passphrase → state → `SECURING`, drop
     ("surprise encryption": KMX still pending); no passphrase → state →
@@ -764,7 +770,8 @@ Mid-stream KMREQ → `crypto.cpp:processSrtMsg_KMREQ` → `HaiCrypt_Rx_Process`:
     the send buffer with identical rexmit bytes (§9.3); undecryptable packets
     ACKed, counted, silently discarded at delivery, and loss detection is
     suppressed for gaps they reveal — no LOSSREPORT (§9.4); cleartext KK=0
-    accepted on an encrypted link (§9.4); 10 retries at 1.5·RTT (§11.2);
+    rejected on an encrypted link in rsrt (CVE-2026-55868; libsrt 1.4.4 accepted
+    it, §9.4); 10 retries at 1.5·RTT (§11.2);
     unsolicited fake-KM KMREQ from a permissive failed-KMX responder (§6.2
     step 6).
 
@@ -823,8 +830,9 @@ Data path:
   bits + R flag). Re-encrypting a retransmission desyncs nothing visibly — the
   bytes are simply wrong at the receiver for that seqno (§9.3).
 * **KK routing on RX is mechanical**: KK=1→even slot, KK=2→odd slot, illegal
-  KK=3→odd slot (no rejection); KK=0 bypasses decryption entirely and is
-  **delivered as cleartext even on a secured link** (§9.4).
+  KK=3→odd slot (no rejection); KK=0 is **rejected as undecryptable on a secured
+  link in rsrt** (CVE-2026-55868 hardening; libsrt 1.4.4 delivered it as
+  cleartext) (§9.4).
 * **Undecryptable packets are ACKed** and silently dropped at delivery time —
   never NAK them, never take connection action, do count them. **Also never NAK
   a sequence gap revealed by one**: libsrt gates loss detection on decrypt

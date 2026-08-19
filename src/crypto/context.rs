@@ -392,11 +392,19 @@ impl Crypto {
         }
     }
 
-    /// Decrypts in place. `EncryptionFlags::None` on an encrypted link is
-    /// cleartext passthrough (§9.4 trap: no enforcement). `Both` (illegal
-    /// on data) selects the odd slot like libsrt (§9.4 trap). `Err(NoKey)`
-    /// ⇒ undecryptable: the packet must still occupy its sequence slot
-    /// (ACKed, never NAK-repaired) but must not be delivered.
+    /// Decrypts in place. A cleartext (`EncryptionFlags::None`) data packet on
+    /// an encrypted link is REJECTED as undecryptable — the CVE-2026-55868
+    /// hardening: a secured connection's legitimate data always carries
+    /// KK=Even/Odd (the sender encrypts from the first packet; a mismatched
+    /// peer is rejected at the handshake, §8), so a cleartext data packet is
+    /// necessarily foreign/injected and must never reach the application.
+    /// This keeps `always-enforced` encryption true on the RX data path, not
+    /// only at handshake time. (libsrt ≤1.4.4 delivered such packets — the
+    /// `§9.4` "no enforcement" trap we used to mirror; libsrt 1.5.6 rejects
+    /// them, "unencrypted packets are not allowed".) `Both` (illegal on data)
+    /// selects the odd slot like libsrt (§9.4 trap). `Err(NoKey)` ⇒
+    /// undecryptable: the packet still occupies its sequence slot (ACKed,
+    /// never NAK-repaired) but is not delivered.
     pub fn decrypt(
         &mut self,
         seq: SeqNumber,
@@ -406,7 +414,8 @@ impl Crypto {
         // §9.4: routing is purely mechanical — `ctx_pair[KK >> 1]`, so
         // KK=1 → even, KK=2 → odd and the illegal-on-data KK=3 → odd.
         let slot = match kk {
-            EncryptionFlags::None => return Ok(()),
+            // CVE-2026-55868: cleartext is not accepted on an encrypted link.
+            EncryptionFlags::None => return Err(CryptoError::NoKey),
             EncryptionFlags::Even => EVEN,
             EncryptionFlags::Odd | EncryptionFlags::Both => ODD,
         };
@@ -1062,15 +1071,19 @@ mod tests {
     // -- Data path (§9) --------------------------------------------------------
 
     #[test]
-    fn decrypt_none_is_cleartext_passthrough() {
-        // §9.4 trap: KK=0 bypasses decryption even on a secured link.
+    fn decrypt_none_is_rejected_on_encrypted_link() {
+        // CVE-2026-55868 hardening: cleartext (KK=0) is NOT accepted on a
+        // secured link. Legitimate data on a secured connection always carries
+        // KK=Even/Odd, so a cleartext data packet is foreign (injected) and
+        // must never be delivered — the packet is reported undecryptable.
         let (_, mut listener) = kmx_pair(KeyLength::Aes128);
         let clear = b"plaintext stays".to_vec();
         let mut buf = clear.clone();
-        listener
-            .decrypt(seq(9), EncryptionFlags::None, &mut buf)
-            .unwrap();
-        assert_eq!(buf, clear);
+        assert_eq!(
+            listener.decrypt(seq(9), EncryptionFlags::None, &mut buf),
+            Err(CryptoError::NoKey)
+        );
+        assert_eq!(buf, clear, "payload left untouched by the drop");
     }
 
     #[test]
@@ -1118,7 +1131,7 @@ mod tests {
         // §1.1/§9.4 surprise encryption: encrypted data reaching an
         // initiator before the echo KMRSP confirmed — UNSECURED flips to
         // SECURING (a passphrase is always present) and nothing is
-        // delivered until the KMX completes; KK=0 cleartext still passes.
+        // delivered until the KMX completes; KK=0 cleartext is rejected too.
         let mut caller = Crypto::new_initiator(config(KeyLength::Aes128));
         let kmreq = caller.kmreq().unwrap();
         let (mut listener, kmrsp) =
@@ -1141,12 +1154,14 @@ mod tests {
             caller.decrypt(seq(5), flags, &mut buf),
             Err(CryptoError::NoKey)
         );
-        // ...but KK=0 passes through the gate untouched (§9.4 trap).
+        // ...and KK=0 cleartext is rejected too (CVE-2026-55868): an
+        // encrypted link never delivers unencrypted data.
         let mut plain = b"cleartext".to_vec();
-        caller
-            .decrypt(seq(6), EncryptionFlags::None, &mut plain)
-            .unwrap();
-        assert_eq!(plain, b"cleartext");
+        assert_eq!(
+            caller.decrypt(seq(6), EncryptionFlags::None, &mut plain),
+            Err(CryptoError::NoKey)
+        );
+        assert_eq!(plain, b"cleartext", "payload untouched by the drop");
 
         // The echo confirmation re-secures RX; the same packet decrypts.
         assert_eq!(caller.handle_kmrsp(&kmrsp), KmRspOutcome::Confirmed);

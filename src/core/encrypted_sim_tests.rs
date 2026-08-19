@@ -47,6 +47,7 @@ use crate::{
     packet::{
         ControlPacket,
         ControlType,
+        DataPacket,
         EncryptionFlags,
         Packet,
         SeqNumber,
@@ -724,4 +725,69 @@ fn undecryptable_arrivals_are_acked_and_reveal_no_naks() {
     assert_eq!(ls.undecrypted_pkts, odd_wire);
     assert_contiguous(&sim.listener_rx, (flags.len() as u64 - odd_wire) as u32);
     assert!(sim.both_established());
+}
+
+/// CVE-2026-55868 regression: an established, SECURED encrypted receiver must
+/// NOT deliver an attacker-injected cleartext (KK=None) data packet. Before
+/// the hardening, `Crypto::decrypt` passed KK=None through and the payload was
+/// delivered (a stream-injection downgrade). Now it is rejected as
+/// undecryptable — ACKed but never delivered — while the legitimate encrypted
+/// stream keeps flowing.
+#[test]
+fn cve_2026_55868_cleartext_injection_rejected_on_secured_link() {
+    let t0 = Instant::now();
+    let mut sim = Sim::new(t0, crypto_opts(None), crypto_opts(None), 0xC0FFEE);
+    sim.establish();
+
+    // Legitimate encrypted stream delivers, and really is encrypted on the wire.
+    sim.stream_caller(0, 6, 5);
+    sim.run_for(300);
+    let legit = sim.listener_rx.len();
+    assert!(legit >= 1, "encrypted stream must deliver");
+    assert!(
+        sim.to_listener
+            .first_send_flags()
+            .iter()
+            .all(|f| *f != EncryptionFlags::None),
+        "caller data really is encrypted on the wire"
+    );
+
+    // Capture the next real data packet (valid seq/ts/dst), drop its encrypted
+    // original, and re-issue the same envelope as CLEARTEXT with an
+    // attacker-chosen plaintext — an on-path attacker's exact capability.
+    let now = sim.now;
+    sim.caller.send(now, payload(6)).unwrap();
+    let mut template = None;
+    while let Some(p) = sim.caller.poll_transmit(now) {
+        match p {
+            Packet::Data(d) => {
+                template = Some(d);
+                break;
+            }
+            other => sim.to_listener.push(now, other),
+        }
+    }
+    let template = template.expect("caller emitted a data packet");
+    assert_ne!(template.encryption, EncryptionFlags::None, "template was encrypted");
+
+    const MARKER: &[u8] = b"ATTACKER-INJECTED-CLEARTEXT-PAYLOAD-0123456789ABCDEF-PAD-64B!!";
+    let injected = DataPacket {
+        encryption: EncryptionFlags::None,
+        payload: Bytes::copy_from_slice(MARKER),
+        ..template
+    };
+    sim.accepted_mut().handle_packet(now, Packet::Data(injected));
+    sim.run_for(500);
+
+    assert!(
+        !sim.listener_rx.iter().any(|(_, d)| d.as_ref() == MARKER),
+        "SECURITY: cleartext injected on a SECURED encrypted link was delivered"
+    );
+    // The undecryptable injection is accounted, and the legitimate stream is
+    // unharmed (the pre-hardening bug delivered the marker instead).
+    assert!(
+        sim.accepted_mut().stats().undecrypted_pkts >= 1,
+        "the rejected cleartext packet is counted as undecryptable"
+    );
+    assert!(sim.both_established(), "connection stays up");
 }

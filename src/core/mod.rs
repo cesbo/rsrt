@@ -1050,10 +1050,12 @@ fn transmission_pair(
 }
 
 /// Feeds one data packet to the receiver through the decrypt step.
-/// Cleartext (KK = None) is accepted even on a secured link — a rule owned
-/// by [`Crypto::decrypt`]. An undecryptable packet (no usable key for its
-/// KK slot) still occupies its sequence slot and is ACKed, but is never
-/// delivered and never NAK-repaired.
+/// On an encrypted link (`crypto` present) a cleartext (KK = None) packet is
+/// rejected as undecryptable — the CVE-2026-55868 hardening owned by
+/// [`Crypto::decrypt`]; on an unencrypted link cleartext is the only thing
+/// accepted. An undecryptable packet (cleartext on a secured link, or no
+/// usable key for its KK slot) still occupies its sequence slot and is ACKed,
+/// but is never delivered and never NAK-repaired.
 fn ingest_data(
     now: Instant,
     receiver: &mut Receiver,

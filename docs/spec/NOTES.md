@@ -215,8 +215,10 @@ Pointers only — details live there:
   §9.2.
 - Encrypt once / retransmit ciphertext; undecryptable packets are ACKed then
   dropped at delivery (and sequence gaps they reveal are **never loss-detected
-  or NAKed** — libsrt gates loss detection on decrypt success); KK=0 always
-  delivered — `encryption.md` §9.3–9.4.
+  or NAKed** — libsrt gates loss detection on decrypt success); KK=0 cleartext on
+  an encrypted link is **rejected as undecryptable in rsrt** (CVE-2026-55868
+  hardening; libsrt 1.4.4 delivered it, 1.5.6 also rejects) — `encryption.md`
+  §9.3–9.4.
 - A permissive failed-KMX responder with a passphrase sends an **unsolicited
   in-stream KMREQ** (fake KM) on the first ACK it receives, retried ×10 —
   `encryption.md` §6.2 step 6.
