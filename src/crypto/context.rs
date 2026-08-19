@@ -392,17 +392,11 @@ impl Crypto {
         }
     }
 
-    /// Decrypts in place. A cleartext (`EncryptionFlags::None`) data packet on
-    /// an encrypted link is REJECTED as undecryptable — the CVE-2026-55868
-    /// hardening: a secured connection's legitimate data always carries
-    /// KK=Even/Odd (the sender encrypts from the first packet; a mismatched
-    /// peer is rejected at the handshake, §8), so a cleartext data packet is
-    /// necessarily foreign/injected and must never reach the application.
-    /// This keeps `always-enforced` encryption true on the RX data path, not
-    /// only at handshake time. (libsrt ≤1.4.4 delivered such packets — the
-    /// `§9.4` "no enforcement" trap we used to mirror; libsrt 1.5.6 rejects
-    /// them, "unencrypted packets are not allowed".) `Both` (illegal on data)
-    /// selects the odd slot like libsrt (§9.4 trap). `Err(NoKey)` ⇒
+    /// Decrypts in place. A cleartext (`EncryptionFlags::None`) data packet is
+    /// rejected as undecryptable (CVE-2026-55868): legitimate data on an
+    /// encrypted link always carries KK=Even/Odd, so cleartext is necessarily
+    /// injected and must never reach the application. `Both` (illegal on
+    /// data) selects the odd slot like libsrt (§9.4 trap). `Err(NoKey)` ⇒
     /// undecryptable: the packet still occupies its sequence slot (ACKed,
     /// never NAK-repaired) but is not delivered.
     pub fn decrypt(
@@ -1072,10 +1066,9 @@ mod tests {
 
     #[test]
     fn decrypt_none_is_rejected_on_encrypted_link() {
-        // CVE-2026-55868 hardening: cleartext (KK=0) is NOT accepted on a
-        // secured link. Legitimate data on a secured connection always carries
-        // KK=Even/Odd, so a cleartext data packet is foreign (injected) and
-        // must never be delivered — the packet is reported undecryptable.
+        // CVE-2026-55868: cleartext (KK=0) is rejected as undecryptable —
+        // legitimate data on a secured link always carries KK=Even/Odd, so
+        // cleartext is necessarily injected and must never be delivered.
         let (_, mut listener) = kmx_pair(KeyLength::Aes128);
         let clear = b"plaintext stays".to_vec();
         let mut buf = clear.clone();

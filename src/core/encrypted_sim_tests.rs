@@ -728,11 +728,9 @@ fn undecryptable_arrivals_are_acked_and_reveal_no_naks() {
 }
 
 /// CVE-2026-55868 regression: an established, SECURED encrypted receiver must
-/// NOT deliver an attacker-injected cleartext (KK=None) data packet. Before
-/// the hardening, `Crypto::decrypt` passed KK=None through and the payload was
-/// delivered (a stream-injection downgrade). Now it is rejected as
-/// undecryptable — ACKed but never delivered — while the legitimate encrypted
-/// stream keeps flowing.
+/// not deliver an attacker-injected cleartext (KK=None) data packet — it is
+/// rejected as undecryptable (ACKed, counted, never delivered) while the
+/// legitimate encrypted stream keeps flowing.
 #[test]
 fn cve_2026_55868_cleartext_injection_rejected_on_secured_link() {
     let t0 = Instant::now();
@@ -783,8 +781,8 @@ fn cve_2026_55868_cleartext_injection_rejected_on_secured_link() {
         !sim.listener_rx.iter().any(|(_, d)| d.as_ref() == MARKER),
         "SECURITY: cleartext injected on a SECURED encrypted link was delivered"
     );
-    // The undecryptable injection is accounted, and the legitimate stream is
-    // unharmed (the pre-hardening bug delivered the marker instead).
+    // The rejected injection is counted as undecryptable, and the legitimate
+    // stream is unharmed.
     assert!(
         sim.accepted_mut().stats().undecrypted_pkts >= 1,
         "the rejected cleartext packet is counted as undecryptable"
