@@ -1,5 +1,8 @@
 # rsrt
 
+[![Latest version](https://img.shields.io/crates/v/bitflags.svg)](https://crates.io/crates/bitflags)
+[![Documentation](https://docs.rs/bitflags/badge.svg)](https://docs.rs/bitflags)
+
 SRT (Secure Reliable Transport) protocol library in pure Rust — no C
 dependencies, async (tokio). Live transmission mode over UDP with TSBPD
 (timestamp-based packet delivery) including clock-drift compensation, ARQ
