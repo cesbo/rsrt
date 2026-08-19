@@ -673,6 +673,13 @@ mod tests {
             ControlPacket::parse(&bytes),
             Err(PacketError::BadCif("NAK range missing end word"))
         );
+        // Lone range-first word (single 4-byte CIF) — libsrt's exact vector.
+        let mut lone = header(0x0003, 0);
+        lone.extend_from_slice(&[0x80, 0x00, 0x00, 0x64]);
+        assert_eq!(
+            ControlPacket::parse(&lone),
+            Err(PacketError::BadCif("NAK range missing end word"))
+        );
     }
 
     #[test]
@@ -719,12 +726,18 @@ mod tests {
 
     #[test]
     fn dropreq_short_cif_rejected() {
-        let mut bytes = header(0x0007, 0);
-        bytes.extend_from_slice(&[0, 0, 0, 0]); // only 1 word
-        assert!(matches!(
-            ControlPacket::parse(&bytes),
-            Err(PacketError::BadCif(_))
-        ));
+        // libsrt d7957ac (#3320): DROPREQ payloads shorter than two seqno
+        // words must be rejected before dropdata[0]/[1] are read. rsrt guards
+        // `cif.len() < 8`; even without it, read_u32 indexing would panic in
+        // safe Rust, never OOB-read adjacent heap as the C code did.
+        for short in [0usize, 1, 4, 7] {
+            let mut bytes = header(0x0007, 0);
+            bytes.extend_from_slice(&vec![0u8; short]);
+            assert!(
+                matches!(ControlPacket::parse(&bytes), Err(PacketError::BadCif(_))),
+                "DROPREQ CIF of {short} bytes must be rejected"
+            );
+        }
     }
 
     // ---- dispatch / errors ----
