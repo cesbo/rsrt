@@ -449,7 +449,7 @@ impl Receiver {
                 let lost = range.last.diff(range.first) as u64 + 1;
                 self.stats.pkts_lost += lost;
                 self.loss.push(range);
-                debug!(
+                trace!(
                     first = range.first.value(),
                     last = range.last.value(),
                     lost,
@@ -613,7 +613,7 @@ impl Receiver {
             self.next_nak_time = now + self.nak_interval;
         } else if now >= self.next_nak_time {
             let ranges = self.nak_ranges();
-            debug!(ranges = ranges.len(), "periodic NAK");
+            trace!(ranges = ranges.len(), "periodic NAK");
             self.queue_nak(ranges);
             self.next_nak_time = now + self.nak_interval;
         }
