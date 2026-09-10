@@ -299,50 +299,41 @@ pub enum HsExtension {
 
 impl HsExtension {
     fn encode(&self, out: &mut Vec<u8>) {
-        let mut content = Vec::new();
         let cmd = match self {
-            HsExtension::HsReq(f) => {
-                f.encode(&mut content);
-                SRT_CMD_HSREQ
-            }
-            HsExtension::HsRsp(f) => {
-                f.encode(&mut content);
-                SRT_CMD_HSRSP
-            }
+            HsExtension::HsReq(_) => SRT_CMD_HSREQ,
+            HsExtension::HsRsp(_) => SRT_CMD_HSRSP,
+            HsExtension::StreamId(_) => SRT_CMD_SID,
+            HsExtension::KmReq(_) => SRT_CMD_KMREQ,
+            HsExtension::KmRsp(_) => SRT_CMD_KMRSP,
+            HsExtension::Congestion(_) => SRT_CMD_CONGESTION,
+            HsExtension::Invalid { cmd, .. } | HsExtension::Unknown { cmd, .. } => *cmd,
+        };
+        out.extend_from_slice(&cmd.to_be_bytes());
+        let len_at = out.len();
+        out.extend_from_slice(&[0, 0]); // length in words, backfilled below
+        match self {
+            HsExtension::HsReq(f) | HsExtension::HsRsp(f) => f.encode(out),
             HsExtension::StreamId(s) => {
                 debug_assert!(
                     !s.is_empty() && s.len() <= 512,
                     "stream id length out of range"
                 );
-                pack_string_words(s, &mut content);
-                SRT_CMD_SID
+                pack_string_words(s, out);
             }
-            HsExtension::KmReq(data) => {
-                content.extend_from_slice(data);
-                SRT_CMD_KMREQ
-            }
-            HsExtension::KmRsp(data) => {
-                content.extend_from_slice(data);
-                SRT_CMD_KMRSP
-            }
-            HsExtension::Congestion(s) => {
-                pack_string_words(s, &mut content);
-                SRT_CMD_CONGESTION
-            }
-            HsExtension::Invalid { cmd, data } | HsExtension::Unknown { cmd, data } => {
-                content.extend_from_slice(data);
-                *cmd
-            }
-        };
-        // KM/unknown payloads come from the wire and are already whole
-        // words; pad defensively so the length field stays truthful.
-        while content.len() % 4 != 0 {
-            content.push(0);
+            HsExtension::Congestion(s) => pack_string_words(s, out),
+            HsExtension::KmReq(data)
+            | HsExtension::KmRsp(data)
+            | HsExtension::Invalid { data, .. }
+            | HsExtension::Unknown { data, .. } => out.extend_from_slice(data),
         }
-        debug_assert!(content.len() / 4 <= u16::MAX as usize);
-        out.extend_from_slice(&cmd.to_be_bytes());
-        out.extend_from_slice(&((content.len() / 4) as u16).to_be_bytes());
-        out.extend_from_slice(&content);
+
+        let content_len = out.len() - len_at - 2;
+        debug_assert!(
+            content_len.is_multiple_of(4),
+            "extension content not word-sized"
+        );
+        debug_assert!(content_len / 4 <= u16::MAX as usize);
+        out[len_at .. len_at + 2].copy_from_slice(&((content_len / 4) as u16).to_be_bytes());
     }
 }
 
