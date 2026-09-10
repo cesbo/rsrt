@@ -362,23 +362,11 @@ impl Connection {
         }
     }
 
-    /// Feeds one raw UDP datagram payload.
-    /// Used on the caller path where the datagram lives in a reused
-    /// scratch buffer.
-    pub fn handle_datagram(&mut self, now: Instant, datagram: &[u8]) {
+    /// Feeds one raw UDP datagram. The driver hands over ownership so a
+    /// data packet's payload is sliced out with no copy.
+    pub fn handle_datagram(&mut self, now: Instant, datagram: Bytes) {
         let len = datagram.len();
-        self.dispatch_datagram(now, Packet::parse(datagram), len);
-    }
-
-    /// Feeds one raw UDP datagram the driver already OWNS (demux path). The
-    /// data-packet payload is sliced out with no copy (`DataPacket::parse_owned`).
-    pub fn handle_datagram_owned(&mut self, now: Instant, datagram: Bytes) {
-        let len = datagram.len();
-        self.dispatch_datagram(now, Packet::parse_owned(datagram), len);
-    }
-
-    fn dispatch_datagram(&mut self, now: Instant, parsed: Result<Packet, PacketError>, len: usize) {
-        match parsed {
+        match Packet::parse(datagram) {
             Ok(packet) => self.handle_packet(now, packet),
             Err(PacketError::UnknownControlType(t)) => {
                 // Ignored, but still counts as peer activity: libsrt resets
@@ -1594,11 +1582,12 @@ mod tests {
         // An unknown control type (0x7FFF user-defined) as a raw datagram.
         let mut unknown = vec![0xFF, 0xFF, 0x00, 0x00];
         unknown.extend_from_slice(&[0; 12]);
+        let unknown = Bytes::from(unknown);
         let mut now = t0;
         for _ in 0 .. 3 {
             // Every 4 s: a keepalive from the peer, then an unknown packet.
             now += Duration::from_secs(4);
-            c.handle_datagram(now, &unknown);
+            c.handle_datagram(now, unknown.clone());
             let mut t = now;
             while let Some(d) = c.next_deadline(t) {
                 if d > now + Duration::from_secs(4) {
@@ -1874,16 +1863,15 @@ mod tests {
     }
 
     #[test]
-    fn handle_datagram_owned_delivers_end_to_end() {
-        // The demux path feeds an owned datagram whose payload is sliced
-        // zero-copy; it must behave identically to the borrowed path and
-        // deliver the payload at its TSBPD deadline.
+    fn handle_datagram_delivers_payload_zero_copy() {
+        // The payload is sliced zero-copy out of the owned datagram and
+        // delivered at its TSBPD deadline.
         let t0 = Instant::now();
         let (mut c, _) = establish_pair(t0, SrtOptions::default(), SrtOptions::default());
         drain(&mut c, t0);
         let mut wire = Vec::new();
         data_packet(ISN.value(), CALLER_ID, b"owned path".to_vec()).encode(&mut wire);
-        c.handle_datagram_owned(t0 + MS, Bytes::from(wire));
+        c.handle_datagram(t0 + MS, Bytes::from(wire));
         assert_eq!(c.state(), ConnState::Established);
         let due = t0 + Duration::from_millis(125);
         assert_eq!(c.poll_deliver(due), Some(Bytes::from_static(b"owned path")));

@@ -77,30 +77,16 @@ pub(crate) fn put_u32(out: &mut Vec<u8>, value: u32) {
 }
 
 impl Packet {
-    /// Parses one UDP datagram payload as an SRT packet.
-    pub fn parse(buf: &[u8]) -> Result<Packet, PacketError> {
-        if buf.len() < HEADER_SIZE {
-            return Err(PacketError::TooShort);
-        }
-        // F bit: MSB of the first byte. 0 = data, 1 = control.
-        if buf[0] & 0x80 == 0 {
+    /// Parses one UDP datagram as an SRT packet. The datagram is owned so a
+    /// data packet's payload is sliced out with no copy (see
+    /// [`DataPacket::parse`]); control packets decode their fields and drop
+    /// the buffer.
+    pub fn parse(buf: Bytes) -> Result<Packet, PacketError> {
+        // F bit: MSB of the first byte. 0 = data, 1 = control. Each branch
+        // checks the header length itself; an empty datagram takes the
+        // control branch and fails there.
+        if buf.first().is_some_and(|b| b & 0x80 == 0) {
             Ok(Packet::Data(DataPacket::parse(buf)?))
-        } else {
-            Ok(Packet::Control(ControlPacket::parse(buf)?))
-        }
-    }
-
-    /// Parses one OWNED UDP datagram as an SRT packet, slicing a data
-    /// packet's payload with no copy (see [`DataPacket::parse_owned`]).
-    /// Control packets decode their fields out and drop the buffer, so this is
-    /// equivalent to [`Packet::parse`] for them.
-    pub fn parse_owned(buf: Bytes) -> Result<Packet, PacketError> {
-        if buf.len() < HEADER_SIZE {
-            return Err(PacketError::TooShort);
-        }
-        // F bit: MSB of the first byte. 0 = data, 1 = control.
-        if buf[0] & 0x80 == 0 {
-            Ok(Packet::Data(DataPacket::parse_owned(buf)?))
         } else {
             Ok(Packet::Control(ControlPacket::parse(&buf)?))
         }
@@ -168,14 +154,17 @@ mod tests {
             0x00, 0x00, 0x00, 0x01, 0xC0, 0x00, 0x00, 0x01, //
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05,
         ];
-        assert!(matches!(Packet::parse(&data), Ok(Packet::Data(_))));
+        assert!(matches!(
+            Packet::parse(Bytes::copy_from_slice(&data)),
+            Ok(Packet::Data(_))
+        ));
 
         // F = 1 → control packet (keepalive, no pad).
         let ctrl = [
             0x80, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05,
         ];
-        match Packet::parse(&ctrl) {
+        match Packet::parse(Bytes::copy_from_slice(&ctrl)) {
             Ok(Packet::Control(p)) => {
                 assert_eq!(p.control_type, ControlType::KeepAlive);
                 assert_eq!(p.dst_socket_id, SocketId(5));
@@ -185,33 +174,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_owned_dispatches_on_f_bit() {
-        let data = [
-            0x00, 0x00, 0x00, 0x01, 0xC0, 0x00, 0x00, 0x01, //
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05,
-        ];
-        assert!(matches!(
-            Packet::parse_owned(Bytes::copy_from_slice(&data)),
-            Ok(Packet::Data(_))
-        ));
-        let ctrl = [
-            0x80, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05,
-        ];
-        assert!(matches!(
-            Packet::parse_owned(Bytes::copy_from_slice(&ctrl)),
-            Ok(Packet::Control(_))
-        ));
+    fn parse_rejects_short_datagram() {
+        assert_eq!(Packet::parse(Bytes::new()), Err(PacketError::TooShort));
+        // Both branches: control (F = 1) and data (F = 0) headers cut short.
         assert_eq!(
-            Packet::parse_owned(Bytes::from_static(&[0x80; 15])),
+            Packet::parse(Bytes::from_static(&[0x80; 15])),
             Err(PacketError::TooShort)
         );
-    }
-
-    #[test]
-    fn parse_rejects_short_datagram() {
-        assert_eq!(Packet::parse(&[]), Err(PacketError::TooShort));
-        assert_eq!(Packet::parse(&[0x80; 15]), Err(PacketError::TooShort));
+        assert_eq!(
+            Packet::parse(Bytes::from_static(&[0x00; 15])),
+            Err(PacketError::TooShort)
+        );
     }
 
     #[test]
@@ -220,7 +193,7 @@ mod tests {
             0x80, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
             0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x07,
         ];
-        let p = Packet::parse(&ctrl).unwrap();
+        let p = Packet::parse(Bytes::copy_from_slice(&ctrl)).unwrap();
         assert_eq!(p.timestamp(), Timestamp(0x100));
         assert_eq!(p.dst_socket_id(), SocketId(7));
     }
@@ -234,6 +207,6 @@ mod tests {
         });
         let mut out = Vec::new();
         p.encode(&mut out);
-        assert_eq!(Packet::parse(&out).unwrap(), p);
+        assert_eq!(Packet::parse(Bytes::from(out)).unwrap(), p);
     }
 }

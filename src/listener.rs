@@ -28,6 +28,7 @@ use std::{
     time::Instant,
 };
 
+use bytes::Bytes;
 use tokio::{
     net::{
         ToSocketAddrs,
@@ -253,7 +254,7 @@ impl ListenerDriver {
         }
 
         // dst 0: connection-request path (NOTES.md routing rule).
-        let packet = match Packet::parse(datagram) {
+        let packet = match Packet::parse(Bytes::copy_from_slice(datagram)) {
             Ok(p) => p,
             Err(e) => {
                 debug!(%from, %e, "undecodable dst-0 datagram dropped");

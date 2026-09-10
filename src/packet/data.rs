@@ -11,6 +11,7 @@ use super::{
         Timestamp,
     },
     PacketError,
+    HEADER_SIZE,
 };
 
 /// Packet position within a message (PP field).
@@ -84,51 +85,29 @@ pub struct DataPacket {
 }
 
 impl DataPacket {
-    /// Wire size of the data packet header.
-    pub const HEADER_SIZE: usize = 16;
-
-    /// Builds a data packet from a buffer already known to be ≥ HEADER_SIZE
-    /// and a payload acquired by the caller (copied, or sliced zero-copy).
-    fn from_parts(header: &[u8], payload: Bytes) -> DataPacket {
-        let word0 = read_u32(header, 0);
-        let word1 = read_u32(header, 4);
-        DataPacket {
+    /// Parses a data packet from an owned datagram, slicing the payload out
+    /// of `buf` with no copy.
+    pub fn parse(buf: Bytes) -> Result<DataPacket, PacketError> {
+        if buf.len() < HEADER_SIZE {
+            return Err(PacketError::TooShort);
+        }
+        let word0 = read_u32(&buf, 0);
+        let word1 = read_u32(&buf, 4);
+        Ok(DataPacket {
             seq: SeqNumber::new(word0 & SeqNumber::MASK),
             position: PacketPosition::from_bits(word1 >> 30),
             order: word1 & 0x2000_0000 != 0,
             encryption: EncryptionFlags::from_bits(word1 >> 27),
             retransmitted: word1 & 0x0400_0000 != 0,
             msg_number: MsgNumber::new(word1 & MsgNumber::MASK),
-            timestamp: Timestamp(read_u32(header, 8)),
-            dst_socket_id: SocketId(read_u32(header, 12)),
-            payload,
-        }
-    }
-
-    /// Parses a data packet from a borrowed buffer, copying the payload into
-    /// its own allocation (the caller path reads into a reused scratch).
-    pub fn parse(buf: &[u8]) -> Result<DataPacket, PacketError> {
-        if buf.len() < Self::HEADER_SIZE {
-            return Err(PacketError::TooShort);
-        }
-        Ok(Self::from_parts(
-            buf,
-            Bytes::copy_from_slice(&buf[Self::HEADER_SIZE ..]),
-        ))
-    }
-
-    /// Parses a data packet from an owned datagram, slicing the payload with
-    /// no copy (the demux path already owns the buffer).
-    pub fn parse_owned(buf: Bytes) -> Result<DataPacket, PacketError> {
-        if buf.len() < Self::HEADER_SIZE {
-            return Err(PacketError::TooShort);
-        }
-        let payload = buf.slice(Self::HEADER_SIZE ..);
-        Ok(Self::from_parts(&buf, payload))
+            timestamp: Timestamp(read_u32(&buf, 8)),
+            dst_socket_id: SocketId(read_u32(&buf, 12)),
+            payload: buf.slice(HEADER_SIZE ..),
+        })
     }
 
     /// Encodes the fixed-size data-packet header separately from the payload.
-    pub fn encode_header(&self) -> [u8; Self::HEADER_SIZE] {
+    pub fn encode_header(&self) -> [u8; HEADER_SIZE] {
         // F = 0 is implied: seq is 31-bit, MSB always clear.
         let word1 = ((self.position as u32) << 30)
             | ((self.order as u32) << 29)
@@ -136,7 +115,7 @@ impl DataPacket {
             | ((self.retransmitted as u32) << 26)
             | self.msg_number.value();
 
-        let mut header = [0u8; Self::HEADER_SIZE];
+        let mut header = [0u8; HEADER_SIZE];
         header[0 .. 4].copy_from_slice(&self.seq.value().to_be_bytes());
         header[4 .. 8].copy_from_slice(&word1.to_be_bytes());
         header[8 .. 12].copy_from_slice(&self.timestamp.0.to_be_bytes());
@@ -146,7 +125,7 @@ impl DataPacket {
 
     /// Appends the encoded packet (header + payload) to `out`.
     pub fn encode(&self, out: &mut Vec<u8>) {
-        out.reserve(Self::HEADER_SIZE + self.payload.len());
+        out.reserve(HEADER_SIZE + self.payload.len());
         out.extend_from_slice(&self.encode_header());
         out.extend_from_slice(&self.payload);
     }
@@ -199,7 +178,7 @@ mod tests {
             0x00, 0x00, 0x00, 0x01, // dst socket id 1
             0x01, 0x02, 0x03, // payload
         ];
-        let p = DataPacket::parse(&buf).unwrap();
+        let p = DataPacket::parse(Bytes::copy_from_slice(&buf)).unwrap();
         assert_eq!(p.seq, SeqNumber::new(SeqNumber::MASK));
         assert_eq!(p.position, PacketPosition::First);
         assert!(p.order);
@@ -236,7 +215,7 @@ mod tests {
                         };
                         let mut out = Vec::new();
                         p.encode(&mut out);
-                        assert_eq!(DataPacket::parse(&out).unwrap(), p);
+                        assert_eq!(DataPacket::parse(Bytes::from(out)).unwrap(), p);
                     }
                 }
             }
@@ -258,7 +237,8 @@ mod tests {
             sample().encode(&mut buf);
             // Patch the KK bits (word1 bits 28..27) directly in the wire image.
             buf[4] = (buf[4] & !0b0001_1000) | (kk_bits << 3) as u8;
-            let p = DataPacket::parse(&buf).expect("KK must never fail parse");
+            let p =
+                DataPacket::parse(Bytes::copy_from_slice(&buf)).expect("KK must never fail parse");
             assert_eq!(p.encryption, expected);
         }
     }
@@ -272,39 +252,22 @@ mod tests {
         let mut out = Vec::new();
         p.encode(&mut out);
         assert_eq!(out.len(), 16);
-        assert_eq!(DataPacket::parse(&out).unwrap(), p);
-    }
-
-    #[test]
-    fn parsed_payload_is_unique_and_mutable_without_copy() {
-        // The connection layer decrypts in place via Bytes::try_into_mut
-        // (zero-copy only while the parsed payload stays unique & vec-backed).
-        let mut buf = Vec::new();
-        sample().encode(&mut buf);
-        let p = DataPacket::parse(&buf).unwrap();
-        assert!(p.payload.try_into_mut().is_ok());
+        assert_eq!(DataPacket::parse(Bytes::from(out)).unwrap(), p);
     }
 
     #[test]
     fn truncated_header_rejected() {
-        assert_eq!(DataPacket::parse(&[0u8; 15]), Err(PacketError::TooShort));
-        assert_eq!(DataPacket::parse(&[]), Err(PacketError::TooShort));
+        assert_eq!(
+            DataPacket::parse(Bytes::from_static(&[0u8; 15])),
+            Err(PacketError::TooShort)
+        );
+        assert_eq!(DataPacket::parse(Bytes::new()), Err(PacketError::TooShort));
     }
 
     #[test]
-    fn parse_owned_matches_parse() {
-        // Same wire bytes → identical DataPacket via either entry point.
-        let mut out = Vec::new();
-        sample().encode(&mut out);
-        let borrowed = DataPacket::parse(&out).unwrap();
-        let owned = DataPacket::parse_owned(Bytes::from(out)).unwrap();
-        assert_eq!(borrowed, owned);
-    }
-
-    #[test]
-    fn parse_owned_payload_is_zero_copy_ready() {
-        // The demux path slices the payload out of the owned datagram with no
-        // copy. A Vec-backed source models the real demux buffer.
+    fn payload_is_zero_copy_slice_of_datagram() {
+        // The payload is sliced out of the owned datagram with no copy. A
+        // Vec-backed source models the real driver buffer.
         let p = DataPacket {
             payload: vec![0x47; 1200].into(),
             ..sample()
@@ -314,15 +277,14 @@ mod tests {
         // Capture the Vec's allocation before ownership passes through Bytes.
         let base = out.as_ptr();
         let datagram = Bytes::from(out);
-        let parsed = DataPacket::parse_owned(datagram).unwrap();
+        let parsed = DataPacket::parse(datagram).unwrap();
         assert_eq!(parsed.payload.len(), 1200);
         // Zero-copy: the payload is a view at offset HEADER_SIZE into that very
         // allocation — not a fresh copy. A copying implementation would point
-        // at a different allocation and fail this (that is the whole point of
-        // parse_owned; the borrowed parse() copies instead).
+        // at a different allocation and fail this.
         assert_eq!(
             parsed.payload.as_ptr(),
-            base.wrapping_add(DataPacket::HEADER_SIZE),
+            base.wrapping_add(HEADER_SIZE),
             "payload must be a zero-copy slice of the source datagram, not a copy"
         );
         // And it must be the unique owner so the in-place decrypt path
@@ -330,14 +292,6 @@ mod tests {
         assert!(
             parsed.payload.try_into_mut().is_ok(),
             "sliced payload must be uniquely owned for zero-copy in-place decrypt"
-        );
-    }
-
-    #[test]
-    fn parse_owned_truncated_header_rejected() {
-        assert_eq!(
-            DataPacket::parse_owned(Bytes::from_static(&[0u8; 15])),
-            Err(PacketError::TooShort)
         );
     }
 
@@ -350,6 +304,6 @@ mod tests {
         let mut out = Vec::new();
         p.encode(&mut out);
         assert_eq!(out.len(), 16 + 1456);
-        assert_eq!(DataPacket::parse(&out).unwrap(), p);
+        assert_eq!(DataPacket::parse(Bytes::from(out)).unwrap(), p);
     }
 }

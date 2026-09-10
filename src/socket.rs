@@ -379,9 +379,11 @@ async fn drive(state: DriverState) {
 
         tokio::select! {
             event = io.recv(&mut buf) => match event {
-                RecvEvent::Buffered(n) => conn.handle_datagram(Instant::now(), &buf[..n]),
+                RecvEvent::Buffered(n) => {
+                    conn.handle_datagram(Instant::now(), Bytes::copy_from_slice(&buf[.. n]))
+                }
                 RecvEvent::Owned(datagram) => {
-                    conn.handle_datagram_owned(Instant::now(), Bytes::from(datagram))
+                    conn.handle_datagram(Instant::now(), Bytes::from(datagram))
                 }
                 RecvEvent::Error => {}
                 RecvEvent::Closed => {
@@ -1012,7 +1014,7 @@ mod tests {
                     std::net::SocketAddr::V4(a) => a,
                     _ => unreachable!(),
                 };
-                let pkt = Packet::parse(&buf[.. n]).unwrap();
+                let pkt = Packet::parse(Bytes::copy_from_slice(&buf[.. n])).unwrap();
                 let cif = match &pkt {
                     Packet::Control(ControlPacket {
                         control_type: ControlType::Handshake(cif),
