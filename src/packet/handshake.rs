@@ -310,9 +310,9 @@ impl HsExtension {
                     !s.is_empty() && s.len() <= 512,
                     "stream id length out of range"
                 );
-                pack_string_words(s, out);
+                pack_bytes_words(s.as_bytes(), out);
             }
-            HsExtension::Congestion(s) => pack_string_words(s, out),
+            HsExtension::Congestion(s) => pack_bytes_words(s.as_bytes(), out),
             HsExtension::KmReq(data)
             | HsExtension::KmRsp(data)
             | HsExtension::Invalid { data, .. }
@@ -485,11 +485,11 @@ fn parse_extension(cmd: u16, content: &[u8]) -> HsExtension {
     }
 }
 
-/// Packs a string into 32-bit words, NUL-padded, with each word's bytes
-/// reversed on the wire (docs/spec/handshake.md §4.4: "abcdefg" ->
-/// "dcba\0gfe").
-fn pack_string_words(s: &str, out: &mut Vec<u8>) {
-    for chunk in s.as_bytes().chunks(4) {
+/// Word-swaps a byte string for the wire (docs/spec/handshake.md §4.4:
+/// "abcdefg" -> "dcba\0gfe"): each 32-bit word NUL-padded, then
+/// byte-reversed. Self-inverse on whole-word input.
+fn pack_bytes_words(bytes: &[u8], out: &mut Vec<u8>) {
+    for chunk in bytes.chunks(4) {
         let mut word = [0u8; 4];
         word[.. chunk.len()].copy_from_slice(chunk);
         word.reverse();
@@ -497,18 +497,12 @@ fn pack_string_words(s: &str, out: &mut Vec<u8>) {
     }
 }
 
-/// Inverse of [`pack_string_words`]: un-reverses each 32-bit word and trims
-/// trailing NUL padding. Returns raw bytes — the wire content is an
-/// arbitrary byte string, not necessarily UTF-8. `content` is whole words by
-/// construction of the TLV length field.
+/// Decodes a wire string: [`pack_bytes_words`] back, then trailing NUL padding
+/// trimmed. Returns raw bytes — the wire content is an arbitrary byte
+/// string, not necessarily UTF-8.
 fn unpack_bytes_words(content: &[u8]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(content.len());
-    for chunk in content.chunks(4) {
-        let mut word = [0u8; 4];
-        word[.. chunk.len()].copy_from_slice(chunk);
-        word.reverse();
-        bytes.extend_from_slice(&word);
-    }
+    pack_bytes_words(content, &mut bytes);
     while bytes.last() == Some(&0) {
         bytes.pop();
     }
@@ -766,12 +760,12 @@ mod tests {
     #[test]
     fn sid_worked_examples() {
         let mut content = Vec::new();
-        pack_string_words("abcdefg", &mut content);
+        pack_bytes_words(b"abcdefg", &mut content);
         assert_eq!(content, b"dcba\0gfe");
         assert_eq!(unpack_bytes_words(&content), b"abcdefg");
 
         content.clear();
-        pack_string_words("STREAM", &mut content);
+        pack_bytes_words(b"STREAM", &mut content);
         assert_eq!(content, b"ERTS\0\0MA");
         assert_eq!(unpack_bytes_words(&content), b"STREAM");
     }
@@ -779,7 +773,7 @@ mod tests {
     #[test]
     fn sid_exact_multiple_of_four() {
         let mut content = Vec::new();
-        pack_string_words("abcd", &mut content);
+        pack_bytes_words(b"abcd", &mut content);
         assert_eq!(content, b"dcba"); // no padding word added
         assert_eq!(unpack_bytes_words(&content), b"abcd");
     }
