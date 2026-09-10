@@ -2,10 +2,7 @@
 
 use std::net::Ipv4Addr;
 
-use tracing::{
-    debug,
-    trace,
-};
+use tracing::debug;
 
 use super::{
     types::{
@@ -142,7 +139,7 @@ impl HandshakeCif {
         let mut peer_ip = [0u8; 16];
         peer_ip.copy_from_slice(&buf[32 .. 48]);
         let extensions = parse_extensions(&buf[CIF_SIZE ..])?;
-        let cif = HandshakeCif {
+        Ok(HandshakeCif {
             version: read_u32(buf, 0),
             encryption: read_u16(buf, 4),
             extension_field: read_u16(buf, 6),
@@ -154,14 +151,7 @@ impl HandshakeCif {
             cookie: read_u32(buf, 28),
             peer_ip,
             extensions,
-        };
-        trace!(
-            hs_type = ?cif.handshake_type,
-            version = cif.version,
-            extensions = cif.extensions.len(),
-            "parsed handshake CIF"
-        );
-        Ok(cif)
+        })
     }
 
     /// Appends the encoded CIF (with extensions) to `out`.
@@ -512,11 +502,6 @@ fn parse_extension(cmd: u16, content: &[u8]) -> HsExtension {
         _ => {
             // FILTER/GROUP land here too: preserved opaquely, the core layer
             // decides whether to reject (FILTER) or skip (GROUP).
-            trace!(
-                cmd,
-                len = content.len(),
-                "unknown handshake extension preserved"
-            );
             HsExtension::Unknown {
                 cmd,
                 data: content.to_vec(),

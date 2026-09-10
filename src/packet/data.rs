@@ -111,11 +111,6 @@ impl DataPacket {
         if buf.len() < Self::HEADER_SIZE {
             return Err(PacketError::TooShort);
         }
-        tracing::trace!(
-            seq = read_u32(buf, 0) & SeqNumber::MASK,
-            payload_len = buf.len() - Self::HEADER_SIZE,
-            "data packet parsed"
-        );
         Ok(Self::from_parts(
             buf,
             Bytes::copy_from_slice(&buf[Self::HEADER_SIZE ..]),
@@ -128,11 +123,6 @@ impl DataPacket {
         if buf.len() < Self::HEADER_SIZE {
             return Err(PacketError::TooShort);
         }
-        tracing::trace!(
-            seq = read_u32(&buf, 0) & SeqNumber::MASK,
-            payload_len = buf.len() - Self::HEADER_SIZE,
-            "data packet parsed (owned)"
-        );
         let payload = buf.slice(Self::HEADER_SIZE ..);
         Ok(Self::from_parts(&buf, payload))
     }

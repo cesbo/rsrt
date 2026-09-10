@@ -1,9 +1,6 @@
 //! Control packets: wire layout per docs/spec/packets.md.
 
-use tracing::{
-    debug,
-    trace,
-};
+use tracing::debug;
 
 use super::{
     handshake::{
@@ -206,7 +203,6 @@ impl ControlPacket {
             },
             other => return Err(PacketError::UnknownControlType(other)),
         };
-        trace!(type_code, cif_len = cif.len(), "control packet parsed");
         Ok(ControlPacket {
             timestamp: Timestamp(read_u32(buf, 8)),
             dst_socket_id: SocketId(read_u32(buf, 12)),
