@@ -42,6 +42,7 @@ use super::{
         KmMessage,
         KmResponse,
         KmState,
+        KM_HEADER_LEN,
     },
     CryptoError,
 };
@@ -58,10 +59,6 @@ const KM_MAX_RETRY: u32 = 10;
 /// (`hcrypt.c:sHaiCrypt_PrepareHandle`; §9.1).
 const EVEN: usize = 0;
 const ODD: usize = 1;
-
-/// Fixed KM header length, for the srtcore §6.2 step-1 pre-checks (same
-/// value as `km.rs`'s private `KM_HEADER_LEN`).
-const KM_HEADER_LEN: usize = 16;
 
 /// Resolved crypto parameters (see `SrtOptions::crypto_config`).
 #[derive(Clone)]
@@ -288,17 +285,7 @@ impl Crypto {
     /// decided by the caller when there is no local passphrase — this
     /// constructor requires one).
     pub fn new_responder(mut cfg: CryptoConfig, kmreq: &[u8]) -> Result<Crypto, KmState> {
-        // srtcore pre-checks (§6.2 step 1): these two failures are
-        // answered BADSECRET by srtcore itself; every later validation
-        // failure is NOSECRET class except the unwrap ICV (§3.1).
-        if kmreq.len() <= KM_HEADER_LEN || kmreq[15] == 0 {
-            debug!(kmreq_len = kmreq.len(), "handshake KMREQ failed pre-checks");
-            return Err(KmState::BadSecret);
-        }
-        let msg = KmMessage::parse(kmreq).map_err(|err| {
-            debug!(?err, "handshake KMREQ rejected");
-            KmState::NoSecret
-        })?;
+        let msg = parse_kmreq(kmreq)?;
         // §6.2 step 2 / §7 trap: adopt the sender's key length for BOTH
         // directions, whatever the local PBKEYLEN says — never an error.
         cfg.key_len = msg.key_len;
@@ -480,24 +467,22 @@ impl Crypto {
     /// In-stream KMREQ (`UMSG_EXT`, §11.3): install refreshed key(s) and
     /// produce the echo KMRSP, or fail with a KM state for the §8 policy.
     pub fn handle_kmreq(&mut self, payload: &[u8]) -> KmReqOutcome {
-        // srtcore pre-checks (§6.2 step 1): BADSECRET class, rcv only.
-        if payload.len() <= KM_HEADER_LEN || payload[15] == 0 {
-            warn!(
-                kmreq_len = payload.len(),
-                "in-stream KMREQ failed pre-checks"
-            );
-            self.rcv_state = KmState::BadSecret;
-            return KmReqOutcome::Failed(KmState::BadSecret);
-        }
-        let msg = match KmMessage::parse(payload) {
+        let msg = match parse_kmreq(payload) {
             Ok(msg) => msg,
-            Err(err) => {
-                // §6.2 step 4, −1 class: structural/unsupported ⇒ both
+            Err(state) => {
+                warn!(
+                    ?state,
+                    kmreq_len = payload.len(),
+                    "in-stream KMREQ rejected"
+                );
+                // §6.2 step 1: pre-check failures (BADSECRET) touch rcv
+                // only; step 4, −1 class: structural/unsupported ⇒ both
                 // states NOSECRET.
-                warn!(?err, "in-stream KMREQ rejected");
-                self.snd_state = KmState::NoSecret;
-                self.rcv_state = KmState::NoSecret;
-                return KmReqOutcome::Failed(KmState::NoSecret);
+                self.rcv_state = state;
+                if state == KmState::NoSecret {
+                    self.snd_state = KmState::NoSecret;
+                }
+                return KmReqOutcome::Failed(state);
             }
         };
         match self.install_rx(&msg) {
@@ -725,6 +710,21 @@ impl fmt::Debug for Crypto {
         // Deliberately terse: never expose key material.
         write!(f, "Crypto(..)")
     }
+}
+
+/// Classifies a KMREQ payload the way srtcore does (§6.2 step 1, §3.1):
+/// the two srtcore pre-checks (length, zero KLen) fail as BADSECRET
+/// class, every later structural/unsupported rejection as NOSECRET class.
+/// The unwrap ICV (wrong passphrase) is the caller's BADSECRET.
+fn parse_kmreq(buf: &[u8]) -> Result<KmMessage, KmState> {
+    if buf.len() <= KM_HEADER_LEN || buf[15] == 0 {
+        debug!(kmreq_len = buf.len(), "KMREQ failed srtcore pre-checks");
+        return Err(KmState::BadSecret);
+    }
+    KmMessage::parse(buf).map_err(|err| {
+        debug!(?err, "KMREQ rejected");
+        KmState::NoSecret
+    })
 }
 
 /// Splits an unwrapped KM payload into `[even, odd]` SEKs. Dual blobs are

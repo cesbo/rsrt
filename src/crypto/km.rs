@@ -14,7 +14,7 @@ use super::{
 
 /// Fixed KM header length (`hcrypt_msg.h:HCRYPT_MSG_KM_OFS_SALT`); the
 /// salt field starts right after it (§3).
-const KM_HEADER_LEN: usize = 16;
+pub(super) const KM_HEADER_LEN: usize = 16;
 
 /// Salt field length as always sent by libsrt 1.4.4
 /// (`haicrypt.h:HAICRYPT_SALT_SZ`; §4.1).
