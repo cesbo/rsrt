@@ -232,16 +232,6 @@ impl HandshakeCif {
             _ => None,
         })
     }
-
-    /// True if the peer attached key material (encryption requested).
-    #[cfg(test)]
-    pub fn requests_encryption(&self) -> bool {
-        self.encryption != 0
-            || self
-                .extensions
-                .iter()
-                .any(|e| matches!(e, HsExtension::KmReq(_) | HsExtension::KmRsp(_)))
-    }
 }
 
 /// Extension command codes.
@@ -856,7 +846,6 @@ mod tests {
         assert_eq!(&out[64 .. 68], &[0x00, 0x03, 0x00, 0x04]); // cmd 3, 4 words
         assert_eq!(&out[68 .. 84], &km[..]);
         let parsed = HandshakeCif::parse_cif(&out).unwrap();
-        assert!(parsed.requests_encryption());
         assert_eq!(parsed.extensions[1], HsExtension::KmReq(km));
     }
 
