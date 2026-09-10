@@ -68,7 +68,12 @@ pub(crate) const HEADER_SIZE: usize = 16;
 
 /// Reads the big-endian 32-bit word at `off`. Caller guarantees bounds.
 pub(crate) fn read_u32(buf: &[u8], off: usize) -> u32 {
-    u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+    u32::from_be_bytes(buf[off .. off + 4].try_into().unwrap())
+}
+
+/// Reads the big-endian 16-bit half-word at `off`. Caller guarantees bounds.
+pub(crate) fn read_u16(buf: &[u8], off: usize) -> u16 {
+    u16::from_be_bytes(buf[off .. off + 2].try_into().unwrap())
 }
 
 /// Appends `value` as a big-endian 32-bit word.

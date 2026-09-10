@@ -5,6 +5,8 @@ use std::net::Ipv4Addr;
 use tracing::debug;
 
 use super::{
+    read_u16,
+    read_u32,
     types::{
         SeqNumber,
         SocketId,
@@ -409,14 +411,6 @@ impl HsFlags {
                 | Self::REXMITFLG,
         )
     }
-}
-
-fn read_u32(buf: &[u8], off: usize) -> u32 {
-    u32::from_be_bytes(buf[off .. off + 4].try_into().unwrap())
-}
-
-fn read_u16(buf: &[u8], off: usize) -> u16 {
-    u16::from_be_bytes(buf[off .. off + 2].try_into().unwrap())
 }
 
 fn parse_extensions(mut buf: &[u8]) -> Result<Vec<HsExtension>, PacketError> {
