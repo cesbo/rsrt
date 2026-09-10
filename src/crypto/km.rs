@@ -193,6 +193,33 @@ impl KmMessage {
     }
 }
 
+/// A decoded KMRSP payload (§5.1, §6.3): exactly one word = failure
+/// status, anything longer = byte echo of the KMREQ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KmResponse<'a> {
+    /// Success: byte-identical echo of the KMREQ (validate by comparison
+    /// with the outstanding request, not by re-parsing).
+    Echo(&'a [u8]),
+    /// Failure: the peer's receiver KM state. `None` for a word that names
+    /// no state — §6.3's "anything else" row, not a malformed response.
+    Status(Option<KmState>),
+}
+
+impl KmResponse<'_> {
+    /// TRAP (§5.1): the 1-word failure status is LITTLE-endian on the wire
+    /// (sender-host order; the KM double-swap cancellation applies).
+    pub fn parse(buf: &[u8]) -> Result<KmResponse<'_>, CryptoError> {
+        match buf.len() {
+            0 ..= 3 => Err(CryptoError::BadKmMessage("KMRSP shorter than one word")),
+            4 => {
+                let word = u32::from_le_bytes(buf.try_into().expect("length checked"));
+                Ok(KmResponse::Status(KmState::from_u32(word)))
+            }
+            _ => Ok(KmResponse::Echo(buf)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,5 +524,38 @@ mod tests {
                 "KM length does not match its fields"
             ))
         );
+    }
+
+    // -- KMRSP codec ----------------------------------------------------------
+
+    #[test]
+    fn kmrsp_parse() {
+        // §5.1 trap: BADSECRET = `04 00 00 00` on the wire (sender host
+        // order, LE on every mainstream build); its big-endian bytes are
+        // the unknown word 0x04000000 — §6.3's "anything else" row, like
+        // any other word naming no state.
+        assert_eq!(
+            KmResponse::parse(&[4, 0, 0, 0]),
+            Ok(KmResponse::Status(Some(KmState::BadSecret)))
+        );
+        assert_eq!(
+            KmResponse::parse(&[0, 0, 0, 4]),
+            Ok(KmResponse::Status(None))
+        );
+        assert_eq!(
+            KmResponse::parse(&[5, 0, 0, 0]),
+            Ok(KmResponse::Status(None))
+        );
+        // §6.3: anything longer than one word is the byte echo, surfaced
+        // verbatim for the initiator's memcmp — never re-parsed here.
+        let buf = valid();
+        assert_eq!(KmResponse::parse(&buf), Ok(KmResponse::Echo(&buf)));
+        for len in 0 .. 4 {
+            assert_eq!(
+                KmResponse::parse(&buf[.. len]),
+                Err(CryptoError::BadKmMessage("KMRSP shorter than one word")),
+                "len {len}"
+            );
+        }
     }
 }
