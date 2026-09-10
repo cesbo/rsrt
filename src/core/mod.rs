@@ -777,12 +777,13 @@ impl Connection {
         };
         let response = match crypto.as_mut() {
             Some(crypto) => match crypto.handle_kmreq(payload) {
-                KmReqOutcome::Installed(echo) => {
+                // §6.2 step 4: the KMRSP is the received KMREQ byte-for-byte.
+                KmReqOutcome::Installed => {
                     debug!(
-                        kmrsp_len = echo.len(),
+                        kmrsp_len = payload.len(),
                         "in-stream KM installed; echoing KMRSP"
                     );
-                    Some(echo)
+                    Some(payload.to_vec())
                 }
                 KmReqOutcome::Failed(state) => {
                     debug!(
@@ -797,9 +798,8 @@ impl Connection {
                 None
             }
         };
-        if let Some(payload) = response {
-            self.transmit_q
-                .push_back(control(ControlType::KmRsp(payload)));
+        if let Some(echo) = response {
+            self.transmit_q.push_back(control(ControlType::KmRsp(echo)));
         }
     }
 

@@ -119,8 +119,9 @@ impl Drop for CryptoConfig {
 /// Outcome of processing a KMREQ (handshake extension or in-stream).
 #[derive(Debug)]
 pub enum KmReqOutcome {
-    /// Keys installed; send back this byte-identical echo KMRSP (§6.2).
-    Installed(Vec<u8>),
+    /// Keys installed; the KMRSP is the received KMREQ payload echoed
+    /// byte-for-byte — never re-encoded (§6.2 step 4, §6.3 memcmp trap).
+    Installed,
     /// Validation/unwrap failed. Policy (§8; encryption is always
     /// enforced): in the handshake ⇒ reject (BadSecret/NoSecret → reject
     /// code); in-stream ⇒ total silence (§11.3).
@@ -280,14 +281,13 @@ impl Crypto {
 
     /// Responder (listener), from the caller's handshake KMREQ: derives
     /// the KEK (adopting the KMREQ's key length, §7), unwraps and installs
-    /// the SEK(s) for both directions, and returns the echo-KMRSP payload
-    /// (§6.2). `Err` carries the failure KM state for the §8 policy
-    /// (BadSecret for unwrap failure, NoSecret is decided by the caller
-    /// when there is no local passphrase — this constructor requires one).
-    pub fn new_responder(
-        mut cfg: CryptoConfig,
-        kmreq: &[u8],
-    ) -> Result<(Crypto, Vec<u8>), KmState> {
+    /// the SEK(s) for both directions (§6.2). On success the caller
+    /// echoes `kmreq` byte-for-byte as the KMRSP — never re-encoded
+    /// (§6.2 step 4, §6.3 memcmp trap). `Err` carries the failure KM
+    /// state for the §8 policy (BadSecret for unwrap failure, NoSecret is
+    /// decided by the caller when there is no local passphrase — this
+    /// constructor requires one).
+    pub fn new_responder(mut cfg: CryptoConfig, kmreq: &[u8]) -> Result<Crypto, KmState> {
         // srtcore pre-checks (§6.2 step 1): these two failures are
         // answered BADSECRET by srtcore itself; every later validation
         // failure is NOSECRET class except the unwrap ICV (§3.1).
@@ -333,7 +333,7 @@ impl Crypto {
             });
         }
         debug!(key_len = cfg.key_len.bytes(), keys = ?msg.keys, "responder installed caller SEK");
-        let crypto = Crypto {
+        Ok(Crypto {
             salt: msg.salt,
             rx_salt: msg.salt,
             rx_kek: None,
@@ -355,10 +355,7 @@ impl Crypto {
             }),
             key_switches: 0,
             cfg,
-        };
-        // §6.2 step 4: the echo KMRSP is the received message
-        // byte-for-byte — never re-encoded (§6.3 memcmp trap).
-        Ok((crypto, kmreq.to_vec()))
+        })
     }
 
     /// KMREQ payload currently outstanding (initial for a caller until
@@ -510,7 +507,7 @@ impl Crypto {
                 // never cloned into the send direction (§11.3 trap).
                 self.rcv_state = KmState::Secured;
                 debug!(keys = ?msg.keys, "in-stream KM installed");
-                KmReqOutcome::Installed(payload.to_vec())
+                KmReqOutcome::Installed
             }
             Err(CryptoError::WrongSecret) => {
                 // §6.2 step 4, −2: wrong passphrase.
@@ -784,8 +781,8 @@ mod tests {
     fn kmx_pair_with(icfg: CryptoConfig, rcfg: CryptoConfig) -> (Crypto, Crypto) {
         let mut initiator = Crypto::new_initiator(icfg);
         let kmreq = initiator.kmreq().expect("initial KMREQ cached");
-        let (responder, kmrsp) = Crypto::new_responder(rcfg, &kmreq).expect("KMX must succeed");
-        assert_eq!(initiator.handle_kmrsp(&kmrsp), KmRspOutcome::Confirmed);
+        let responder = Crypto::new_responder(rcfg, &kmreq).expect("KMX must succeed");
+        assert_eq!(initiator.handle_kmrsp(&kmreq), KmRspOutcome::Confirmed);
         (initiator, responder)
     }
 
@@ -928,14 +925,13 @@ mod tests {
     #[test]
     fn cve_2026_55869_valid_kmreq_still_accepted() {
         // The length hardening must not break legitimate key exchange: a real
-        // 56-byte even/AES-128 KMREQ must parse, unwrap and echo. Positive
-        // control — the analogue of libsrt's len=56 case that fits the buffer.
+        // 56-byte even/AES-128 KMREQ must parse and unwrap. Positive control
+        // — the analogue of libsrt's len=56 case that fits the buffer.
         let initiator = Crypto::new_initiator(config(KeyLength::Aes128));
         let kmreq = initiator.kmreq().expect("initial KMREQ");
         assert_eq!(kmreq.len(), 56);
-        let (_responder, echo) = Crypto::new_responder(config(KeyLength::Aes128), &kmreq)
+        Crypto::new_responder(config(KeyLength::Aes128), &kmreq)
             .expect("valid KMREQ must be accepted");
-        assert_eq!(echo, kmreq, "success KMRSP is the byte-exact echo");
     }
 
     // -- Handshake KMX through the public API (§1, §6) ------------------------
@@ -982,16 +978,6 @@ mod tests {
         let msg = KmMessage::parse(&blob).unwrap();
         assert_eq!(msg.keys, KmKeys::Even);
         assert_eq!(msg.key_len, KeyLength::Aes128);
-    }
-
-    #[test]
-    fn responder_echo_is_byte_identical() {
-        // §6.2/§6.3 trap: the success KMRSP is the received KMREQ echoed
-        // byte-for-byte, never re-encoded.
-        let initiator = Crypto::new_initiator(config(KeyLength::Aes192));
-        let kmreq = initiator.kmreq().unwrap();
-        let (_, kmrsp) = Crypto::new_responder(config(KeyLength::Aes192), &kmreq).unwrap();
-        assert_eq!(kmrsp, kmreq);
     }
 
     #[test]
@@ -1130,8 +1116,7 @@ mod tests {
         // delivered until the KMX completes; KK=0 cleartext is rejected too.
         let mut caller = Crypto::new_initiator(config(KeyLength::Aes128));
         let kmreq = caller.kmreq().unwrap();
-        let (mut listener, kmrsp) =
-            Crypto::new_responder(config(KeyLength::Aes128), &kmreq).unwrap();
+        let mut listener = Crypto::new_responder(config(KeyLength::Aes128), &kmreq).unwrap();
 
         // The responder (SECURED immediately) sends before the caller
         // processed the echo.
@@ -1160,7 +1145,7 @@ mod tests {
         assert_eq!(plain, b"cleartext", "payload untouched by the drop");
 
         // The echo confirmation re-secures RX; the same packet decrypts.
-        assert_eq!(caller.handle_kmrsp(&kmrsp), KmRspOutcome::Confirmed);
+        assert_eq!(caller.handle_kmrsp(&kmreq), KmRspOutcome::Confirmed);
         caller.decrypt(seq(5), flags, &mut buf).unwrap();
         assert_eq!(buf, clear);
     }
@@ -1209,10 +1194,10 @@ mod tests {
             EncryptionFlags::Even
         });
         let (_, km) = kms.into_iter().next().expect("pre-announce KM");
-        let KmReqOutcome::Installed(echo) = listener.handle_kmreq(&km) else {
+        let KmReqOutcome::Installed = listener.handle_kmreq(&km) else {
             panic!("refresh KM must install");
         };
-        assert_eq!(caller.handle_kmrsp(&echo), KmRspOutcome::Confirmed);
+        assert_eq!(caller.handle_kmrsp(&km), KmRspOutcome::Confirmed);
         // Packets 13..=16 still even; the switch fires on the ACK after
         // packet 16 (cnt 17 > 16), so 17.. are odd.
         drive(&mut caller, &mut listener, 13 ..= 16, t0, |_| {
@@ -1250,12 +1235,11 @@ mod tests {
         assert_eq!(msg.salt, caller.salt);
 
         // Peer installs BOTH keys from the one message and echoes it.
-        let KmReqOutcome::Installed(echo) = listener.handle_kmreq(&km) else {
+        let KmReqOutcome::Installed = listener.handle_kmreq(&km) else {
             panic!("refresh KM must install");
         };
-        assert_eq!(echo, km);
         assert_eq!(listener.rcv_km_state(), KmState::Secured);
-        assert_eq!(caller.handle_kmrsp(&echo), KmRspOutcome::Confirmed);
+        assert_eq!(caller.handle_kmrsp(&km), KmRspOutcome::Confirmed);
         assert!(caller.kmreq().is_none());
 
         // Dual-key window: old-key (even) packets still decrypt...
@@ -1304,10 +1288,10 @@ mod tests {
         let msg2 = KmMessage::parse(km2).unwrap();
         assert_eq!(msg2.keys, KmKeys::Both);
         assert_eq!(msg2.salt, caller.salt, "salt is stable across refreshes");
-        let KmReqOutcome::Installed(echo2) = listener.handle_kmreq(km2) else {
+        let KmReqOutcome::Installed = listener.handle_kmreq(km2) else {
             panic!("second refresh KM must install");
         };
-        assert_eq!(caller.handle_kmrsp(&echo2), KmRspOutcome::Confirmed);
+        assert_eq!(caller.handle_kmrsp(km2), KmRspOutcome::Confirmed);
         drive(&mut caller, &mut listener, 30 ..= 32, t0, |_| {
             EncryptionFlags::Odd
         });
@@ -1353,7 +1337,7 @@ mod tests {
             roundtrip(&mut caller, &mut listener, 31),
             EncryptionFlags::Even
         );
-        let KmReqOutcome::Installed(_) = listener.handle_kmreq(&km) else {
+        let KmReqOutcome::Installed = listener.handle_kmreq(&km) else {
             panic!("refresh KM must install");
         };
         assert!(
@@ -1400,7 +1384,7 @@ mod tests {
         .expect("pre-announce KM");
         for _ in 0 .. 2 {
             match listener.handle_kmreq(&km) {
-                KmReqOutcome::Installed(echo) => assert_eq!(echo, km),
+                KmReqOutcome::Installed => {}
                 KmReqOutcome::Failed(state) => panic!("duplicate rejected: {state:?}"),
             }
         }
@@ -1455,7 +1439,7 @@ mod tests {
 
         // §11.3: a later good KMREQ re-secures RX unconditionally — and
         // the keys that survived the rejected KM decrypt again.
-        let KmReqOutcome::Installed(_) = listener.handle_kmreq(&km) else {
+        let KmReqOutcome::Installed = listener.handle_kmreq(&km) else {
             panic!("good KM must install");
         };
         assert_eq!(listener.rcv_km_state(), KmState::Secured);

@@ -129,13 +129,7 @@ fn counter_block(salt: &[u8; 16], seq: u32) -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn hex(s: &str) -> Vec<u8> {
-        (0 .. s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i .. i + 2], 16).unwrap())
-            .collect()
-    }
+    use crate::crypto::hex;
 
     // AES keys from NIST SP 800-38A (arbitrary — any fixed keys work).
     const KEY_128: &str = "2b7e151628aed2a6abf7158809cf4f3c";

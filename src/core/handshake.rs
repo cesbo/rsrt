@@ -776,9 +776,9 @@ impl Listener {
                 // §8 row 8: echo the received KM message byte-for-byte
                 // (§6.2 step 4); the caller's one SEK now secures both
                 // directions (§1).
-                Ok((crypto, echo)) => {
+                Ok(crypto) => {
                     debug!(%from, kmreq_len = km.len(), "handshake KMX succeeded");
-                    (Some(crypto), Some(echo))
+                    (Some(crypto), Some(km.to_vec()))
                 }
                 // §8 row 9 [wire-verified]: BADSECRET only when the
                 // failure was BADSECRET class (pre-checks / unwrap ICV

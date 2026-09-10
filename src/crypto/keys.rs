@@ -185,13 +185,7 @@ pub fn random_salt() -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn hex(s: &str) -> Vec<u8> {
-        (0 .. s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i .. i + 2], 16).unwrap())
-            .collect()
-    }
+    use crate::crypto::hex;
 
     fn kek_from_hex(s: &str) -> Kek {
         Kek(SecretKey::from_bytes(&hex(s)))

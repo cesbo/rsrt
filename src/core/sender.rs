@@ -1629,8 +1629,8 @@ mod tests {
         };
         let mut tx = Crypto::new_initiator(cfg.clone());
         let kmreq = tx.kmreq().expect("initial KMREQ cached");
-        let (rx, kmrsp) = Crypto::new_responder(cfg, &kmreq).expect("KMX must succeed");
-        assert_eq!(tx.handle_kmrsp(&kmrsp), KmRspOutcome::Confirmed);
+        let rx = Crypto::new_responder(cfg, &kmreq).expect("KMX must succeed");
+        assert_eq!(tx.handle_kmrsp(&kmreq), KmRspOutcome::Confirmed);
         (tx, rx)
     }
 
@@ -1656,7 +1656,7 @@ mod tests {
         // Refresh ticks run on the ACK path (§10.2); the Connection layer
         // owns that wiring, so the tests tick the engine directly.
         let km = tx.on_ack(t0, 100_000).expect("pre-announce KM");
-        let KmReqOutcome::Installed(_) = rx.handle_kmreq(&km) else {
+        let KmReqOutcome::Installed = rx.handle_kmreq(&km) else {
             panic!("refresh KM must install");
         };
         push_encrypted(s, tx, t0, 12 .. 16);

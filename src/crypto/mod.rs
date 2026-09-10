@@ -47,3 +47,12 @@ pub enum CryptoError {
     /// (undecryptable; encryption.md §9.4).
     NoKey,
 }
+
+/// Decodes a hex test vector.
+#[cfg(test)]
+fn hex(s: &str) -> Vec<u8> {
+    (0 .. s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i .. i + 2], 16).unwrap())
+        .collect()
+}
