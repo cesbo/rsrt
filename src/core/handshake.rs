@@ -417,7 +417,10 @@ impl CallerHandshake {
                 // always-enforced library, the connection is rejected
                 // instead.
                 outcome => {
-                    debug!(?outcome, "handshake KMX failed; aborting (enforced encryption)");
+                    debug!(
+                        ?outcome,
+                        "handshake KMX failed; aborting (enforced encryption)"
+                    );
                     return self.fail(SrtError::Rejected(reject::UNSECURE));
                 }
             }
@@ -1048,7 +1051,10 @@ mod tests {
         match action {
             ListenerAction::Accept { reply, negotiated } => (reply, *negotiated),
             ListenerAction::Reply(p) => {
-                panic!("expected Accept, got Reply({:?})", hs_cif(&p).handshake_type)
+                panic!(
+                    "expected Accept, got Reply({:?})",
+                    hs_cif(&p).handshake_type
+                )
             }
             ListenerAction::Drop => panic!("expected Accept, got Drop"),
         }
@@ -1092,7 +1098,8 @@ mod tests {
         let mut c = caller(t0, &caller_opts);
         let mut l = listener(t0, listener_opts);
         let ind = c.poll_transmit(t0).expect("induction request");
-        let rsp = reply_of(l.handle_handshake(t0, caller_addr(), hs_cif(&ind), ACCEPT_ID, UNUSED_ISN));
+        let rsp =
+            reply_of(l.handle_handshake(t0, caller_addr(), hs_cif(&ind), ACCEPT_ID, UNUSED_ISN));
         assert!(c
             .handle_handshake(t0, hs_cif(&rsp))
             .expect("induction ok")
@@ -1148,7 +1155,10 @@ mod tests {
         assert_eq!(rsp.version, 5);
         assert_eq!(rsp.extension_field, SRT_MAGIC);
         // §7: the listener advertises its configured PBKEYLEN (0 = unset).
-        assert_eq!(rsp.encryption, listener_opts.pbkeylen.map_or(0, pbkeylen_bits));
+        assert_eq!(
+            rsp.encryption,
+            listener_opts.pbkeylen.map_or(0, pbkeylen_bits)
+        );
         assert_ne!(rsp.cookie, 0);
         assert_eq!(rsp.handshake_type, HandshakeType::Induction);
         // Everything else echoed verbatim — including the caller's own
@@ -1210,7 +1220,10 @@ mod tests {
         assert_eq!(rsp.handshake_type, HandshakeType::Conclusion);
         // The response advert is the listener's raw option too (its
         // `m_config` is never mutated on this path — core.cpp:1454).
-        assert_eq!(rsp.encryption, listener_opts.pbkeylen.map_or(0, pbkeylen_bits));
+        assert_eq!(
+            rsp.encryption,
+            listener_opts.pbkeylen.map_or(0, pbkeylen_bits)
+        );
         assert_eq!(rsp.initial_seq, CALLER_ISN); // adopted + echoed
         assert_eq!(rsp.socket_id, ACCEPT_ID);
         // §6.2: a KMRSP block (echo or 1-word status) is attached whenever
@@ -2138,7 +2151,10 @@ mod tests {
         let reply = reply_of(l.handle_handshake(t0, caller_addr(), &req, ACCEPT_ID, UNUSED_ISN));
         let rcif = hs_cif(&reply);
         // §8.1 [wire-verified]: UNSECURE = handshake type 1011.
-        assert_eq!(rcif.handshake_type, HandshakeType::Rejection(reject::UNSECURE));
+        assert_eq!(
+            rcif.handshake_type,
+            HandshakeType::Rejection(reject::UNSECURE)
+        );
         // With a passphrase the caller surfaces the plain wire code (the
         // listener cannot do encryption — not "encryption unsupported").
         assert!(matches!(
@@ -2184,10 +2200,16 @@ mod tests {
         // (row 5) and the passphrase-less caller surfaces it as
         // "the peer demands encryption".
         let (t0, mut c, mut l, req) = exchange_to_conclusion(SrtOptions::default(), secure_opts());
-        assert!(!req.extensions.iter().any(|e| matches!(e, HsExtension::KmReq(_))));
+        assert!(!req
+            .extensions
+            .iter()
+            .any(|e| matches!(e, HsExtension::KmReq(_))));
         let reply = reply_of(handle(&mut l, t0, &req));
         let rcif = hs_cif(&reply);
-        assert_eq!(rcif.handshake_type, HandshakeType::Rejection(reject::UNSECURE));
+        assert_eq!(
+            rcif.handshake_type,
+            HandshakeType::Rejection(reject::UNSECURE)
+        );
         assert!(matches!(
             c.handle_handshake(t0, rcif),
             Err(SrtError::EncryptionUnsupported)
@@ -2201,7 +2223,10 @@ mod tests {
         let reply = reply_of(l.handle_handshake(t0, caller_addr(), &req, ACCEPT_ID, UNUSED_ISN));
         let rcif = hs_cif(&reply);
         // §8.1 [wire-verified]: BADSECRET = handshake type 1010.
-        assert_eq!(rcif.handshake_type, HandshakeType::Rejection(reject::BADSECRET));
+        assert_eq!(
+            rcif.handshake_type,
+            HandshakeType::Rejection(reject::BADSECRET)
+        );
         assert!(matches!(
             c.handle_handshake(t0, rcif),
             Err(SrtError::Rejected(code)) if code == reject::BADSECRET
@@ -2239,7 +2264,7 @@ mod tests {
         assert_eq!(km[0], 0x12); // Vers 1, PT KM
         assert_eq!(&km[1 .. 3], &[0x20, 0x29]); // 'HAI' sign
         assert_eq!(km[3], 0x01); // §9.1 trap: the first SEK is EVEN
-        // §6.1: retransmissions re-attach the KMREQ byte-identically.
+                                 // §6.1: retransmissions re-attach the KMREQ byte-identically.
         let retry = c.poll_transmit(t0 + HS_RETRY_INTERVAL).expect("retransmit");
         assert_eq!(km_req_of(hs_cif(&retry)), &km[..]);
     }
@@ -2440,11 +2465,16 @@ mod tests {
             .crypto_config()
             .expect("valid crypto options")
             .expect("passphrase set");
-        cif.extensions
-            .push(HsExtension::KmReq(Crypto::new_initiator(cfg).kmreq().unwrap()));
+        cif.extensions.push(HsExtension::KmReq(
+            Crypto::new_initiator(cfg).kmreq().unwrap(),
+        ));
         cif.extension_field = HS_EXT_HSREQ | HS_EXT_KMREQ;
         let (reply, l_neg) = accept_of(handle(&mut l, t0, &cif));
-        assert_eq!(hs_cif(&reply).encryption, 3, "raw option, not adopted KLen 16");
+        assert_eq!(
+            hs_cif(&reply).encryption,
+            3,
+            "raw option, not adopted KLen 16"
+        );
         assert!(l_neg.crypto.is_some());
     }
 

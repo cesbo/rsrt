@@ -1,0 +1,12 @@
+# Usage: cargo +nightly fmt -- --check
+imports_layout = "Vertical"
+spaces_around_ranges = true
+group_imports = "StdExternalCrate"
+imports_granularity = "Crate"
+newline_style = "Unix"
+struct_lit_single_line = true
+use_field_init_shorthand = true
+max_width = 100
+comment_width = 100
+wrap_comments = true
+normalize_comments = true

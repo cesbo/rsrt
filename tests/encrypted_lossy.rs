@@ -56,18 +56,15 @@ const TAIL_MESSAGES: usize = 8;
 /// Pace between messages. 8 ms keeps the 47-packet pre-announce window
 /// (§10.1) at ~376 ms of wall time. That number is load-bearing:
 ///
-/// - The sender switches SEKs at RR *whether or not* the refresh KMREQ
-///   was ever received (§11.2), and from the second refresh on the
-///   receiver's slot still holds the two-generations-old key — AES-CTR
-///   has no integrity check, so a switch that outruns every KMREQ
-///   delivers GARBAGE, not a drop (§9.4, §15; libsrt is identical).
-/// - KMREQ (re)sends happen on the ACK path ONLY (§10.2, §11.2), and a
-///   pinned loss hole freezes ACKs entirely (duplicate-ACK suppression
-///   after ACKACK — libsrt sendCtrlAck is the same). The longest
-///   plausible freeze is one initial-NAK-interval repair round: 300 ms
-///   (the pre-first-RTT-sample NAK timer, transmission.md §7). A window
-///   shorter than that can compress pre-announce → switch into two
-///   consecutive ACK ticks, leaving ONE loss-exposed KMREQ attempt —
+/// - The sender switches SEKs at RR *whether or not* the refresh KMREQ was ever received (§11.2),
+///   and from the second refresh on the receiver's slot still holds the two-generations-old key —
+///   AES-CTR has no integrity check, so a switch that outruns every KMREQ delivers GARBAGE, not a
+///   drop (§9.4, §15; libsrt is identical).
+/// - KMREQ (re)sends happen on the ACK path ONLY (§10.2, §11.2), and a pinned loss hole freezes
+///   ACKs entirely (duplicate-ACK suppression after ACKACK — libsrt sendCtrlAck is the same). The
+///   longest plausible freeze is one initial-NAK-interval repair round: 300 ms (the
+///   pre-first-RTT-sample NAK timer, transmission.md §7). A window shorter than that can compress
+///   pre-announce → switch into two consecutive ACK ticks, leaving ONE loss-exposed KMREQ attempt —
 ///   observed as a few-percent corruption flake at 3 ms pace.
 ///
 /// At 376 ms the window survives a full 300 ms freeze with several paced
@@ -153,8 +150,7 @@ async fn send_all(caller: SrtSocket, seed: u64, settle: Duration) -> Stats {
 async fn refresh_under_15_percent_loss_delivers_everything() {
     const SEED: u64 = 0x10E5_0001;
     within_timeout(async {
-        let behavior =
-            ProxyBehavior::symmetric(DirectionBehavior::passthrough().with_drop(0.15));
+        let behavior = ProxyBehavior::symmetric(DirectionBehavior::passthrough().with_drop(0.15));
         // 600 ms latency: ~30 NAK rounds fit before any TSBPD deadline on
         // a sub-millisecond-RTT path — 15% loss cannot outlast that.
         let opts = crypto_opts(Duration::from_millis(600));
@@ -167,7 +163,9 @@ async fn refresh_under_15_percent_loss_delivers_everything() {
         while (verifier.verified() as usize) < TOTAL {
             match tokio::time::timeout(Duration::from_secs(10), accepted.recv()).await {
                 Ok(Ok(Some(payload))) => verifier.update(&payload).unwrap_or_else(|e| {
-                    panic!("stream not recovered byte-perfect (lost to ARQ or to a key switch): {e}")
+                    panic!(
+                        "stream not recovered byte-perfect (lost to ARQ or to a key switch): {e}"
+                    )
                 }),
                 Ok(Ok(None)) => break,
                 Ok(Err(e)) => panic!("recv failed at byte {}: {e}", verifier.verified()),

@@ -137,9 +137,7 @@ mod tests {
         // held candidate must skip it.
         let base = NEXT_OFFSET.load(Ordering::Relaxed);
         let held: Vec<UdpSocket> = (base .. base + 16)
-            .filter_map(|n| {
-                UdpSocket::bind((Ipv4Addr::LOCALHOST, candidate_port(n))).ok()
-            })
+            .filter_map(|n| UdpSocket::bind((Ipv4Addr::LOCALHOST, candidate_port(n))).ok())
             .collect();
         let held_ports: HashSet<u16> = held
             .iter()

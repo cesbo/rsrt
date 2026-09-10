@@ -97,7 +97,9 @@ impl KmMessage {
     pub fn parse(buf: &[u8]) -> Result<KmMessage, CryptoError> {
         // srtcore pre-checks (`crypto.cpp:processSrtMsg_KMREQ`; §3.1 step 1).
         if buf.len() <= KM_HEADER_LEN {
-            return Err(CryptoError::BadKmMessage("KM message not longer than its header"));
+            return Err(CryptoError::BadKmMessage(
+                "KM message not longer than its header",
+            ));
         }
         let sek_len = usize::from(buf[15]) * 4;
         if sek_len == 0 {
@@ -116,7 +118,9 @@ impl KmMessage {
             return Err(CryptoError::BadKmMessage("bad HaiCrypt signature"));
         }
         if buf[10] != 2 {
-            return Err(CryptoError::Unsupported("stream encapsulation is not TSSRT"));
+            return Err(CryptoError::Unsupported(
+                "stream encapsulation is not TSSRT",
+            ));
         }
         // The upper 6 bits of the KK byte are reserved and never examined
         // by libsrt; ignore them like `hcrypt_msg.h:HCRYPT_MSG_F_xSEK`.
@@ -142,7 +146,9 @@ impl KmMessage {
         let key_len = KeyLength::from_bytes(sek_len)
             .ok_or(CryptoError::BadKmMessage("SEK length not 16/24/32"))?;
         if buf.len() != KM_HEADER_LEN + salt_len + WRAP_ICV_LEN + keys.count() * sek_len {
-            return Err(CryptoError::BadKmMessage("KM length does not match its fields"));
+            return Err(CryptoError::BadKmMessage(
+                "KM length does not match its fields",
+            ));
         }
         if buf[8] != 2 {
             return Err(CryptoError::Unsupported("cipher is not AES-CTR"));
@@ -333,7 +339,9 @@ mod tests {
         for len in [0, 1, 4, 15, 16] {
             assert_eq!(
                 KmMessage::parse(&buf[.. len]),
-                Err(CryptoError::BadKmMessage("KM message not longer than its header")),
+                Err(CryptoError::BadKmMessage(
+                    "KM message not longer than its header"
+                )),
                 "len {len}"
             );
         }
@@ -394,7 +402,9 @@ mod tests {
         buf[10] = 1; // HCRYPT_SE_TSUDP
         assert_eq!(
             KmMessage::parse(&buf),
-            Err(CryptoError::Unsupported("stream encapsulation is not TSSRT"))
+            Err(CryptoError::Unsupported(
+                "stream encapsulation is not TSSRT"
+            ))
         );
     }
 
@@ -445,7 +455,9 @@ mod tests {
 
     #[test]
     fn parse_rejects_total_length_mismatch() {
-        let err = Err(CryptoError::BadKmMessage("KM length does not match its fields"));
+        let err = Err(CryptoError::BadKmMessage(
+            "KM length does not match its fields",
+        ));
         // One byte short / long.
         let buf = valid();
         assert_eq!(KmMessage::parse(&buf[.. buf.len() - 1]), err);
@@ -515,7 +527,9 @@ mod tests {
         buf.push(0);
         assert_eq!(
             KmMessage::parse(&buf),
-            Err(CryptoError::BadKmMessage("KM length does not match its fields"))
+            Err(CryptoError::BadKmMessage(
+                "KM length does not match its fields"
+            ))
         );
     }
 

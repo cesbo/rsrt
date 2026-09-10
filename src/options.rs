@@ -37,7 +37,10 @@ pub enum Bandwidth {
     /// `bytes_per_sec * (100 + overhead_pct) / 100` (integer division),
     /// fixed at connect. libsrt: SRTO_MAXBW = 0, SRTO_INPUTBW =
     /// bytes_per_sec, SRTO_OHEADBW = overhead_pct (5..=100).
-    Input { bytes_per_sec: u64, overhead_pct: u8 },
+    Input {
+        bytes_per_sec: u64,
+        overhead_pct: u8,
+    },
     /// Ceiling relative to the measured input rate (sampled where the
     /// application submits payloads), floored by `min_bytes_per_sec`:
     /// `max(min_bytes_per_sec, measured) * (100 + overhead_pct) / 100`.
@@ -45,7 +48,10 @@ pub enum Bandwidth {
     /// (libsrt fast-start: initial estimate = BW_INFINITE).
     /// libsrt: SRTO_MAXBW = 0, SRTO_INPUTBW = 0,
     /// SRTO_MININPUTBW = min_bytes_per_sec, SRTO_OHEADBW = overhead_pct.
-    Estimated { min_bytes_per_sec: u64, overhead_pct: u8 },
+    Estimated {
+        min_bytes_per_sec: u64,
+        overhead_pct: u8,
+    },
 }
 
 impl Bandwidth {
@@ -62,13 +68,17 @@ impl Bandwidth {
             Bandwidth::Max { bytes_per_sec: 0 } => {
                 Err(SrtError::InvalidBandwidth("max bandwidth must be nonzero"))
             }
-            Bandwidth::Input { bytes_per_sec: 0, .. } => Err(SrtError::InvalidBandwidth(
+            Bandwidth::Input {
+                bytes_per_sec: 0, ..
+            } => Err(SrtError::InvalidBandwidth(
                 "explicit input rate must be nonzero (use Bandwidth::Estimated for auto)",
             )),
             Bandwidth::Input { overhead_pct, .. } | Bandwidth::Estimated { overhead_pct, .. }
                 if !(5 ..= 100).contains(&overhead_pct) =>
             {
-                Err(SrtError::InvalidBandwidth("overhead_pct must be within 5..=100"))
+                Err(SrtError::InvalidBandwidth(
+                    "overhead_pct must be within 5..=100",
+                ))
             }
             _ => Ok(()),
         }
@@ -174,7 +184,10 @@ impl fmt::Debug for SrtOptions {
             .field("bandwidth", &self.bandwidth)
             .field("udp_recv_buffer", &self.udp_recv_buffer)
             .field("local_addr", &self.local_addr)
-            .field("passphrase", &self.passphrase.as_ref().map(|_| "<redacted>"))
+            .field(
+                "passphrase",
+                &self.passphrase.as_ref().map(|_| "<redacted>"),
+            )
             .field("pbkeylen", &self.pbkeylen)
             .field("km_refresh_rate", &self.km_refresh_rate)
             .field("km_preannounce", &self.km_preannounce)
@@ -359,7 +372,7 @@ mod tests {
         let cfg = opts.crypto_config().unwrap().unwrap();
         assert_eq!(cfg.km_refresh_rate, 0x10_0000);
         assert_eq!(cfg.km_preannounce, (0x10_0000 - 1) / 2); // 524287, not 65536
-        // An explicit pre-announce still wins over the force-set.
+                                                             // An explicit pre-announce still wins over the force-set.
         opts.km_preannounce = Some(1000);
         let cfg = opts.crypto_config().unwrap().unwrap();
         assert_eq!(cfg.km_preannounce, 1000);
@@ -387,15 +400,21 @@ mod tests {
         assert!(Bandwidth::Max { bytes_per_sec: 1 }.validate().is_ok());
         let err = Bandwidth::Max { bytes_per_sec: 0 }.validate().unwrap_err();
         assert!(matches!(err, SrtError::InvalidBandwidth(_)), "{err:?}");
-        let err = Bandwidth::Input { bytes_per_sec: 0, overhead_pct: 25 }
-            .validate()
-            .unwrap_err();
+        let err = Bandwidth::Input {
+            bytes_per_sec: 0,
+            overhead_pct: 25,
+        }
+        .validate()
+        .unwrap_err();
         assert!(matches!(err, SrtError::InvalidBandwidth(_)), "{err:?}");
         // A zero *minimum* is fine: it means "trust the estimator alone"
         // (libsrt SRTO_MININPUTBW default 0).
-        assert!(Bandwidth::Estimated { min_bytes_per_sec: 0, overhead_pct: 25 }
-            .validate()
-            .is_ok());
+        assert!(Bandwidth::Estimated {
+            min_bytes_per_sec: 0,
+            overhead_pct: 25
+        }
+        .validate()
+        .is_ok());
     }
 
     #[test]
@@ -404,21 +423,33 @@ mod tests {
         // socketconfig.cpp:312-322) — 0-4 are not settable in libsrt
         // either, so the docs' "avoid 0" advice is moot.
         for pct in [5, 25, 100] {
-            assert!(Bandwidth::Input { bytes_per_sec: 1, overhead_pct: pct }
-                .validate()
-                .is_ok());
-            assert!(Bandwidth::Estimated { min_bytes_per_sec: 1, overhead_pct: pct }
-                .validate()
-                .is_ok());
+            assert!(Bandwidth::Input {
+                bytes_per_sec: 1,
+                overhead_pct: pct
+            }
+            .validate()
+            .is_ok());
+            assert!(Bandwidth::Estimated {
+                min_bytes_per_sec: 1,
+                overhead_pct: pct
+            }
+            .validate()
+            .is_ok());
         }
         for pct in [0, 4, 101, u8::MAX] {
-            let err = Bandwidth::Input { bytes_per_sec: 1, overhead_pct: pct }
-                .validate()
-                .unwrap_err();
+            let err = Bandwidth::Input {
+                bytes_per_sec: 1,
+                overhead_pct: pct,
+            }
+            .validate()
+            .unwrap_err();
             assert!(matches!(err, SrtError::InvalidBandwidth(_)), "{err:?}");
-            let err = Bandwidth::Estimated { min_bytes_per_sec: 1, overhead_pct: pct }
-                .validate()
-                .unwrap_err();
+            let err = Bandwidth::Estimated {
+                min_bytes_per_sec: 1,
+                overhead_pct: pct,
+            }
+            .validate()
+            .unwrap_err();
             assert!(matches!(err, SrtError::InvalidBandwidth(_)), "{err:?}");
         }
     }

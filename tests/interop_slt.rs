@@ -419,7 +419,9 @@ async fn low_maxbw_engages_pacing() {
 
         let opts = SrtOptions::default()
             .latency(Duration::from_millis(1_000))
-            .bandwidth(Bandwidth::Max { bytes_per_sec: 680_000 });
+            .bandwidth(Bandwidth::Max {
+                bytes_per_sec: 680_000,
+            });
         let sock = SrtSocket::connect(("127.0.0.1", port), opts)
             .await
             .expect("connect to slt listener");

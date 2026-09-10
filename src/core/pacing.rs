@@ -167,13 +167,17 @@ impl Pacer {
             Bandwidth::Max { bytes_per_sec } => (PacerMode::Fixed, bytes_per_sec),
             // Ceiling computed once: options are immutable post-connect
             // (libsrt recomputes only on runtime option changes we lack).
-            Bandwidth::Input { bytes_per_sec, overhead_pct } => {
-                (PacerMode::Fixed, with_overhead(bytes_per_sec, overhead_pct))
-            }
+            Bandwidth::Input {
+                bytes_per_sec,
+                overhead_pct,
+            } => (PacerMode::Fixed, with_overhead(bytes_per_sec, overhead_pct)),
             // Parity with `updateBandwidth(0, 0)` at TEV_INIT: LiveCC
             // keeps its ctor BW_INFINITE ceiling; the overheaded estimate
             // first lands at the first refresh event.
-            Bandwidth::Estimated { min_bytes_per_sec, overhead_pct } => (
+            Bandwidth::Estimated {
+                min_bytes_per_sec,
+                overhead_pct,
+            } => (
                 PacerMode::Estimated {
                     est: InputRateEstimator::new(),
                     min: min_bytes_per_sec,
@@ -203,8 +207,8 @@ impl Pacer {
     fn recompute_period(&mut self) {
         // `max_bw` is never 0 (see field doc); `.max(1)` is defense only.
         self.period = Duration::from_micros(
-            (1_000_000.0 * (self.avg_payload + DATA_HDR_SIZE) as f64
-                / self.max_bw.max(1) as f64) as u64,
+            (1_000_000.0 * (self.avg_payload + DATA_HDR_SIZE) as f64 / self.max_bw.max(1) as f64)
+                as u64,
         );
     }
 
@@ -223,7 +227,12 @@ impl Pacer {
     /// Called on full ACK / NAK / timer tick; never on send (libsrt
     /// excludes TEV_SEND from the interval copy-out).
     pub(crate) fn refresh(&mut self) {
-        if let PacerMode::Estimated { est, min, overhead_pct } = &self.mode {
+        if let PacerMode::Estimated {
+            est,
+            min,
+            overhead_pct,
+        } = &self.mode
+        {
             let bw = with_overhead((*min).max(est.ceiling_input()), *overhead_pct);
             // LiveCC's `if (bw == 0) return;` (congctl.cpp:209-212): a
             // degenerate window with min == 0 keeps the previous ceiling.
@@ -356,9 +365,13 @@ mod tests {
         let t0 = Instant::now();
         let mut est = InputRateEstimator::new();
         est.on_input(t0, 100); // stamps only
-        // True elapsed 500 000.4 µs truncates to 500 000: not > 500 000.
+                               // True elapsed 500 000.4 µs truncates to 500 000: not > 500 000.
         est.on_input(t0 + ms(500) + Duration::from_nanos(400), 100);
-        assert_eq!(est.measured(), 0, "sub-µs overshoot must not close the window");
+        assert_eq!(
+            est.measured(),
+            0,
+            "sub-µs overshoot must not close the window"
+        );
         // The next whole-µs sample closes with BOTH counted samples —
         // (200 + 2·44)·1e6 / 500_001 = 575.99 → 575.
         est.on_input(t0 + ms(500) + us(1), 100);
@@ -406,7 +419,7 @@ mod tests {
         let mut est = InputRateEstimator::new();
         est.on_input(t0, 500); // stamps only
         est.on_input(t0 + ms(501), 500); // first close (fast-start)
-        // (500 + 44)·1e6 / 501_000 = 1085.8 → 1085.
+                                         // (500 + 44)·1e6 / 501_000 = 1085.8 → 1085.
         assert_eq!(est.measured(), 1085);
         est.on_input(t0 + ms(501) + ms(600), 500);
         assert_eq!(est.measured(), 1085, "600 ms must not close a 1 s window");
@@ -480,11 +493,23 @@ mod tests {
         // congctl.cpp:173-180 + core.cpp:7371-7379: the period is f64
         // math truncated to whole µs. BW_INFINITE with the 1316 init avg:
         // 1e6·(1316+44)/125e6 = 10.88 → exactly 10 µs.
-        let p = Pacer::new(&Bandwidth::Max { bytes_per_sec: BW_INFINITE }, 1456).unwrap();
+        let p = Pacer::new(
+            &Bandwidth::Max {
+                bytes_per_sec: BW_INFINITE,
+            },
+            1456,
+        )
+        .unwrap();
         assert_eq!(p.period_us(), 10);
         // The IIR init is min(1316, max_payload): a 1000-byte cap gives
         // 1e6·(1000+44)/125e6 = 8.35 → 8 µs.
-        let p = Pacer::new(&Bandwidth::Max { bytes_per_sec: BW_INFINITE }, 1000).unwrap();
+        let p = Pacer::new(
+            &Bandwidth::Max {
+                bytes_per_sec: BW_INFINITE,
+            },
+            1000,
+        )
+        .unwrap();
         assert_eq!(p.period_us(), 8);
     }
 
@@ -501,7 +526,10 @@ mod tests {
         // Input mode: ceiling = withOverhead(declared rate), fixed at
         // construction (options are immutable post-connect); the
         // estimator is off, refresh never re-derives the ceiling.
-        let bw = Bandwidth::Input { bytes_per_sec: 1_000_000, overhead_pct: 25 };
+        let bw = Bandwidth::Input {
+            bytes_per_sec: 1_000_000,
+            overhead_pct: 25,
+        };
         let mut p = Pacer::new(&bw, 1456).unwrap();
         assert_eq!(p.max_bw(), 1_250_000);
         let t0 = Instant::now();
@@ -519,14 +547,21 @@ mod tests {
         // LiveCC updateBandwidth's `if (bw == 0) return;`
         // (congctl.cpp:209-212): a degenerate window (measured 0) with
         // min == 0 keeps the previous ceiling instead of zeroing it.
-        let bw = Bandwidth::Estimated { min_bytes_per_sec: 0, overhead_pct: 25 };
+        let bw = Bandwidth::Estimated {
+            min_bytes_per_sec: 0,
+            overhead_pct: 25,
+        };
         let mut p = Pacer::new(&bw, 1456).unwrap();
         let t0 = Instant::now();
         // One 0-byte payload over 100 s: (0 + 44)·1e6/1e8 = 0.44 → rate 0.
         p.on_input(t0, 0);
         p.on_input(t0 + Duration::from_secs(100), 0);
         p.refresh();
-        assert_eq!(p.max_bw(), BW_INFINITE, "zero estimate must keep the ceiling");
+        assert_eq!(
+            p.max_bw(),
+            BW_INFINITE,
+            "zero estimate must keep the ceiling"
+        );
     }
 
     #[test]
@@ -534,7 +569,10 @@ mod tests {
         // core.cpp:7344-7363: auto-mode ceiling =
         // withOverhead(max(MININPUTBW, estimate)) — the floor engages
         // only while the measured rate sits below it.
-        let bw = Bandwidth::Estimated { min_bytes_per_sec: 100_000, overhead_pct: 25 };
+        let bw = Bandwidth::Estimated {
+            min_bytes_per_sec: 100_000,
+            overhead_pct: 25,
+        };
         let mut p = Pacer::new(&bw, 1456).unwrap();
         let t0 = Instant::now();
         // First window measures ~1085 B/s, far below min: the floor wins.

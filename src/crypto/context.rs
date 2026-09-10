@@ -911,7 +911,10 @@ mod tests {
                 // though its 0xAA wrap fails the crypto unwrap in new_responder.
                 assert!(parse.is_ok(), "valid 56-byte shape must parse");
             } else {
-                assert!(parse.is_err(), "malformed/oversized len {n} must be rejected");
+                assert!(
+                    parse.is_err(),
+                    "malformed/oversized len {n} must be rejected"
+                );
             }
             // The handshake responder — the exact path that overflows libsrt —
             // rejects all of them (bad length or bogus crypto).

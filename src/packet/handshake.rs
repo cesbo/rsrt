@@ -932,7 +932,7 @@ mod tests {
             assert_eq!(out.len(), 124, "cmd {cmd}");
             assert_eq!(&out[64 .. 66], &cmd.to_be_bytes(), "cmd {cmd}");
             assert_eq!(&out[66 .. 68], &[0x00, 0x0E], "cmd {cmd}"); // 14 words
-            // The blob's exact bytes, contiguous and in natural order.
+                                                                    // The blob's exact bytes, contiguous and in natural order.
             assert_eq!(&out[68 .. 124], &km[..], "cmd {cmd}");
             // The word-swapped form appears nowhere in the encoding.
             assert!(

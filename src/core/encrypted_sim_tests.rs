@@ -10,18 +10,15 @@
 //! reproducible and the assertions can be exact.
 //!
 //! Covered (docs/spec/encryption.md):
-//! - lost KMRSPs: the KMREQ is retried at 1.5 × SRTT pacing until an echo
-//!   confirms, and the refresh completes (§10.4, §11.2);
-//! - lost KMREQs: retries deliver the refresh KM before the key switch
-//!   (§11.2);
-//! - refresh racing loss recovery: retransmitted old-KK packets decrypt
-//!   through the decommission window (§9.3, §10.4);
-//! - retry exhaustion: exactly 1 + 10 KMREQ sends, then the sender switches
-//!   at RR anyway; the peer drops new-key packets, the connection survives
-//!   (§11.2);
-//! - undecryptable packets are ACKed and reveal no NAKs — no NAK storm, no
-//!   retransmission, the receive cursor advances past suppressed gaps
-//!   (§9.4).
+//! - lost KMRSPs: the KMREQ is retried at 1.5 × SRTT pacing until an echo confirms, and the refresh
+//!   completes (§10.4, §11.2);
+//! - lost KMREQs: retries deliver the refresh KM before the key switch (§11.2);
+//! - refresh racing loss recovery: retransmitted old-KK packets decrypt through the decommission
+//!   window (§9.3, §10.4);
+//! - retry exhaustion: exactly 1 + 10 KMREQ sends, then the sender switches at RR anyway; the peer
+//!   drops new-key packets, the connection survives (§11.2);
+//! - undecryptable packets are ACKed and reveal no NAKs — no NAK storm, no retransmission, the
+//!   receive cursor advances past suppressed gaps (§9.4).
 
 use std::{
     net::{
@@ -153,11 +150,7 @@ impl Link {
     fn push(&mut self, now: Instant, pkt: Packet) {
         match &pkt {
             Packet::Data(d) => {
-                if let Some(i) = self
-                    .drop_data_seqs
-                    .iter()
-                    .position(|s| *s == d.seq.value())
-                {
+                if let Some(i) = self.drop_data_seqs.iter().position(|s| *s == d.seq.value()) {
                     self.drop_data_seqs.remove(i);
                     return;
                 }
@@ -192,9 +185,7 @@ impl Link {
                 ControlType::AckAck { .. } if self.drop_all_ackacks => return,
                 ControlType::Nak(_) => self.naks += 1,
                 ControlType::Ack { cif, .. } => {
-                    let better = self
-                        .max_ack
-                        .is_none_or(|m| cif.last_ack_seq.diff(m) > 0);
+                    let better = self.max_ack.is_none_or(|m| cif.last_ack_seq.diff(m) > 0);
                     if better {
                         self.max_ack = Some(cif.last_ack_seq);
                     }
@@ -322,12 +313,8 @@ impl Sim {
         {
             ListenerAction::Reply(p) => self.to_caller.push(self.now, p),
             ListenerAction::Accept { reply, negotiated } => {
-                let conn = Connection::accepted(
-                    self.now,
-                    *negotiated,
-                    reply,
-                    self.listener_opts.clone(),
-                );
+                let conn =
+                    Connection::accepted(self.now, *negotiated, reply, self.listener_opts.clone());
                 self.accepted = Some(conn);
             }
             ListenerAction::Drop => {}
@@ -528,7 +515,10 @@ fn kmreq_loss_retries_deliver_the_refresh_km() {
         "exactly 3 KMREQs were eaten by the wire"
     );
     // Only delivered KMREQs are echoed; the first echo confirms.
-    assert_eq!(sim.to_caller.kmrsps.len() as u64, sim.to_listener.kmreqs_through);
+    assert_eq!(
+        sim.to_caller.kmrsps.len() as u64,
+        sim.to_listener.kmreqs_through
+    );
 
     // Refresh completed in time: switch on the wire, zero undecryptable.
     let flags = sim.to_listener.first_send_flags();
@@ -601,7 +591,11 @@ fn old_key_retransmissions_decrypt_through_decommission_window() {
         .iter()
         .find(|e| e.retransmitted && e.at > first_odd)
         .expect("an old-key retransmission must land after the switch");
-    assert_eq!(late_rexmit.kk, EncryptionFlags::Even, "original KK bits (§9.3)");
+    assert_eq!(
+        late_rexmit.kk,
+        EncryptionFlags::Even,
+        "original KK bits (§9.3)"
+    );
     assert_eq!(late_rexmit.seq, seq_of(15));
 
     // Two retransmissions of the one packet (immediate NAK round eaten by
@@ -703,7 +697,10 @@ fn undecryptable_arrivals_are_acked_and_reveal_no_naks() {
     assert_eq!(sim.to_caller.naks, 0, "loss detection must be suppressed");
     assert_eq!(sim.caller.stats().pkts_retransmitted, 0);
     let ls = sim.accepted_mut().stats();
-    assert_eq!(ls.pkts_recv_lost, 0, "the gap must never enter the loss list");
+    assert_eq!(
+        ls.pkts_recv_lost, 0,
+        "the gap must never enter the loss list"
+    );
 
     // ...while the ACK position marched past every undecryptable packet
     // AND the suppressed hole, up to the final send position.
@@ -766,7 +763,11 @@ fn cve_2026_55868_cleartext_injection_rejected_on_secured_link() {
         }
     }
     let template = template.expect("caller emitted a data packet");
-    assert_ne!(template.encryption, EncryptionFlags::None, "template was encrypted");
+    assert_ne!(
+        template.encryption,
+        EncryptionFlags::None,
+        "template was encrypted"
+    );
 
     const MARKER: &[u8] = b"ATTACKER-INJECTED-CLEARTEXT-PAYLOAD-0123456789ABCDEF-PAD-64B!!";
     let injected = DataPacket {
@@ -774,7 +775,8 @@ fn cve_2026_55868_cleartext_injection_rejected_on_secured_link() {
         payload: Bytes::copy_from_slice(MARKER),
         ..template
     };
-    sim.accepted_mut().handle_packet(now, Packet::Data(injected));
+    sim.accepted_mut()
+        .handle_packet(now, Packet::Data(injected));
     sim.run_for(500);
 
     assert!(

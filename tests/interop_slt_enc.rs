@@ -2,32 +2,26 @@
 //! (libsrt 1.4.4), pinning the HaiCrypt wire format and KMX semantics of
 //! docs/spec/encryption.md against the normative implementation:
 //!
-//! 1. **Matching-passphrase matrix** — all four directions of
-//!    `tests/interop_slt.rs` with a shared passphrase, at PBKEYLEN 16 and 32
-//!    (24 once), byte-perfect payload comparison. Caller directions prove
-//!    our initiator KMREQ + KMRSP-echo validation (§6.1, §6.3); listener
-//!    directions prove our responder unwrap + byte-exact echo and the
-//!    RX→TX clone (§6.2), each against real libsrt ciphertext (§9.2).
-//! 2. **Wrong passphrase, both roles** (§8 rows 9/10): an slt listener
-//!    (libsrt's default enforced encryption) rejects us with wire code
-//!    1010 → [`SrtError::WrongPassphrase`]; our listener rejects an slt
-//!    caller, whose log must show libsrt's BADSECRET text "Incorrect
-//!    passphrase", while our listener keeps serving.
-//! 3. **Key refresh, both roles** (§10, §11): our sender at
-//!    `km_refresh_rate=128` / `km_preannounce=32` streams ~2000 packets to
-//!    an slt receiver byte-perfect across ≥ 2 SEK switches (wire-proves our
-//!    dual-SEK KMREQ and switch timing); an slt sender with the same rates
-//!    streams to our receiver byte-perfect (wire-proves our in-stream KMREQ
-//!    install + echo KMRSP — libsrt re-sends a KMREQ up to 10× unless the
-//!    byte-exact echo lands, §11.2).
-//! 4. **Mismatches are always rejected** (§8 rows 2-7, 10/11): the library
-//!    is always enforced — the §8 non-enforced rows are not implemented,
-//!    every encryption mismatch fails at handshake time. Our listener
-//!    rejects an slt caller whose KMX cannot succeed with wire code 1011,
-//!    decoded in the slt log as libsrt's UNSECURE text "Password required
-//!    or unexpected"; and a permissive (`enforcedencryption=false`) slt
-//!    listener that answers our KMREQ with a 1-word failure-status KMRSP
-//!    (§5.1) instead of rejecting makes our caller abort locally (§6.1).
+//! 1. **Matching-passphrase matrix** — all four directions of `tests/interop_slt.rs` with a shared
+//!    passphrase, at PBKEYLEN 16 and 32 (24 once), byte-perfect payload comparison. Caller
+//!    directions prove our initiator KMREQ + KMRSP-echo validation (§6.1, §6.3); listener
+//!    directions prove our responder unwrap + byte-exact echo and the RX→TX clone (§6.2), each
+//!    against real libsrt ciphertext (§9.2).
+//! 2. **Wrong passphrase, both roles** (§8 rows 9/10): an slt listener (libsrt's default enforced
+//!    encryption) rejects us with wire code 1010 → [`SrtError::WrongPassphrase`]; our listener
+//!    rejects an slt caller, whose log must show libsrt's BADSECRET text "Incorrect passphrase",
+//!    while our listener keeps serving.
+//! 3. **Key refresh, both roles** (§10, §11): our sender at `km_refresh_rate=128` /
+//!    `km_preannounce=32` streams ~2000 packets to an slt receiver byte-perfect across ≥ 2 SEK
+//!    switches (wire-proves our dual-SEK KMREQ and switch timing); an slt sender with the same
+//!    rates streams to our receiver byte-perfect (wire-proves our in-stream KMREQ install + echo
+//!    KMRSP — libsrt re-sends a KMREQ up to 10× unless the byte-exact echo lands, §11.2).
+//! 4. **Mismatches are always rejected** (§8 rows 2-7, 10/11): the library is always enforced — the
+//!    §8 non-enforced rows are not implemented, every encryption mismatch fails at handshake time.
+//!    Our listener rejects an slt caller whose KMX cannot succeed with wire code 1011, decoded in
+//!    the slt log as libsrt's UNSECURE text "Password required or unexpected"; and a permissive
+//!    (`enforcedencryption=false`) slt listener that answers our KMREQ with a 1-word failure-status
+//!    KMRSP (§5.1) instead of rejecting makes our caller abort locally (§6.1).
 //!
 //! Same conventions as `tests/interop_slt.rs`: byte-stream (not message)
 //! equality since slt re-chunks at 1316 bytes, `SKIP` + return when the
@@ -167,7 +161,9 @@ async fn caller_receives(keylen: KeyLength, seed: u64) {
         .expect("spawn srt-live-transmit");
         tokio::time::sleep(Duration::from_millis(300)).await; // let it bind
 
-        let opts = SrtOptions::default().passphrase(PASSPHRASE).pbkeylen(keylen);
+        let opts = SrtOptions::default()
+            .passphrase(PASSPHRASE)
+            .pbkeylen(keylen);
         let mut sock = SrtSocket::connect(("127.0.0.1", port), opts)
             .await
             .expect("connect to slt listener");
@@ -216,7 +212,9 @@ async fn caller_sends(keylen: KeyLength, seed: u64) {
         .expect("spawn srt-live-transmit");
         tokio::time::sleep(Duration::from_millis(300)).await; // let it bind
 
-        let opts = SrtOptions::default().passphrase(PASSPHRASE).pbkeylen(keylen);
+        let opts = SrtOptions::default()
+            .passphrase(PASSPHRASE)
+            .pbkeylen(keylen);
         let sock = SrtSocket::connect(("127.0.0.1", port), opts)
             .await
             .expect("connect to slt listener");
@@ -794,7 +792,10 @@ async fn badsecret_kmrsp_from_permissive_slt_listener_aborts_our_caller() {
         let pw_param = format!("passphrase={PASSPHRASE}");
         let mut slt = SltProcess::spawn_receive(
             &binary,
-            &listener_uri(port, &["latency=120", &pw_param, "enforcedencryption=false"]),
+            &listener_uri(
+                port,
+                &["latency=120", &pw_param, "enforcedencryption=false"],
+            ),
             &[LOG, "-a:no"],
         )
         .expect("spawn srt-live-transmit");
