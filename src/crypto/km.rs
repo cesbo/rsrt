@@ -193,40 +193,6 @@ impl KmMessage {
     }
 }
 
-/// A decoded KMRSP payload: exactly 4 bytes = failure status, anything
-/// longer = byte echo of the KMREQ (§5.1, §6.3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KmResponse<'a> {
-    /// Success: byte-identical echo of the KMREQ (validate by comparison
-    /// with the outstanding request, not by re-parsing).
-    Echo(&'a [u8]),
-    /// Failure: peer's receiver KM state.
-    Status(KmState),
-}
-
-impl KmResponse<'_> {
-    /// TRAP (§5.1): the 1-word failure status is LITTLE-endian on the wire
-    /// (sender-host order; the KM double-swap cancellation applies).
-    pub fn parse(buf: &[u8]) -> Result<KmResponse<'_>, CryptoError> {
-        match buf.len() {
-            0 ..= 3 => Err(CryptoError::BadKmMessage("KMRSP shorter than one word")),
-            4 => {
-                let state = u32::from_le_bytes(buf.try_into().expect("length checked"));
-                KmState::from_u32(state)
-                    .map(KmResponse::Status)
-                    .ok_or(CryptoError::BadKmMessage("unknown KM state in KMRSP"))
-            }
-            _ => Ok(KmResponse::Echo(buf)),
-        }
-    }
-
-    /// Failure-KMRSP payload (little-endian; §5.1).
-    #[cfg(test)]
-    pub fn encode_status(state: KmState) -> [u8; 4] {
-        (state as u32).to_le_bytes()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,71 +496,6 @@ mod tests {
             Err(CryptoError::BadKmMessage(
                 "KM length does not match its fields"
             ))
-        );
-    }
-
-    // -- KMRSP codec ----------------------------------------------------------
-
-    #[test]
-    fn kmrsp_status_word_is_little_endian() {
-        // §5.1 trap: BADSECRET = `04 00 00 00` on the wire (sender host
-        // order, LE on every mainstream build). UNSECURED = 0 is
-        // endian-invariant and would hide a byte-order bug — hence the
-        // nonzero state here.
-        assert_eq!(
-            KmResponse::encode_status(KmState::BadSecret),
-            [0x04, 0x00, 0x00, 0x00]
-        );
-        assert_eq!(
-            KmResponse::parse(&[0x04, 0x00, 0x00, 0x00]),
-            Ok(KmResponse::Status(KmState::BadSecret))
-        );
-        // The big-endian bytes decode to 0x04000000 — an unknown state.
-        assert_eq!(
-            KmResponse::parse(&[0x00, 0x00, 0x00, 0x04]),
-            Err(CryptoError::BadKmMessage("unknown KM state in KMRSP"))
-        );
-    }
-
-    #[test]
-    fn kmrsp_roundtrips_every_state() {
-        for state in [
-            KmState::Unsecured,
-            KmState::Securing,
-            KmState::Secured,
-            KmState::NoSecret,
-            KmState::BadSecret,
-        ] {
-            let wire = KmResponse::encode_status(state);
-            assert_eq!(KmResponse::parse(&wire), Ok(KmResponse::Status(state)));
-        }
-    }
-
-    #[test]
-    fn kmrsp_full_length_is_echo() {
-        // §6.3: anything longer than one word is the byte echo, surfaced
-        // verbatim for the initiator's memcmp — never re-parsed here.
-        let buf = valid();
-        assert_eq!(KmResponse::parse(&buf), Ok(KmResponse::Echo(&buf)));
-    }
-
-    #[test]
-    fn kmrsp_rejects_short_payload() {
-        let buf = valid();
-        for len in 0 .. 4 {
-            assert_eq!(
-                KmResponse::parse(&buf[.. len]),
-                Err(CryptoError::BadKmMessage("KMRSP shorter than one word")),
-                "len {len}"
-            );
-        }
-    }
-
-    #[test]
-    fn kmrsp_rejects_unknown_state() {
-        assert_eq!(
-            KmResponse::parse(&[0x05, 0x00, 0x00, 0x00]),
-            Err(CryptoError::BadKmMessage("unknown KM state in KMRSP"))
         );
     }
 }

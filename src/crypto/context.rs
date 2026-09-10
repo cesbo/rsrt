@@ -40,7 +40,6 @@ use super::{
     km::{
         KmKeys,
         KmMessage,
-        KmResponse,
         KmState,
         KM_HEADER_LEN,
     },
@@ -509,17 +508,26 @@ impl Crypto {
         }
     }
 
-    /// KMRSP from the handshake extension or `UMSG_EXT` (§6.3).
+    /// KMRSP from the handshake extension or `UMSG_EXT` (§6.3): exactly
+    /// one word = failure status, anything longer = byte echo of the
+    /// KMREQ (§5.1). TRAP (§5.1): the status word is LITTLE-endian on the
+    /// wire (sender-host order; the KM double-swap cancellation applies).
     pub fn handle_kmrsp(&mut self, payload: &[u8]) -> KmRspOutcome {
-        match KmResponse::parse(payload) {
-            Ok(KmResponse::Status(state)) => self.peer_km_failure(Some(state)),
-            // A 4-byte word with an unknown value is §6.3's "anything
-            // else" row, not a malformed response.
-            Err(_) if payload.len() == 4 => self.peer_km_failure(None),
-            Ok(KmResponse::Echo(echo)) => match self.outstanding.as_ref() {
+        match payload.len() {
+            0 ..= 3 => {
+                debug!(kmrsp_len = payload.len(), "malformed KMRSP ignored");
+                KmRspOutcome::Ignored
+            }
+            // An unknown status word is §6.3's "anything else" row, not a
+            // malformed response.
+            4 => {
+                let word = u32::from_le_bytes(payload.try_into().expect("length checked"));
+                self.peer_km_failure(KmState::from_u32(word))
+            }
+            _ => match self.outstanding.as_ref() {
                 // §6.3: byte-exact echo of the outstanding KMREQ — the
                 // slot's retries stop, both directions SECURED.
-                Some(out) if out.blob == echo => {
+                Some(out) if out.blob == payload => {
                     self.outstanding = None;
                     self.snd_state = KmState::Secured;
                     self.rcv_state = KmState::Secured;
@@ -544,16 +552,12 @@ impl Crypto {
                     // no wire-visible difference and no self-inflicted
                     // delivery outage.
                     debug!(
-                        kmrsp_len = echo.len(),
+                        kmrsp_len = payload.len(),
                         "KMRSP echo does not match outstanding KMREQ"
                     );
                     KmRspOutcome::Ignored
                 }
             },
-            Err(_) => {
-                debug!(kmrsp_len = payload.len(), "malformed KMRSP ignored");
-                KmRspOutcome::Ignored
-            }
         }
     }
 
@@ -882,11 +886,7 @@ mod tests {
                 matches!(inflight.unwrap(), KmReqOutcome::Failed(_)),
                 "bogus KMREQ at len {n} must be rejected, never installed"
             );
-            // 4. KMRSP paths (also hardened by the CVE fix).
-            assert!(
-                catch_unwind(|| KmResponse::parse(&buf)).is_ok(),
-                "KmResponse::parse panicked at len {n}"
-            );
+            // 4. KMRSP path (also hardened by the CVE fix).
             assert!(
                 catch_unwind(AssertUnwindSafe(|| initiator.handle_kmrsp(&buf))).is_ok(),
                 "handle_kmrsp panicked at len {n}"

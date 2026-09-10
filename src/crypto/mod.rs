@@ -9,7 +9,7 @@
 //!
 //! Layout (private modules, re-exported below):
 //! - `keys`: SEK/KEK material, PBKDF2 derivation, RFC 3394 wrap;
-//! - `km`: KM message and KMRSP codec;
+//! - `km`: KM message codec;
 //! - `ctr`: per-packet AES-CTR keystream;
 //! - `context`: per-connection engine (KMX, refresh, encrypt/decrypt).
 
