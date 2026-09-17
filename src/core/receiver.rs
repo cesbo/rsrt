@@ -280,7 +280,7 @@ impl Receiver {
             return;
         }
         let ext_us = self.extender.extend(ts, instant);
-        debug!(ext_us, "TSBPD anchored at handshake packet");
+        trace!(ext_us, "TSBPD anchored at handshake packet");
         self.anchor = Some(Anchor { instant, ext_us });
     }
 
@@ -369,7 +369,7 @@ impl Receiver {
         // packet's one-way delay into every deadline).
         let ext_us = self.extender.extend(pkt.timestamp, now);
         if self.anchor.is_none() {
-            debug!(ext_us, "TSBPD anchored at first data packet");
+            trace!(ext_us, "TSBPD anchored at first data packet");
             self.anchor = Some(Anchor {
                 instant: now,
                 ext_us,

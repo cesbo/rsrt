@@ -211,7 +211,7 @@ pub struct Sender {
 
 impl Sender {
     pub fn new(cfg: SenderConfig) -> Self {
-        debug!(
+        trace!(
             initial_seq = cfg.initial_seq.value(),
             flow_window = cfg.flow_window,
             snd_latency_ms = cfg.snd_latency.as_millis() as u64,

@@ -365,7 +365,7 @@ async fn drive(state: DriverState) {
                     deliver(&data_tx, payload);
                 }
                 store(&stats, output_stats.snapshot(conn.stats()));
-                debug!(%reason, "connection driver finished");
+                trace!(%reason, "connection driver finished");
                 return;
             }
             _ => {}
@@ -402,7 +402,7 @@ async fn drive(state: DriverState) {
                 Some(Cmd::Close) => conn.close(Instant::now()),
                 None => {
                     cmd_open = false;
-                    debug!("handle dropped; closing connection");
+                    trace!("handle dropped; closing connection");
                     conn.close(Instant::now());
                 }
             },

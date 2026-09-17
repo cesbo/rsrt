@@ -322,7 +322,7 @@ impl Connection {
         timebase: Timebase,
     ) -> Connection {
         let (sender, receiver) = transmission_pair(now, &negotiated, &opts, timebase);
-        debug!(
+        trace!(
             remote = %negotiated.remote,
             local = ?negotiated.local_socket_id,
             peer = ?negotiated.peer_socket_id,
@@ -510,7 +510,7 @@ impl Connection {
         // SHUTDOWN is meaningful only once the peer knows us; a caller
         // abandoning a handshake just stops transmitting (handshake.md §8).
         let send_shutdown = matches!(self.state, State::Established { .. });
-        debug!("local close");
+        trace!("local close");
         self.close_with(now, CloseReason::Local, send_shutdown);
     }
 

@@ -341,7 +341,7 @@ impl ListenerDriver {
                         id: local_id,
                     }),
                 );
-                debug!(%from, id = local_id.0, "connection accepted");
+                trace!(%from, id = local_id.0, "connection accepted");
                 self.conns
                     .insert(local_id, ConnEntry { tx, peer: peer_key });
                 self.by_peer.insert(peer_key, local_id);
@@ -377,7 +377,7 @@ impl ListenerDriver {
             if self.by_peer.get(&entry.peer) == Some(&id) {
                 self.by_peer.remove(&entry.peer);
             }
-            debug!(id = id.0, "connection reaped");
+            trace!(id = id.0, "connection reaped");
         }
     }
 
