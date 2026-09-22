@@ -423,7 +423,7 @@ impl Sender {
             // window (docs/spec/transmission.md §6 step 6).
             if let Some(avail) = cif.avail_buf_pkts {
                 if avail != self.advertised_window {
-                    debug!(avail, "peer advertised window updated");
+                    trace!(avail, "peer advertised window updated");
                 }
                 self.advertised_window = avail;
             }
