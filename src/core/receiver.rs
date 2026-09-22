@@ -482,7 +482,7 @@ impl Receiver {
     pub fn handle_ackack(&mut self, now: Instant, ack_number: u32, ts: Timestamp) {
         let Some(pos) = self.ack_journal.iter().position(|r| r.number == ack_number) else {
             // Unknown, light (0), or already-consumed number.
-            debug!(ack_number, "ACKACK does not match any pending ACK; ignored");
+            trace!(ack_number, "ACKACK does not match any pending ACK; ignored");
             return;
         };
         let rec = self.ack_journal[pos];
@@ -669,7 +669,7 @@ impl Receiver {
 
             let slot = self.slots.pop_front().flatten().expect("occupied");
             if slot.undecryptable {
-                debug!(
+                trace!(
                     seq = self.base_seq.value(),
                     "undecryptable packet freed at play time"
                 );

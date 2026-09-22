@@ -371,10 +371,10 @@ impl Connection {
             Err(PacketError::UnknownControlType(t)) => {
                 // Ignored, but still counts as peer activity: libsrt resets
                 // EXPCount before dispatching on the type (docs/spec/NOTES.md).
-                debug!(control_type = t, "unknown control type ignored");
+                trace!(control_type = t, "unknown control type ignored");
                 self.touch(now);
             }
-            Err(e) => debug!(%e, len, "undecodable datagram dropped"),
+            Err(e) => trace!(%e, len, "undecodable datagram dropped"),
         }
     }
 
@@ -386,7 +386,7 @@ impl Connection {
         }
         let dst = packet.dst_socket_id();
         if dst != SocketId::HANDSHAKE && dst != self.local_socket_id {
-            debug!(
+            trace!(
                 dst = dst.0,
                 local = self.local_socket_id.0,
                 "packet for another socket dropped"

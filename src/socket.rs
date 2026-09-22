@@ -54,7 +54,6 @@ use tokio::{
     task::JoinHandle,
 };
 use tracing::{
-    debug,
     trace,
     warn,
 };
@@ -166,7 +165,7 @@ impl DriverIo {
             DriverIo::Connected(udp) => match udp.recv(buf).await {
                 Ok(n) => RecvEvent::Buffered(n),
                 Err(e) => {
-                    debug!(%e, "udp recv error (transient)");
+                    trace!(%e, "udp recv error (transient)");
                     RecvEvent::Error
                 }
             },

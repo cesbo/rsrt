@@ -199,7 +199,7 @@ impl ListenerDriver {
                     Ok((n, SocketAddr::V6(from))) => {
                         trace!(%from, len = n, "non-IPv4 datagram dropped");
                     }
-                    Err(e) => debug!(%e, "listener recv error (transient)"),
+                    Err(e) => trace!(%e, "listener recv error (transient)"),
                 },
                 // `reap_tx` lives on this stack frame: recv() never yields
                 // None while the loop runs.
@@ -247,7 +247,7 @@ impl ListenerDriver {
                         }
                     }
                 }
-                Some(_) => debug!(%from, dst = dst.0, "source address mismatch; datagram dropped"),
+                Some(_) => trace!(%from, dst = dst.0, "source address mismatch; datagram dropped"),
                 None => trace!(%from, dst = dst.0, "datagram for unknown socket dropped"),
             }
             return;
@@ -257,7 +257,7 @@ impl ListenerDriver {
         let packet = match Packet::parse(Bytes::copy_from_slice(datagram)) {
             Ok(p) => p,
             Err(e) => {
-                debug!(%from, %e, "undecodable dst-0 datagram dropped");
+                trace!(%from, %e, "undecodable dst-0 datagram dropped");
                 return;
             }
         };
