@@ -251,7 +251,7 @@ impl Connection {
     /// INDUCTION request immediately.
     pub fn connect(
         now: Instant,
-        remote: impl Into<SocketAddr>,
+        remote: SocketAddr,
         local_socket_id: SocketId,
         initial_seq: SeqNumber,
         opts: SrtOptions,
@@ -270,13 +270,12 @@ impl Connection {
     /// place the timebase start close to the 32-bit µs timestamp wrap.
     pub fn connect_with_timebase(
         now: Instant,
-        remote: impl Into<SocketAddr>,
+        remote: SocketAddr,
         local_socket_id: SocketId,
         initial_seq: SeqNumber,
         opts: SrtOptions,
         timebase: Timebase,
     ) -> Connection {
-        let remote = remote.into();
         let hs = CallerHandshake::new(now, remote, local_socket_id, initial_seq, timebase, &opts);
         Connection {
             state: State::Connecting {
@@ -1121,10 +1120,7 @@ fn merge_stats(sender: &Sender, receiver: &Receiver, crypto: Option<&Crypto>) ->
 
 #[cfg(test)]
 mod tests {
-    use std::net::{
-        Ipv4Addr,
-        SocketAddrV4,
-    };
+    use std::net::Ipv4Addr;
 
     use super::*;
     use crate::packet::{
@@ -1141,12 +1137,12 @@ mod tests {
     const UNUSED_ISN: SeqNumber = SeqNumber::new(9);
     const MS: Duration = Duration::from_millis(1);
 
-    fn caller_addr() -> SocketAddrV4 {
-        SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 50_000)
+    fn caller_addr() -> SocketAddr {
+        SocketAddr::new(Ipv4Addr::new(10, 0, 0, 2).into(), 50_000)
     }
 
-    fn listener_addr() -> SocketAddrV4 {
-        SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 10), 4200)
+    fn listener_addr() -> SocketAddr {
+        SocketAddr::new(Ipv4Addr::new(192, 168, 1, 10).into(), 4200)
     }
 
     fn caller(now: Instant, opts: SrtOptions) -> Connection {
@@ -1367,7 +1363,7 @@ mod tests {
         let t0 = Instant::now();
         let mut c = caller(t0, SrtOptions::default());
         assert_eq!(c.state(), ConnState::Connecting);
-        assert_eq!(c.remote(), std::net::SocketAddr::from(listener_addr()));
+        assert_eq!(c.remote(), listener_addr());
         let pkt = c.poll_transmit(t0).expect("induction request");
         assert_eq!(hs_cif(&pkt).handshake_type, HandshakeType::Induction);
         assert_eq!(pkt.dst_socket_id(), SocketId::HANDSHAKE);

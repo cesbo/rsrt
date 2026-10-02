@@ -9,8 +9,6 @@ use std::{
         Ipv4Addr,
         Ipv6Addr,
         SocketAddr,
-        SocketAddrV4,
-        SocketAddrV6,
     },
     time::Duration,
 };
@@ -25,19 +23,13 @@ use rsrt::{
 async fn pair(
     caller_opts: SrtOptions,
     listener_opts: SrtOptions,
-) -> (
-    SrtSocket<SocketAddr>,
-    SrtSocket<SocketAddr>,
-    SrtListener<SocketAddr>,
-) {
+) -> (SrtSocket, SrtSocket, SrtListener) {
     tokio::time::timeout(Duration::from_secs(5), async {
-        let mut listener = SrtListener::bind_ip("[::1]:0", listener_opts)
-            .await
-            .unwrap();
+        let mut listener = SrtListener::bind("[::1]:0", listener_opts).await.unwrap();
         let addr = listener.local_addr();
         assert!(addr.is_ipv6());
         let (caller, accepted) =
-            tokio::join!(SrtSocket::connect_ip(addr, caller_opts), listener.accept(),);
+            tokio::join!(SrtSocket::connect(addr, caller_opts), listener.accept(),);
         let caller = caller.unwrap();
         let (accepted, peer) = accepted.unwrap();
         assert_eq!(peer.ip(), Ipv6Addr::LOCALHOST);
@@ -86,7 +78,7 @@ async fn ipv6_encrypted_bidirectional_transfer() {
 async fn ipv6_source_binding_and_streamid() {
     let port = net_support::free_udp_port_v6().unwrap();
     let opts = SrtOptions::default()
-        .local_addr_v6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, port, 0, 0))
+        .local_addr(SocketAddr::from((Ipv6Addr::LOCALHOST, port)))
         .streamid("ipv6-stream");
     let (caller, accepted, _listener) = pair(opts, SrtOptions::default()).await;
     assert_eq!(accepted.streamid().as_deref(), Some("ipv6-stream"));
@@ -136,39 +128,30 @@ async fn source_family_mismatch_fails_before_handshake() {
     for (target, opts) in [
         (
             "[::1]:9000",
-            SrtOptions::default().local_addr(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            SrtOptions::default().local_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
         ),
         (
             "127.0.0.1:9000",
-            SrtOptions::default().local_addr_v6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0)),
+            SrtOptions::default().local_addr(SocketAddr::from((Ipv6Addr::LOCALHOST, 0))),
         ),
     ] {
-        match SrtSocket::connect_ip(target, opts).await {
+        match SrtSocket::connect(target, opts).await {
             Err(SrtError::Io(err)) => assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput),
             _ => panic!("expected a source/target family error"),
         }
     }
-    let opts = SrtOptions {
-        local_addr: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
-        local_addr_v6: Some(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0)),
-        ..SrtOptions::default()
-    };
-    assert!(matches!(
-        SrtSocket::connect_ip("[::1]:9000", opts).await,
-        Err(SrtError::Io(_))
-    ));
 }
 
 #[tokio::test]
 async fn ipv6_listener_demuxes_multiple_callers() {
     tokio::time::timeout(Duration::from_secs(5), async {
-        let mut listener = SrtListener::bind_ip("[::1]:0", SrtOptions::default())
+        let mut listener = SrtListener::bind("[::1]:0", SrtOptions::default())
             .await
             .unwrap();
         let addr = listener.local_addr();
         let (first, second, peers) = tokio::join!(
-            SrtSocket::connect_ip(addr, SrtOptions::default().streamid("first")),
-            SrtSocket::connect_ip(addr, SrtOptions::default().streamid("second")),
+            SrtSocket::connect(addr, SrtOptions::default().streamid("first")),
+            SrtSocket::connect(addr, SrtOptions::default().streamid("second")),
             async {
                 (
                     listener.accept().await.unwrap(),
@@ -197,34 +180,26 @@ async fn ipv6_listener_demuxes_multiple_callers() {
 }
 
 #[tokio::test]
-async fn existing_ipv4_types_and_ip_apis_interoperate() {
-    // These annotations pin the existing API contracts at compile time.
-    let mut listener: SrtListener = SrtListener::bind("127.0.0.1:0", SrtOptions::default())
-        .await
-        .unwrap();
-    let addr: SocketAddrV4 = listener.local_addr();
-    let (caller, accepted) = tokio::join!(
-        SrtSocket::connect_ip(addr, SrtOptions::default()),
-        listener.accept()
-    );
-    let caller: SrtSocket<SocketAddr> = caller.unwrap();
-    let (accepted, peer): (SrtSocket, SocketAddrV4) = accepted.unwrap();
-    let _: SocketAddrV4 = accepted.peer_addr();
-    assert_eq!(SocketAddr::from(peer), accepted.peer_addr().into());
-    assert_eq!(caller.peer_addr(), SocketAddr::from(addr));
-    caller.close().await.unwrap();
-    accepted.close().await.unwrap();
-
-    let mut listener = SrtListener::bind_ip("127.0.0.1:0", SrtOptions::default())
-        .await
-        .unwrap();
-    let (caller, accepted) = tokio::join!(
-        SrtSocket::connect(listener.local_addr(), SrtOptions::default()),
-        listener.accept()
-    );
-    let caller: SrtSocket = caller.unwrap();
-    let (accepted, _) = accepted.unwrap();
-    assert_eq!(SocketAddr::from(caller.peer_addr()), listener.local_addr());
-    caller.close().await.unwrap();
-    accepted.close().await.unwrap();
+async fn ipv4_and_ipv6_use_same_api_types() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for bind_addr in ["127.0.0.1:0", "[::1]:0"] {
+            let mut listener: SrtListener = SrtListener::bind(bind_addr, SrtOptions::default())
+                .await
+                .unwrap();
+            let addr: SocketAddr = listener.local_addr();
+            let (caller, accepted) = tokio::join!(
+                SrtSocket::connect(addr, SrtOptions::default()),
+                listener.accept(),
+            );
+            let caller: SrtSocket = caller.unwrap();
+            let (accepted, peer): (SrtSocket, SocketAddr) = accepted.unwrap();
+            assert_eq!(accepted.peer_addr(), peer);
+            assert_eq!(caller.peer_addr(), addr);
+            assert_eq!(peer.is_ipv6(), addr.is_ipv6());
+            caller.close().await.unwrap();
+            accepted.close().await.unwrap();
+        }
+    })
+    .await
+    .expect("unified address API timed out");
 }

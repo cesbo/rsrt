@@ -7,10 +7,7 @@ use std::{
         Hasher,
     },
     io,
-    net::{
-        SocketAddr,
-        SocketAddrV4,
-    },
+    net::SocketAddr,
     sync::{
         atomic::{
             AtomicU64,
@@ -49,11 +46,7 @@ use crate::{
 /// bind must fail with `AddrInUse` instead of silently stealing all inbound
 /// traffic from the first socket (which is what the kernel does for unicast
 /// UDP when both binders set `SO_REUSEADDR`).
-pub(crate) fn bind_udp(
-    addr: impl Into<SocketAddr>,
-    recv_buffer: Option<usize>,
-) -> io::Result<UdpSocket> {
-    let addr = addr.into();
+pub(crate) fn bind_udp(addr: SocketAddr, recv_buffer: Option<usize>) -> io::Result<UdpSocket> {
     let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
     // Keep the address family explicit on every platform: IPv4-mapped
     // traffic must not unexpectedly share an IPv6 listener's port.
@@ -69,21 +62,9 @@ pub(crate) fn bind_udp(
     UdpSocket::from_std(socket)
 }
 
-/// Resolves `addr` to the first IPv4 address ([`SrtError::NoIpv4Address`]
-/// if none). Uses `tokio::net::lookup_host`.
-pub(crate) async fn resolve_v4(addr: impl ToSocketAddrs) -> Result<SocketAddrV4, SrtError> {
-    let mut addrs = tokio::net::lookup_host(addr).await?;
-    addrs
-        .find_map(|a| match a {
-            SocketAddr::V4(v4) => Some(v4),
-            SocketAddr::V6(_) => None,
-        })
-        .ok_or(SrtError::NoIpv4Address)
-}
-
-/// Resolves either family, preferring IPv4 for existing hostname behavior.
+/// Resolves either family in the order returned by `lookup_host`.
 /// An explicit source address restricts resolution to its own family.
-pub(crate) async fn resolve_ip(
+pub(crate) async fn resolve(
     addr: impl ToSocketAddrs,
     local: Option<SocketAddr>,
 ) -> Result<SocketAddr, SrtError> {
@@ -91,26 +72,18 @@ pub(crate) async fn resolve_ip(
 }
 
 fn select_ip(
-    addrs: impl Iterator<Item = SocketAddr>,
+    mut addrs: impl Iterator<Item = SocketAddr>,
     local: Option<SocketAddr>,
 ) -> Result<SocketAddr, SrtError> {
-    let mut first_v6 = None;
-    for addr in addrs {
-        if local.is_some_and(|local| local.is_ipv4() != addr.is_ipv4()) {
-            continue;
-        }
-        if addr.is_ipv4() {
-            return Ok(addr);
-        }
-        first_v6.get_or_insert(addr);
-    }
-    first_v6.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "no target address matches the requested IP family",
-        )
-        .into()
-    })
+    addrs
+        .find(|addr| local.is_none_or(|local| local.is_ipv4() == addr.is_ipv4()))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "no target address matches the requested IP family",
+            )
+            .into()
+        })
 }
 
 /// Non-zero random value without external dependencies: SipHash keyed once
@@ -185,9 +158,12 @@ mod tests {
 
     #[tokio::test]
     async fn bind_udp_roundtrip() {
-        let a =
-            bind_udp(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), Some(256 * 1024)).expect("bind a");
-        let b = bind_udp(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), None).expect("bind b");
+        let a = bind_udp(
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
+            Some(256 * 1024),
+        )
+        .expect("bind a");
+        let b = bind_udp(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0), None).expect("bind b");
         let addr_a = a.local_addr().expect("local addr");
         b.send_to(b"ping", addr_a).await.expect("send");
         let mut buf = [0u8; 16];
@@ -202,7 +178,8 @@ mod tests {
     /// to it — this test then fails.
     #[tokio::test]
     async fn bind_udp_is_exclusive_against_reuseaddr_rival() {
-        let first = bind_udp(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), None).expect("first bind");
+        let first =
+            bind_udp(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0), None).expect("first bind");
         let addr = first.local_addr().expect("local addr");
 
         let rival =
@@ -215,25 +192,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_v4_literal() {
-        let addr = resolve_v4("127.0.0.1:9000").await.expect("resolve");
-        assert_eq!(addr, SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9000));
-    }
-
-    #[tokio::test]
-    async fn resolve_v4_rejects_v6_only() {
-        match resolve_v4("[::1]:9000").await {
-            Err(SrtError::NoIpv4Address) => {}
-            other => panic!("expected NoIpv4Address, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn resolve_ip_literals_and_source_family() {
+    async fn resolve_literals_and_source_family() {
         let v4: SocketAddr = "127.0.0.1:9000".parse().unwrap();
         let v6: SocketAddr = "[::1]:9000".parse().unwrap();
-        assert_eq!(resolve_ip("[::1]:9000", None).await.unwrap(), v6);
-        assert_eq!(select_ip([v6, v4].into_iter(), None).unwrap(), v4);
+        assert_eq!(resolve("[::1]:9000", None).await.unwrap(), v6);
+        assert_eq!(resolve("127.0.0.1:9000", None).await.unwrap(), v4);
+        assert_eq!(select_ip([v6, v4].into_iter(), None).unwrap(), v6);
+        assert_eq!(select_ip([v4, v6].into_iter(), None).unwrap(), v4);
         assert_eq!(select_ip([v4, v6].into_iter(), Some(v6)).unwrap(), v6);
         assert_eq!(select_ip([v6, v4].into_iter(), Some(v4)).unwrap(), v4);
         assert!(select_ip([v4].into_iter(), Some(v6)).is_err());
@@ -246,7 +211,7 @@ mod tests {
             0,
             7,
         ));
-        assert_eq!(resolve_ip(scoped, Some(v6)).await.unwrap(), scoped);
+        assert_eq!(resolve(scoped, Some(v6)).await.unwrap(), scoped);
     }
 
     #[tokio::test]

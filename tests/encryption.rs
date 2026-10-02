@@ -43,12 +43,12 @@ async fn pair(copts: SrtOptions, lopts: SrtOptions) -> (SrtSocket, SrtSocket, Sr
         .await
         .expect("listener bind");
     let addr = listener.local_addr();
-    assert_eq!(*addr.ip(), Ipv4Addr::LOCALHOST);
+    assert_eq!(addr.ip(), Ipv4Addr::LOCALHOST);
     assert_ne!(addr.port(), 0);
     let (caller, accepted) = tokio::join!(SrtSocket::connect(addr, copts), listener.accept());
     let caller = caller.expect("connect");
     let (accepted, peer) = accepted.expect("accept");
-    assert_eq!(*peer.ip(), Ipv4Addr::LOCALHOST);
+    assert_eq!(peer.ip(), Ipv4Addr::LOCALHOST);
     (caller, accepted, listener)
 }
 

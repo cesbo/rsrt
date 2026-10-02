@@ -37,7 +37,6 @@ use std::{
         self,
         Read,
     },
-    net::SocketAddr,
     thread,
     time::Duration,
 };
@@ -151,11 +150,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 /// Awaits `f` while keeping the stats cadence: whenever the deadline passes
 /// before `f` completes, a stats line is printed and the wait resumes.
-async fn with_stats<F: Future>(
-    sock: &SrtSocket<SocketAddr>,
-    next_stats: &mut Instant,
-    f: F,
-) -> F::Output {
+async fn with_stats<F: Future>(sock: &SrtSocket, next_stats: &mut Instant, f: F) -> F::Output {
     tokio::pin!(f);
     loop {
         tokio::select! {
@@ -169,15 +164,15 @@ async fn with_stats<F: Future>(
 }
 
 /// Connects or listens according to the URL (see [`SrtUrl::is_listener`]).
-async fn open(url: &SrtUrl, opts: SrtOptions) -> Result<SrtSocket<SocketAddr>, Box<dyn Error>> {
+async fn open(url: &SrtUrl, opts: SrtOptions) -> Result<SrtSocket, Box<dyn Error>> {
     if url.is_listener() {
-        let mut listener = SrtListener::bind_ip(url.socket_addr(), opts).await?;
+        let mut listener = SrtListener::bind(url.socket_addr(), opts).await?;
         eprintln!("send: listening on {}", listener.local_addr());
         let (sock, peer) = listener.accept().await?;
         eprintln!("send: accepted {peer}");
         Ok(sock)
     } else {
-        let sock = SrtSocket::connect_ip(url.socket_addr(), opts).await?;
+        let sock = SrtSocket::connect(url.socket_addr(), opts).await?;
         eprintln!("send: connected to {}", sock.peer_addr());
         Ok(sock)
     }

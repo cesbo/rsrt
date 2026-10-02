@@ -2,11 +2,7 @@
 
 use std::{
     fmt,
-    net::{
-        SocketAddr,
-        SocketAddrV4,
-        SocketAddrV6,
-    },
+    net::SocketAddr,
     time::Duration,
 };
 
@@ -140,16 +136,12 @@ pub struct SrtOptions {
     /// (multi-homed hosts, policy routing): pins the source address
     /// and/or the local port — the peer then sees exactly this source.
     /// Port 0 lets the kernel pick an ephemeral port. `None` (default)
-    /// binds `0.0.0.0:0`. Binding an address the host does not own fails
+    /// binds `0.0.0.0:0` or `[::]:0` to match the target family. IPv6
+    /// scope IDs are preserved. Binding an address the host does not own fails
     /// with `SrtError::Io` (`AddrNotAvailable`); there is no silent
     /// fallback to another interface. Ignored by `SrtListener::bind`,
     /// whose bind address is the explicit argument.
-    pub local_addr: Option<SocketAddrV4>,
-    /// IPv6 source address for `SrtSocket::connect_ip`. Port 0 selects an
-    /// ephemeral port. Preserves the scope ID for link-local addresses.
-    /// Set at most one of `local_addr` and `local_addr_v6`. Ignored by
-    /// listeners and the IPv4-only `SrtSocket::connect`.
-    pub local_addr_v6: Option<SocketAddrV6>,
+    pub local_addr: Option<SocketAddr>,
     /// Encryption passphrase (SRTO_PASSPHRASE). `None` or empty =
     /// unencrypted. When set: 10..=80 bytes (libsrt's code accepts 80
     /// despite `srt.h` documenting 79; docs/spec/encryption.md §2).
@@ -195,7 +187,6 @@ impl fmt::Debug for SrtOptions {
             .field("bandwidth", &self.bandwidth)
             .field("udp_recv_buffer", &self.udp_recv_buffer)
             .field("local_addr", &self.local_addr)
-            .field("local_addr_v6", &self.local_addr_v6)
             .field(
                 "passphrase",
                 &self.passphrase.as_ref().map(|_| "<redacted>"),
@@ -223,7 +214,6 @@ impl Default for SrtOptions {
             bandwidth: Bandwidth::Unlimited,
             udp_recv_buffer: None,
             local_addr: None,
-            local_addr_v6: None,
             passphrase: None,
             pbkeylen: None,
             km_refresh_rate: None,
@@ -278,29 +268,9 @@ impl SrtOptions {
         self
     }
 
-    pub fn local_addr(mut self, addr: SocketAddrV4) -> Self {
+    pub fn local_addr(mut self, addr: SocketAddr) -> Self {
         self.local_addr = Some(addr);
-        self.local_addr_v6 = None;
         self
-    }
-
-    pub fn local_addr_v6(mut self, addr: SocketAddrV6) -> Self {
-        self.local_addr_v6 = Some(addr);
-        self.local_addr = None;
-        self
-    }
-
-    pub(crate) fn ip_local_addr(&self) -> Result<Option<SocketAddr>, SrtError> {
-        match (self.local_addr, self.local_addr_v6) {
-            (Some(_), Some(_)) => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "set only one of local_addr and local_addr_v6",
-            )
-            .into()),
-            (Some(addr), None) => Ok(Some(addr.into())),
-            (None, Some(addr)) => Ok(Some(addr.into())),
-            (None, None) => Ok(None),
-        }
     }
 
     pub fn pbkeylen(mut self, len: KeyLength) -> Self {

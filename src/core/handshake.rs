@@ -156,13 +156,12 @@ impl CallerHandshake {
     /// queued immediately (returned by the first `poll_transmit`).
     pub fn new(
         now: Instant,
-        remote: impl Into<SocketAddr>,
+        remote: SocketAddr,
         local_socket_id: SocketId,
         initial_seq: SeqNumber,
         timebase: Timebase,
         opts: &SrtOptions,
     ) -> Self {
-        let remote = remote.into();
         debug!(%remote, id = ?local_socket_id, isn = %initial_seq, "caller handshake started");
         // Crypto options are validated by the runtime before connecting
         // (like the StreamID length). If an invalid set reaches the FSM
@@ -602,7 +601,7 @@ impl Listener {
     pub fn handle_handshake(
         &mut self,
         now: Instant,
-        from: impl Into<SocketAddr>,
+        from: SocketAddr,
         cif: &HandshakeCif,
         new_socket_id: SocketId,
         new_initial_seq: SeqNumber,
@@ -610,7 +609,6 @@ impl Listener {
         // In caller-listener mode the listener never generates an ISN: it
         // adopts the caller's for both directions (echoed for the security
         // check). `new_initial_seq` is deliberately unused.
-        let from = from.into();
         let _ = new_initial_seq;
         match cif.handshake_type {
             HandshakeType::Induction => self.on_induction(now, from, cif),
@@ -629,8 +627,8 @@ impl Listener {
     }
 
     /// Stateless SYN cookie for `from` at minute granularity.
-    pub fn cookie(&self, now: Instant, from: impl Into<SocketAddr>) -> u32 {
-        self.cookie_at(self.minute(now), from.into())
+    pub fn cookie(&self, now: Instant, from: SocketAddr) -> u32 {
+        self.cookie_at(self.minute(now), from)
     }
 
     fn on_induction(&self, now: Instant, from: SocketAddr, cif: &HandshakeCif) -> ListenerAction {
@@ -874,8 +872,7 @@ impl Listener {
         ListenerAction::Reply(self.packet(now, cif.socket_id, reply))
     }
 
-    fn cookie_ok(&self, now: Instant, from: impl Into<SocketAddr>, cookie: u32) -> bool {
-        let from = from.into();
+    fn cookie_ok(&self, now: Instant, from: SocketAddr, cookie: u32) -> bool {
         let minute = self.minute(now);
         cookie == self.cookie_at(minute, from)
             // Accept the previous minute too: fixes libsrt 1.4.4's
@@ -988,10 +985,7 @@ fn ms_dur(ms: u16) -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{
-        Ipv4Addr,
-        SocketAddrV4,
-    };
+    use std::net::Ipv4Addr;
 
     use super::*;
     use crate::packet::Timestamp;
@@ -1003,12 +997,12 @@ mod tests {
     const UNUSED_ISN: SeqNumber = SeqNumber::new(42);
     const SECRET: u64 = 0xDEAD_BEEF_F00D;
 
-    fn caller_addr() -> SocketAddrV4 {
-        SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 50_000)
+    fn caller_addr() -> SocketAddr {
+        SocketAddr::new(Ipv4Addr::new(10, 0, 0, 2).into(), 50_000)
     }
 
-    fn listener_addr() -> SocketAddrV4 {
-        SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 10), 4200)
+    fn listener_addr() -> SocketAddr {
+        SocketAddr::new(Ipv4Addr::new(192, 168, 1, 10).into(), 4200)
     }
 
     fn hs_cif(pkt: &Packet) -> &HandshakeCif {
@@ -1148,7 +1142,7 @@ mod tests {
         assert_eq!(req.initial_seq, CALLER_ISN);
         assert_eq!(
             req.peer_ip,
-            HandshakeCif::encode_peer_ip(*listener_addr().ip())
+            HandshakeCif::encode_peer_ip(listener_addr().ip())
         );
         assert!(req.extensions.is_empty());
 
@@ -1252,7 +1246,7 @@ mod tests {
         );
         assert_eq!(
             rsp.peer_ip,
-            HandshakeCif::encode_peer_ip(*caller_addr().ip())
+            HandshakeCif::encode_peer_ip(caller_addr().ip())
         );
         assert!(rsp.stream_id().is_none()); // listener never sends SID back
 
@@ -1282,8 +1276,8 @@ mod tests {
         assert_eq!(c_neg.snd_latency, l_neg.rcv_latency);
         assert_eq!(c_neg.rcv_latency, l_neg.snd_latency);
         assert_eq!(c_neg.mss, l_neg.mss);
-        assert_eq!(c_neg.remote, std::net::SocketAddr::from(listener_addr()));
-        assert_eq!(l_neg.remote, std::net::SocketAddr::from(caller_addr()));
+        assert_eq!(c_neg.remote, listener_addr());
+        assert_eq!(l_neg.remote, caller_addr());
         (c_neg, l_neg)
     }
 
@@ -1485,7 +1479,7 @@ mod tests {
             handshake_type: HandshakeType::Induction,
             socket_id: CALLER_ID, // our own id echoed back — must not be read
             cookie,
-            peer_ip: HandshakeCif::encode_peer_ip(*listener_addr().ip()),
+            peer_ip: HandshakeCif::encode_peer_ip(listener_addr().ip()),
             extensions: vec![],
         };
         let t1 = t0 + Duration::from_millis(100);
@@ -1508,7 +1502,7 @@ mod tests {
             handshake_type: HandshakeType::Conclusion,
             socket_id: ACCEPT_ID,
             cookie: 0x5EED_C00C,
-            peer_ip: HandshakeCif::encode_peer_ip(*caller_addr().ip()),
+            peer_ip: HandshakeCif::encode_peer_ip(caller_addr().ip()),
             extensions: vec![HsExtension::HsRsp(HsExtFields {
                 srt_version: SRT_VERSION,
                 flags: HsFlags::live_defaults(),
@@ -1753,7 +1747,7 @@ mod tests {
             handshake_type: HandshakeType::Conclusion,
             socket_id: CALLER_ID,
             cookie: l.cookie(now, caller_addr()),
-            peer_ip: HandshakeCif::encode_peer_ip(*listener_addr().ip()),
+            peer_ip: HandshakeCif::encode_peer_ip(listener_addr().ip()),
             extensions: vec![HsExtension::HsReq(HsExtFields {
                 srt_version: SRT_VERSION,
                 flags: HsFlags::live_defaults(),
@@ -2027,9 +2021,9 @@ mod tests {
         let l2 = Listener::new(SECRET, Timebase::new(t0), SrtOptions::default());
         assert_eq!(c1, l2.cookie(t0, caller_addr()));
         // Different port, ip, minute or secret → different cookie.
-        let other_port = SocketAddrV4::new(*caller_addr().ip(), 50_001);
+        let other_port = SocketAddr::new(caller_addr().ip(), 50_001);
         assert_ne!(c1, l.cookie(t0, other_port));
-        let other_ip = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 3), 50_000);
+        let other_ip = SocketAddr::new(Ipv4Addr::new(10, 0, 0, 3).into(), 50_000);
         assert_ne!(c1, l.cookie(t0, other_ip));
         assert_ne!(c1, l.cookie(t0 + Duration::from_secs(60), caller_addr()));
         let l3 = Listener::new(SECRET + 1, Timebase::new(t0), SrtOptions::default());
@@ -2072,20 +2066,20 @@ mod tests {
             0,
             7,
         );
-        let cookie = l.cookie(now, base);
-        assert!(l.cookie_ok(now, base, cookie));
+        let cookie = l.cookie(now, base.into());
+        assert!(l.cookie_ok(now, base.into(), cookie));
         for word in 0 .. 4 {
             let mut octets = base.ip().octets();
             octets[word * 4] ^= 1;
             let other = SocketAddrV6::new(Ipv6Addr::from(octets), base.port(), 0, base.scope_id());
-            assert!(!l.cookie_ok(now, other, cookie), "word {word}");
+            assert!(!l.cookie_ok(now, other.into(), cookie), "word {word}");
         }
         let mut other = base;
         other.set_port(base.port() + 1);
-        assert!(!l.cookie_ok(now, other, cookie));
+        assert!(!l.cookie_ok(now, other.into(), cookie));
         other = base;
         other.set_scope_id(base.scope_id() + 1);
-        assert!(!l.cookie_ok(now, other, cookie));
+        assert!(!l.cookie_ok(now, other.into(), cookie));
     }
 
     #[test]
@@ -2099,7 +2093,7 @@ mod tests {
         assert!(!l.cookie_ok(t0 + Duration::from_secs(121), caller_addr(), cookie));
         assert!(!l.cookie_ok(t0, caller_addr(), cookie.wrapping_add(1)));
         // A cookie for peer A never validates for peer B.
-        let other = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 3), 50_000);
+        let other = SocketAddr::new(Ipv4Addr::new(10, 0, 0, 3).into(), 50_000);
         assert!(!l.cookie_ok(t0, other, cookie));
     }
 

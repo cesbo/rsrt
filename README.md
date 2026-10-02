@@ -46,22 +46,24 @@ Tunables (latency, StreamID, passphrase/key length, bandwidth/pacing, buffer
 sizes, timeouts) live in [`SrtOptions`](src/options.rs); defaults follow
 libsrt 1.4.4 live mode.
 
-For IPv6, use `SrtSocket::connect_ip` and `SrtListener::bind_ip`. These also
-accept IPv4 addresses. Their socket and listener handles use `SocketAddr`
-for `peer_addr`, `local_addr`, and the peer returned by `accept`:
+`SrtSocket::connect` and `SrtListener::bind` accept IPv4 and IPv6
+addresses. Address accessors, the peer returned by `accept`, and
+`SrtOptions::local_addr` use `SocketAddr`:
 
 ```rust
-let mut listener = rsrt::SrtListener::bind_ip("[::]:9000", rsrt::SrtOptions::default()).await?;
+let mut listener = rsrt::SrtListener::bind("[::]:9000", rsrt::SrtOptions::default()).await?;
 let (sock, peer) = listener.accept().await?;
-// An IPv6 caller uses SrtSocket::connect_ip("[::1]:9000", opts).
+// An IPv6 caller uses SrtSocket::connect("[::1]:9000", opts).
 ```
 
-The existing `connect` and `bind` APIs retain their IPv4 behavior and
-`SocketAddrV4` types. The new APIs return `SrtSocket<SocketAddr>` and
-`SrtListener<SocketAddr>`; type inference usually handles this. Hostnames
-prefer IPv4 unless a caller sets `SrtOptions::local_addr_v6`. IPv6 sockets
-are IPv6-only, so bind separate listeners to serve both families. For
-link-local addresses, pass a `SocketAddrV6` with the interface scope ID.
+Hostnames use the first resolved address matching the caller's optional
+`local_addr` family, or the first resolved address when no source is set.
+IPv6 sockets are IPv6-only, so bind separate listeners to serve both
+families. For link-local addresses, pass a `SocketAddrV6` with the
+interface scope ID.
+
+This changes the address API from `SocketAddrV4` to `SocketAddr`; wrap
+existing IPv4 address values with `.into()` when assigning `local_addr`.
 
 Payload sizing follows libsrt: the limit is negotiated MSS minus 44 bytes
 for either family. IPv6 adds 20 bytes to the actual IP packet; set MSS to

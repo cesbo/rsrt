@@ -20,10 +20,7 @@
 
 use std::{
     collections::HashMap,
-    net::{
-        SocketAddr,
-        SocketAddrV4,
-    },
+    net::SocketAddr,
     sync::Arc,
     time::Instant,
 };
@@ -83,56 +80,27 @@ const DEMUX_QUEUE: usize = 1024;
 ///
 /// Dropping the listener stops accepting new connections; established
 /// sockets keep running (each has its own driver and shares the UDP socket).
-/// `A` is `SocketAddrV4` for `bind`, or `SocketAddr` for `bind_ip`.
-pub struct SrtListener<A = SocketAddrV4> {
-    accept_rx: mpsc::Receiver<(SrtSocket<SocketAddr>, SocketAddr)>,
-    local_addr: A,
-    peer_addr: fn(SocketAddr) -> A,
+pub struct SrtListener {
+    accept_rx: mpsc::Receiver<(SrtSocket, SocketAddr)>,
+    local_addr: SocketAddr,
 }
 
 impl SrtListener {
-    /// Binds the UDP socket (IPv4) and starts the listener driver.
+    /// Binds an IPv4 or IPv6 UDP socket and starts the listener driver.
+    /// Uses the first resolved address. IPv6 sockets are IPv6-only; bind
+    /// separate listeners to serve both families.
     ///
     /// `opts` apply to every accepted connection (`opts.streamid` is
     /// ignored; the caller supplies it).
     ///
     /// Errors: [`SrtError::InvalidPassphrase`],
     /// [`SrtError::InvalidKmParameters`], [`SrtError::InvalidBandwidth`],
-    /// [`SrtError::NoIpv4Address`], [`SrtError::Io`].
+    /// [`SrtError::Io`].
     pub async fn bind(addr: impl ToSocketAddrs, opts: SrtOptions) -> Result<SrtListener, SrtError> {
-        validate_listener_options(&opts)?;
-        let addr = net::resolve_v4(addr).await?;
-        let listener = SrtListener::<SocketAddr>::bind_resolved(addr.into(), opts).await?;
-        let SocketAddr::V4(local_addr) = listener.local_addr else {
-            unreachable!()
-        };
-        Ok(SrtListener {
-            accept_rx: listener.accept_rx,
-            local_addr,
-            peer_addr: |peer| match peer {
-                SocketAddr::V4(peer) => peer,
-                // An AF_INET socket only receives IPv4 datagrams.
-                SocketAddr::V6(_) => unreachable!(),
-            },
-        })
-    }
-
-    /// Binds an IPv4 or IPv6 listener. `accept` and `local_addr` use
-    /// `SocketAddr`, and accepted sockets are `SrtSocket<SocketAddr>`.
-    /// Hostnames prefer IPv4. IPv6 sockets are IPv6-only; bind separate
-    /// listeners to serve both families. Options apply as in `bind`.
-    pub async fn bind_ip(
-        addr: impl ToSocketAddrs,
-        opts: SrtOptions,
-    ) -> Result<SrtListener<SocketAddr>, SrtError> {
-        validate_listener_options(&opts)?;
-        let addr = net::resolve_ip(addr, None).await?;
-        SrtListener::<SocketAddr>::bind_resolved(addr, opts).await
-    }
-}
-
-impl SrtListener<SocketAddr> {
-    async fn bind_resolved(addr: SocketAddr, opts: SrtOptions) -> Result<Self, SrtError> {
+        // Validate local options before DNS or socket I/O.
+        opts.crypto_config()?;
+        opts.bandwidth.validate()?;
+        let addr = net::resolve(addr, None).await?;
         let udp = net::bind_udp(addr, opts.udp_recv_buffer)?;
         let local_addr = udp.local_addr()?;
         let (accept_tx, accept_rx) = mpsc::channel(ACCEPT_BACKLOG);
@@ -153,33 +121,20 @@ impl SrtListener<SocketAddr> {
         Ok(SrtListener {
             accept_rx,
             local_addr,
-            peer_addr: |peer| peer,
         })
     }
-}
 
-fn validate_listener_options(opts: &SrtOptions) -> Result<(), SrtError> {
-    // Fail before DNS or socket I/O: otherwise the core could silently
-    // reject every conclusion for invalid encryption or pacing options.
-    opts.crypto_config()?;
-    opts.bandwidth.validate()
-}
-
-impl<A: Copy> SrtListener<A> {
     /// Waits for the next accepted connection. Cancel-safe: dropping this
     /// future does not lose an accepted socket.
-    pub async fn accept(&mut self) -> Result<(SrtSocket<A>, A), SrtError> {
+    pub async fn accept(&mut self) -> Result<(SrtSocket, SocketAddr), SrtError> {
         // The driver outlives the handle, so a closed queue means it died.
-        let (socket, peer) = self
-            .accept_rx
+        self.accept_rx
             .recv()
             .await
-            .ok_or(SrtError::Closed(CloseReason::Local))?;
-        let peer = (self.peer_addr)(peer);
-        Ok((socket.map_peer(peer), peer))
+            .ok_or(SrtError::Closed(CloseReason::Local))
     }
 
-    pub fn local_addr(&self) -> A {
+    pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
 }
@@ -209,7 +164,7 @@ struct ListenerDriver {
     core: core::Listener,
     timebase: Timebase,
     opts: SrtOptions,
-    accept_tx: mpsc::Sender<(SrtSocket<SocketAddr>, SocketAddr)>,
+    accept_tx: mpsc::Sender<(SrtSocket, SocketAddr)>,
     /// False once the [`SrtListener`] handle is dropped.
     accept_open: bool,
     /// Established-traffic demux: local socket id → connection.
@@ -472,7 +427,7 @@ mod tests {
     fn shell_driver() -> (
         tokio::runtime::Runtime,
         ListenerDriver,
-        mpsc::Receiver<(SrtSocket<SocketAddr>, SocketAddr)>,
+        mpsc::Receiver<(SrtSocket, SocketAddr)>,
     ) {
         let timebase = Timebase::new(Instant::now());
         let (accept_tx, accept_rx) = mpsc::channel(1);
@@ -481,7 +436,7 @@ mod tests {
             .build()
             .unwrap();
         let udp = rt.block_on(async {
-            net::bind_udp(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), None).unwrap()
+            net::bind_udp(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0), None).unwrap()
         });
         let driver = ListenerDriver {
             udp: Arc::new(udp),

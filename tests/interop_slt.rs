@@ -73,7 +73,7 @@ async fn within_timeout<T>(fut: impl Future<Output = T>) -> T {
 
 /// Receives from `sock` until the whole expected stream for `seed` has been
 /// verified. Panics on divergence, early end of stream, or a 10 s stall.
-async fn recv_and_verify<A: Copy>(sock: &mut SrtSocket<A>, seed: u64) {
+async fn recv_and_verify(sock: &mut SrtSocket, seed: u64) {
     let mut verifier = PayloadVerifier::new(seed);
     while (verifier.verified() as usize) < TOTAL {
         match tokio::time::timeout(Duration::from_secs(10), sock.recv()).await {
@@ -94,7 +94,7 @@ async fn recv_and_verify<A: Copy>(sock: &mut SrtSocket<A>, seed: u64) {
 }
 
 /// Sends the whole stream for `seed` as paced [`MESSAGE_SIZE`] messages.
-async fn send_stream<A: Copy>(sock: &SrtSocket<A>, seed: u64) {
+async fn send_stream(sock: &SrtSocket, seed: u64) {
     let mut generator = PayloadGen::new(seed);
     for i in 0 .. MESSAGES {
         sock.send(&generator.next_message())
@@ -613,7 +613,7 @@ async fn ipv6_interop(rsrt_listens: bool, rsrt_receives: bool) {
             };
             let mut listener = if rsrt_listens {
                 Some(
-                    SrtListener::bind_ip("[::1]:0", opts.clone())
+                    SrtListener::bind("[::1]:0", opts.clone())
                         .await
                         .expect("IPv6 bind"),
                 )
@@ -639,7 +639,7 @@ async fn ipv6_interop(rsrt_listens: bool, rsrt_receives: bool) {
                 listener.accept().await.expect("IPv6 accept").0
             } else {
                 tokio::time::sleep(Duration::from_millis(300)).await;
-                SrtSocket::connect_ip(("::1", port), opts)
+                SrtSocket::connect(("::1", port), opts)
                     .await
                     .expect("IPv6 connect")
             };
