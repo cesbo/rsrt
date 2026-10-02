@@ -73,7 +73,7 @@ async fn within_timeout<T>(fut: impl Future<Output = T>) -> T {
 
 /// Receives from `sock` until the whole expected stream for `seed` has been
 /// verified. Panics on divergence, early end of stream, or a 10 s stall.
-async fn recv_and_verify(sock: &mut SrtSocket, seed: u64) {
+async fn recv_and_verify<A: Copy>(sock: &mut SrtSocket<A>, seed: u64) {
     let mut verifier = PayloadVerifier::new(seed);
     while (verifier.verified() as usize) < TOTAL {
         match tokio::time::timeout(Duration::from_secs(10), sock.recv()).await {
@@ -94,7 +94,7 @@ async fn recv_and_verify(sock: &mut SrtSocket, seed: u64) {
 }
 
 /// Sends the whole stream for `seed` as paced [`MESSAGE_SIZE`] messages.
-async fn send_stream(sock: &SrtSocket, seed: u64) {
+async fn send_stream<A: Copy>(sock: &SrtSocket<A>, seed: u64) {
     let mut generator = PayloadGen::new(seed);
     for i in 0 .. MESSAGES {
         sock.send(&generator.next_message())
@@ -598,4 +598,101 @@ async fn encrypted_caller_sends_to_slt_listener() {
         slt.kill().await.ok();
     })
     .await;
+}
+
+// The IPv6 matrix covers caller/listener and send/receive paths, each
+// with and without HaiCrypt, against the installed reference executable.
+async fn ipv6_interop(rsrt_listens: bool, rsrt_receives: bool) {
+    let binary = require_slt!();
+    for encrypted in [false, true] {
+        within_timeout(async {
+            let opts = if encrypted {
+                SrtOptions::default().passphrase(PASSPHRASE)
+            } else {
+                SrtOptions::default()
+            };
+            let mut listener = if rsrt_listens {
+                Some(
+                    SrtListener::bind_ip("[::1]:0", opts.clone())
+                        .await
+                        .expect("IPv6 bind"),
+                )
+            } else {
+                None
+            };
+            let port = listener
+                .as_ref()
+                .map(|l| l.local_addr().port())
+                .unwrap_or_else(|| support::net::free_udp_port_v6().expect("free IPv6 port"));
+            let mode = if rsrt_listens { "caller" } else { "listener" };
+            let mut uri = format!("srt://[::1]:{port}?mode={mode}&latency=120&ipv6only=1");
+            if encrypted {
+                uri.push_str(&format!("&passphrase={PASSPHRASE}"));
+            }
+            let mut slt = if rsrt_receives {
+                SltProcess::spawn_send(&binary, &uri, &[LOG, "-c:1316", "-a:no"])
+            } else {
+                SltProcess::spawn_receive(&binary, &uri, &[LOG, "-a:no"])
+            }
+            .expect("spawn IPv6 srt-live-transmit");
+            let mut sock = if let Some(listener) = listener.as_mut() {
+                listener.accept().await.expect("IPv6 accept").0
+            } else {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                SrtSocket::connect_ip(("::1", port), opts)
+                    .await
+                    .expect("IPv6 connect")
+            };
+            assert!(sock.peer_addr().is_ipv6());
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            const SEED: u64 = 0x51A7_0007;
+            if rsrt_receives {
+                let data = PayloadGen::stream_prefix(SEED, TOTAL);
+                let (fed, ()) = tokio::join!(
+                    slt.feed_stdin(&data, MESSAGE_SIZE, PACE),
+                    recv_and_verify(&mut sock, SEED),
+                );
+                fed.expect("feed IPv6 slt stdin");
+                assert_eq!(sock.stats().undecrypted_pkts, 0);
+                sock.close().await.expect("close IPv6 receiver");
+            } else {
+                let (out, ()) =
+                    tokio::join!(slt.collect_stdout(TOTAL, Duration::from_secs(25)), async {
+                        send_stream(&sock, SEED).await;
+                        tokio::time::sleep(Duration::from_millis(800)).await;
+                        sock.close().await.expect("close IPv6 sender");
+                    },);
+                let out = out.expect("collect IPv6 slt stdout");
+                assert_eq!(
+                    out.len(),
+                    TOTAL,
+                    "IPv6 slt stderr: {:?}",
+                    slt.drain_stderr()
+                );
+                verify_prefix(SEED, &out).expect("IPv6 payload equality");
+            }
+            slt.kill().await.ok();
+        })
+        .await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ipv6_caller_receives_from_slt_listener() {
+    ipv6_interop(false, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ipv6_listener_receives_from_slt_caller() {
+    ipv6_interop(true, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ipv6_caller_sends_to_slt_listener() {
+    ipv6_interop(false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ipv6_listener_sends_to_slt_caller() {
+    ipv6_interop(true, false).await;
 }

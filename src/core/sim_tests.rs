@@ -481,8 +481,14 @@ fn clean_handshake_data_and_shutdown() {
         setup < Duration::from_millis(50),
         "handshake too slow: {setup:?}"
     );
-    assert_eq!(sim.caller.remote(), listener_addr());
-    assert_eq!(sim.accepted_mut().remote(), caller_addr());
+    assert_eq!(
+        sim.caller.remote(),
+        std::net::SocketAddr::from(listener_addr())
+    );
+    assert_eq!(
+        sim.accepted_mut().remote(),
+        std::net::SocketAddr::from(caller_addr())
+    );
 
     // 200 payloads in each direction, one every 2 ms.
     let mut caller_sent = Vec::new();

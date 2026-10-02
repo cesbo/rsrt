@@ -2,7 +2,11 @@
 
 use std::{
     fmt,
-    net::SocketAddrV4,
+    net::{
+        SocketAddr,
+        SocketAddrV4,
+        SocketAddrV6,
+    },
     time::Duration,
 };
 
@@ -101,7 +105,9 @@ pub struct SrtOptions {
     pub peer_latency: Duration,
     /// StreamID sent by a caller (SRTO_STREAMID), max 512 bytes.
     pub streamid: Option<String>,
-    /// MTU including IP/UDP headers (SRTO_MSS). Default 1500.
+    /// SRT MSS including the fixed IPv4/UDP header allowance (SRTO_MSS).
+    /// Default 1500. Like libsrt, IPv6 uses the same payload sizing;
+    /// use 1480 to fit a 1500-byte IPv6 path MTU.
     pub mss: u32,
     /// Maximum flow window (packets in flight). Default 8192.
     pub flow_window: u32,
@@ -139,6 +145,11 @@ pub struct SrtOptions {
     /// fallback to another interface. Ignored by `SrtListener::bind`,
     /// whose bind address is the explicit argument.
     pub local_addr: Option<SocketAddrV4>,
+    /// IPv6 source address for `SrtSocket::connect_ip`. Port 0 selects an
+    /// ephemeral port. Preserves the scope ID for link-local addresses.
+    /// Set at most one of `local_addr` and `local_addr_v6`. Ignored by
+    /// listeners and the IPv4-only `SrtSocket::connect`.
+    pub local_addr_v6: Option<SocketAddrV6>,
     /// Encryption passphrase (SRTO_PASSPHRASE). `None` or empty =
     /// unencrypted. When set: 10..=80 bytes (libsrt's code accepts 80
     /// despite `srt.h` documenting 79; docs/spec/encryption.md §2).
@@ -184,6 +195,7 @@ impl fmt::Debug for SrtOptions {
             .field("bandwidth", &self.bandwidth)
             .field("udp_recv_buffer", &self.udp_recv_buffer)
             .field("local_addr", &self.local_addr)
+            .field("local_addr_v6", &self.local_addr_v6)
             .field(
                 "passphrase",
                 &self.passphrase.as_ref().map(|_| "<redacted>"),
@@ -211,6 +223,7 @@ impl Default for SrtOptions {
             bandwidth: Bandwidth::Unlimited,
             udp_recv_buffer: None,
             local_addr: None,
+            local_addr_v6: None,
             passphrase: None,
             pbkeylen: None,
             km_refresh_rate: None,
@@ -267,7 +280,27 @@ impl SrtOptions {
 
     pub fn local_addr(mut self, addr: SocketAddrV4) -> Self {
         self.local_addr = Some(addr);
+        self.local_addr_v6 = None;
         self
+    }
+
+    pub fn local_addr_v6(mut self, addr: SocketAddrV6) -> Self {
+        self.local_addr_v6 = Some(addr);
+        self.local_addr = None;
+        self
+    }
+
+    pub(crate) fn ip_local_addr(&self) -> Result<Option<SocketAddr>, SrtError> {
+        match (self.local_addr, self.local_addr_v6) {
+            (Some(_), Some(_)) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "set only one of local_addr and local_addr_v6",
+            )
+            .into()),
+            (Some(addr), None) => Ok(Some(addr.into())),
+            (None, Some(addr)) => Ok(Some(addr.into())),
+            (None, None) => Ok(None),
+        }
     }
 
     pub fn pbkeylen(mut self, len: KeyLength) -> Self {
@@ -372,7 +405,8 @@ mod tests {
         let cfg = opts.crypto_config().unwrap().unwrap();
         assert_eq!(cfg.km_refresh_rate, 0x10_0000);
         assert_eq!(cfg.km_preannounce, (0x10_0000 - 1) / 2); // 524287, not 65536
-                                                             // An explicit pre-announce still wins over the force-set.
+                                                             // An explicit pre-announce still wins
+                                                             // over the force-set.
         opts.km_preannounce = Some(1000);
         let cfg = opts.crypto_config().unwrap().unwrap();
         assert_eq!(cfg.km_preannounce, 1000);

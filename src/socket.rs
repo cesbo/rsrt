@@ -24,6 +24,8 @@
 use std::{
     net::{
         Ipv4Addr,
+        Ipv6Addr,
+        SocketAddr,
         SocketAddrV4,
     },
     sync::{
@@ -104,7 +106,7 @@ pub(crate) enum DriverIo {
     /// `rx`; sends go through the shared listener socket via `send_to`.
     Demux {
         udp: Arc<UdpSocket>,
-        remote: SocketAddrV4,
+        remote: SocketAddr,
         rx: mpsc::Receiver<Vec<u8>>,
     },
 }
@@ -219,7 +221,7 @@ impl DriverIo {
                 .await
             }
             DriverIo::Demux { udp, remote, .. } => {
-                let remote = socket2::SockAddr::from(std::net::SocketAddr::V4(*remote));
+                let remote = socket2::SockAddr::from(*remote);
                 udp.async_io(tokio::io::Interest::WRITABLE, || {
                     socket2::SockRef::from(udp.as_ref()).send_to_vectored(&bufs, &remote)
                 })
@@ -269,7 +271,7 @@ pub(crate) fn spawn_connection(
     opts: &SrtOptions,
     established_tx: Option<oneshot::Sender<Result<(), SrtError>>>,
     reap: Option<ReapGuard>,
-) -> SrtSocket {
+) -> SrtSocket<SocketAddr> {
     let (cmd_tx, cmd_rx) = mpsc::channel(CMD_QUEUE);
     let (data_tx, data_rx) = mpsc::channel(opts.recv_buffer_pkts.max(16));
     let stats = Arc::new(Mutex::new(conn.stats()));
@@ -456,13 +458,15 @@ fn connect_error(reason: CloseReason) -> SrtError {
 /// accepted by [`crate::SrtListener`]).
 ///
 /// Dropping the handle closes the connection (the driver sends SHUTDOWN).
-pub struct SrtSocket {
+/// `A` is `SocketAddrV4` for the existing IPv4 API, or `SocketAddr` for
+/// `connect_ip` and sockets accepted by `SrtListener::bind_ip`.
+pub struct SrtSocket<A = SocketAddrV4> {
     cmd_tx: mpsc::Sender<Cmd>,
     data_rx: mpsc::Receiver<Bytes>,
     stats: Arc<Mutex<Stats>>,
     close_reason: Arc<Mutex<Option<CloseReason>>>,
     driver: Option<JoinHandle<()>>,
-    peer: SocketAddrV4,
+    peer: A,
     streamid: Option<String>,
     /// Effective payload limit, shared with the driver (which stores the
     /// negotiated value at establishment). Relaxed ordering suffices: the
@@ -483,21 +487,45 @@ impl SrtSocket {
         addr: impl ToSocketAddrs,
         opts: SrtOptions,
     ) -> Result<SrtSocket, SrtError> {
-        if opts.streamid.as_ref().is_some_and(|s| s.len() > 512) {
-            return Err(SrtError::StreamIdTooLong);
-        }
-        // Fail fast on invalid encryption options (encryption.md §2),
-        // before any I/O: the handshake FSM consumes `crypto_config()`
-        // internally and would otherwise fail closed without a
-        // user-visible reason.
-        opts.crypto_config()?;
-        // Same fail-fast for pacing parameters: libsrt rejects them at
-        // setsockopt; connect is this crate's earliest equivalent.
-        opts.bandwidth.validate()?;
+        validate_connect_options(&opts)?;
         let remote = net::resolve_v4(addr).await?;
         let local = opts
             .local_addr
             .unwrap_or(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
+        let socket =
+            SrtSocket::<SocketAddr>::connect_resolved(remote.into(), local.into(), opts).await?;
+        Ok(socket.map_peer(remote))
+    }
+
+    /// Caller mode over IPv4 or IPv6. Returns a socket whose `peer_addr`
+    /// is a `SocketAddr`. Hostnames prefer IPv4 unless `local_addr_v6`
+    /// selects IPv6. With no source address, binds the matching wildcard.
+    ///
+    /// IPv6 literals use brackets: `[::1]:9000`. For scoped addresses,
+    /// pass a `SocketAddrV6` with the required scope ID.
+    /// Errors match `connect`; an empty resolution or a source/target
+    /// family mismatch returns `SrtError::Io` with `InvalidInput`.
+    pub async fn connect_ip(
+        addr: impl ToSocketAddrs,
+        opts: SrtOptions,
+    ) -> Result<SrtSocket<SocketAddr>, SrtError> {
+        validate_connect_options(&opts)?;
+        let local = opts.ip_local_addr()?;
+        let remote = net::resolve_ip(addr, local).await?;
+        let local = local.unwrap_or_else(|| match remote {
+            SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+            SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+        });
+        SrtSocket::<SocketAddr>::connect_resolved(remote, local, opts).await
+    }
+}
+
+impl SrtSocket<SocketAddr> {
+    async fn connect_resolved(
+        remote: SocketAddr,
+        local: SocketAddr,
+        opts: SrtOptions,
+    ) -> Result<Self, SrtError> {
         let udp = net::bind_udp(local, opts.udp_recv_buffer)?;
         udp.connect(remote).await?;
         let connect_timeout = opts.connect_timeout;
@@ -525,7 +553,9 @@ impl SrtSocket {
             Ok(Err(_)) | Err(_) => Err(SrtError::ConnectTimeout),
         }
     }
+}
 
+impl<A: Copy> SrtSocket<A> {
     /// Receives the next data message in TSBPD order.
     ///
     /// The returned payload is a [`bytes::Bytes`]: cheap to clone and
@@ -566,7 +596,7 @@ impl SrtSocket {
         load(&self.stats)
     }
 
-    pub fn peer_addr(&self) -> SocketAddrV4 {
+    pub fn peer_addr(&self) -> A {
         self.peer
     }
 
@@ -588,9 +618,37 @@ impl SrtSocket {
         Ok(())
     }
 
+    pub(crate) fn map_peer<B>(self, peer: B) -> SrtSocket<B> {
+        SrtSocket {
+            cmd_tx: self.cmd_tx,
+            data_rx: self.data_rx,
+            stats: self.stats,
+            close_reason: self.close_reason,
+            driver: self.driver,
+            peer,
+            streamid: self.streamid,
+            max_payload: self.max_payload,
+        }
+    }
+
     fn closed_error(&self) -> SrtError {
         SrtError::Closed(load(&self.close_reason).unwrap_or(CloseReason::Local))
     }
+}
+
+fn validate_connect_options(opts: &SrtOptions) -> Result<(), SrtError> {
+    if opts.streamid.as_ref().is_some_and(|s| s.len() > 512) {
+        return Err(SrtError::StreamIdTooLong);
+    }
+    // Fail fast on invalid encryption options (encryption.md §2),
+    // before any I/O: the handshake FSM consumes `crypto_config()`
+    // internally and would otherwise fail closed without a
+    // user-visible reason.
+    opts.crypto_config()?;
+    // Same fail-fast for pacing parameters: libsrt rejects them at
+    // setsockopt; connect is this crate's earliest equivalent.
+    opts.bandwidth.validate()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -698,10 +756,7 @@ mod tests {
         let sender =
             Arc::new(net::bind_udp(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), None).unwrap());
         let receiver = net::bind_udp(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), None).unwrap();
-        let remote = match receiver.local_addr().unwrap() {
-            std::net::SocketAddr::V4(addr) => addr,
-            std::net::SocketAddr::V6(_) => unreachable!(),
-        };
+        let remote = receiver.local_addr().unwrap();
         let (_tx, rx) = mpsc::channel(1);
 
         assert_data_datagram(
@@ -721,7 +776,7 @@ mod tests {
         t0: Instant,
         caller_opts: SrtOptions,
         listener_opts: SrtOptions,
-    ) -> (Connection, Connection, SocketAddrV4) {
+    ) -> (Connection, Connection, SocketAddr) {
         use crate::{
             core::{
                 Listener,
@@ -745,7 +800,7 @@ mod tests {
             }
         }
 
-        let caller_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 50_001);
+        let caller_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 50_001));
         let mut c = Connection::connect(
             t0,
             caller_addr,

@@ -23,6 +23,24 @@
 //! # Ok(()) }
 //! ```
 //!
+//! # IPv6
+//!
+//! `connect_ip` and `bind_ip` support either IP family and use
+//! `std::net::SocketAddr` for address accessors. The original APIs retain
+//! their IPv4 types. IPv6 listeners are IPv6-only.
+//!
+//! ```no_run
+//! # async fn demo() -> Result<(), rsrt::SrtError> {
+//! let mut listener = rsrt::SrtListener::bind_ip("[::]:10101", rsrt::SrtOptions::default()).await?;
+//! let (caller, accepted) = tokio::join!(
+//!     rsrt::SrtSocket::connect_ip("[::1]:10101", rsrt::SrtOptions::default()),
+//!     listener.accept(),
+//! );
+//! assert!(caller?.peer_addr().is_ipv6());
+//! let (sock, peer) = accepted?;
+//! # Ok(()) }
+//! ```
+//!
 //! # Serving (listener)
 //!
 //! ```no_run

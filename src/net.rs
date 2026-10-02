@@ -49,12 +49,21 @@ use crate::{
 /// bind must fail with `AddrInUse` instead of silently stealing all inbound
 /// traffic from the first socket (which is what the kernel does for unicast
 /// UDP when both binders set `SO_REUSEADDR`).
-pub(crate) fn bind_udp(addr: SocketAddrV4, recv_buffer: Option<usize>) -> io::Result<UdpSocket> {
-    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+pub(crate) fn bind_udp(
+    addr: impl Into<SocketAddr>,
+    recv_buffer: Option<usize>,
+) -> io::Result<UdpSocket> {
+    let addr = addr.into();
+    let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+    // Keep the address family explicit on every platform: IPv4-mapped
+    // traffic must not unexpectedly share an IPv6 listener's port.
+    if addr.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
     if let Some(bytes) = recv_buffer {
         socket.set_recv_buffer_size(bytes)?;
     }
-    socket.bind(&SocketAddr::V4(addr).into())?;
+    socket.bind(&addr.into())?;
     let socket = std::net::UdpSocket::from(socket);
     socket.set_nonblocking(true)?;
     UdpSocket::from_std(socket)
@@ -70,6 +79,38 @@ pub(crate) async fn resolve_v4(addr: impl ToSocketAddrs) -> Result<SocketAddrV4,
             SocketAddr::V6(_) => None,
         })
         .ok_or(SrtError::NoIpv4Address)
+}
+
+/// Resolves either family, preferring IPv4 for existing hostname behavior.
+/// An explicit source address restricts resolution to its own family.
+pub(crate) async fn resolve_ip(
+    addr: impl ToSocketAddrs,
+    local: Option<SocketAddr>,
+) -> Result<SocketAddr, SrtError> {
+    select_ip(tokio::net::lookup_host(addr).await?, local)
+}
+
+fn select_ip(
+    addrs: impl Iterator<Item = SocketAddr>,
+    local: Option<SocketAddr>,
+) -> Result<SocketAddr, SrtError> {
+    let mut first_v6 = None;
+    for addr in addrs {
+        if local.is_some_and(|local| local.is_ipv4() != addr.is_ipv4()) {
+            continue;
+        }
+        if addr.is_ipv4() {
+            return Ok(addr);
+        }
+        first_v6.get_or_insert(addr);
+    }
+    first_v6.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "no target address matches the requested IP family",
+        )
+        .into()
+    })
 }
 
 /// Non-zero random value without external dependencies: SipHash keyed once
@@ -185,5 +226,40 @@ mod tests {
             Err(SrtError::NoIpv4Address) => {}
             other => panic!("expected NoIpv4Address, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn resolve_ip_literals_and_source_family() {
+        let v4: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let v6: SocketAddr = "[::1]:9000".parse().unwrap();
+        assert_eq!(resolve_ip("[::1]:9000", None).await.unwrap(), v6);
+        assert_eq!(select_ip([v6, v4].into_iter(), None).unwrap(), v4);
+        assert_eq!(select_ip([v4, v6].into_iter(), Some(v6)).unwrap(), v6);
+        assert_eq!(select_ip([v6, v4].into_iter(), Some(v4)).unwrap(), v4);
+        assert!(select_ip([v4].into_iter(), Some(v6)).is_err());
+        assert!(select_ip([v6].into_iter(), Some(v4)).is_err());
+        assert!(select_ip([].into_iter(), None).is_err());
+        // Resolution must retain the interface scope for link-local peers.
+        let scoped = SocketAddr::V6(std::net::SocketAddrV6::new(
+            "fe80::1234".parse().unwrap(),
+            9000,
+            0,
+            7,
+        ));
+        assert_eq!(resolve_ip(scoped, Some(v6)).await.unwrap(), scoped);
+    }
+
+    #[tokio::test]
+    async fn ipv6_bind_roundtrip_and_exclusive_port() {
+        let a = bind_udp("[::1]:0".parse::<SocketAddr>().unwrap(), Some(256 * 1024)).unwrap();
+        let b = bind_udp("[::1]:0".parse::<SocketAddr>().unwrap(), None).unwrap();
+        assert!(socket2::SockRef::from(&a).only_v6().unwrap());
+        b.send_to(b"ipv6", a.local_addr().unwrap()).await.unwrap();
+        let mut buf = [0u8; 16];
+        let (n, from) = a.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[.. n], b"ipv6");
+        assert_eq!(from, b.local_addr().unwrap());
+        let err = bind_udp(a.local_addr().unwrap(), None).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
     }
 }

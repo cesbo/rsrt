@@ -67,8 +67,8 @@ pub enum SrtError {
     PayloadTooLarge(usize),
     /// Operation on a connection that is closed.
     Closed(CloseReason),
-    /// Address did not resolve to any IPv4 address (the library is
-    /// IPv4-only).
+    /// Address did not resolve to any IPv4 address for `connect` or `bind`.
+    /// Use `connect_ip` or `bind_ip` for IPv6 targets.
     NoIpv4Address,
     /// StreamID longer than 512 bytes.
     StreamIdTooLong,

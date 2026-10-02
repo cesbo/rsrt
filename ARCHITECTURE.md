@@ -153,12 +153,18 @@ then: drain poll_transmit -> socket.send_to, drain poll_deliver -> data mpsc
   `Arc<tokio::net::UdpSocket>` for sends), answers inductions statelessly,
   and on accepted conclusions spawns a connection driver, demuxing subsequent
   datagrams to it by (peer addr, dst socket id) via mpsc.
+- `SrtSocket::connect_ip` and `SrtListener::bind_ip` accept IPv4 or IPv6.
+  These return `SrtSocket<SocketAddr>` and `SrtListener<SocketAddr>`, with
+  address accessors and `accept` using `SocketAddr`. The default type
+  parameter is `SocketAddrV4`, preserving the existing IPv4 API.
 - UDP sockets are built via `socket2` (`src/net.rs::bind_udp`: receive buffer
   sized before `bind`, deliberately no `SO_REUSEADDR` — a duplicate bind on an
   SRT port must fail instead of hijacking traffic), then
-  `set_nonblocking(true)` → `tokio::net::UdpSocket::from_std`. IPv4 only.
-  Callers may pin the source address (`SrtOptions::local_addr`) for
-  multi-homed / policy-routing setups.
+  `set_nonblocking(true)` → `tokio::net::UdpSocket::from_std`. The bind
+  address selects AF_INET or AF_INET6; IPv6 sockets set IPV6_V6ONLY.
+  Callers may pin the source address (`SrtOptions::local_addr` or
+  `local_addr_v6`) for multi-homed / policy-routing setups. An explicit
+  source restricts target resolution to the same address family.
 
 ## Conventions
 
@@ -194,7 +200,10 @@ then: drain poll_transmit -> socket.send_to, drain poll_deliver -> data mpsc
   ARQ test) use only the public API. Examples in `examples/` (`recv.rs`,
   `send.rs`).
 - Payload limit in live mode: 1456 bytes (MSS 1500 − 28 IPv4/UDP − 16 SRT).
-  `send()` of anything larger returns `SrtError::PayloadTooLarge`.
+  This fixed MSS allowance also applies to IPv6, matching libsrt. The
+  actual IPv6 packet has 20 additional header bytes; MSS 1480 keeps it
+  within a 1500-byte path MTU. `send()` of anything larger than the
+  negotiated limit returns `SrtError::PayloadTooLarge`.
 
 ## Interface stability rule (for implementation agents)
 

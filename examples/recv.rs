@@ -34,6 +34,7 @@ use std::{
         BufWriter,
         Write,
     },
+    net::SocketAddr,
     thread,
     time::Duration,
 };
@@ -143,9 +144,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 
 /// Connects or listens according to the URL (see [`SrtUrl::is_listener`]).
-async fn open(url: &SrtUrl, opts: SrtOptions) -> Result<SrtSocket, Box<dyn Error>> {
+async fn open(url: &SrtUrl, opts: SrtOptions) -> Result<SrtSocket<SocketAddr>, Box<dyn Error>> {
     if url.is_listener() {
-        let mut listener = SrtListener::bind(url.socket_addr(), opts).await?;
+        let mut listener = SrtListener::bind_ip(url.socket_addr(), opts).await?;
         eprintln!("recv: listening on {}", listener.local_addr());
         let (sock, peer) = listener.accept().await?;
         match sock.streamid() {
@@ -154,7 +155,7 @@ async fn open(url: &SrtUrl, opts: SrtOptions) -> Result<SrtSocket, Box<dyn Error
         }
         Ok(sock)
     } else {
-        let sock = SrtSocket::connect(url.socket_addr(), opts).await?;
+        let sock = SrtSocket::connect_ip(url.socket_addr(), opts).await?;
         eprintln!("recv: connected to {}", sock.peer_addr());
         Ok(sock)
     }

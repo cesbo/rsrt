@@ -1,6 +1,6 @@
 //! Handshake CIF and SRT handshake extensions: docs/spec/handshake.md.
 
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 
 use tracing::debug;
 
@@ -207,15 +207,19 @@ impl HandshakeCif {
         bits
     }
 
-    /// Builds the 16-byte Peer IP field from an IPv4 address.
+    /// Builds the 16-byte Peer IP field from an IPv4 or IPv6 address.
     ///
-    /// Word 0 carries the address with its bytes reversed (per-word
-    /// little-endian rule, docs/spec/handshake.md §2.2); words 1..3 are zero.
-    pub fn encode_peer_ip(addr: Ipv4Addr) -> [u8; 16] {
+    /// Each 32-bit word carries four address bytes in reverse order
+    /// (docs/spec/handshake.md §2.2). IPv4 uses word 0; words 1..3 are zero.
+    pub fn encode_peer_ip(addr: impl Into<IpAddr>) -> [u8; 16] {
         let mut out = [0u8; 16];
-        let mut octets = addr.octets();
-        octets.reverse();
-        out[.. 4].copy_from_slice(&octets);
+        match addr.into() {
+            IpAddr::V4(addr) => out[.. 4].copy_from_slice(&addr.octets()),
+            IpAddr::V6(addr) => out.copy_from_slice(&addr.octets()),
+        }
+        for word in out.chunks_mut(4) {
+            word.reverse();
+        }
         out
     }
 
@@ -511,6 +515,8 @@ fn unpack_bytes_words(content: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+
     use super::*;
 
     fn encoded(cif: &HandshakeCif) -> Vec<u8> {
@@ -566,6 +572,26 @@ mod tests {
         let mut expected = [0u8; 16];
         expected[.. 4].copy_from_slice(&[0x0A, 0x01, 0xA8, 0xC0]);
         assert_eq!(field, expected);
+    }
+
+    #[test]
+    fn peer_ip_ipv6_uses_all_four_words() {
+        // A distinct pattern in every word detects word-order and byte-order
+        // bugs that ::1 or a codec round trip alone would miss.
+        let ip: std::net::Ipv6Addr = "2001:db8:1234:5678:90ab:cdef:102:304".parse().unwrap();
+        assert_eq!(
+            HandshakeCif::encode_peer_ip(ip),
+            [
+                0xb8, 0x0d, 0x01, 0x20, 0x78, 0x56, 0x34, 0x12, 0xef, 0xcd, 0xab, 0x90, 0x04, 0x03,
+                0x02, 0x01,
+            ]
+        );
+        let cif = HandshakeCif {
+            peer_ip: HandshakeCif::encode_peer_ip(ip),
+            ..induction_request()
+        };
+        assert_eq!(&encoded(&cif)[32 .. 48], &cif.peer_ip);
+        roundtrip(&cif);
     }
 
     // -- Byte-exact CIF vectors (spec §5 field tables) ---------------------
@@ -885,7 +911,9 @@ mod tests {
             assert_eq!(out.len(), 124, "cmd {cmd}");
             assert_eq!(&out[64 .. 66], &cmd.to_be_bytes(), "cmd {cmd}");
             assert_eq!(&out[66 .. 68], &[0x00, 0x0E], "cmd {cmd}"); // 14 words
-                                                                    // The blob's exact bytes, contiguous and in natural order.
+                                                                    // The blob's exact bytes,
+                                                                    // contiguous and in natural
+                                                                    // order.
             assert_eq!(&out[68 .. 124], &km[..], "cmd {cmd}");
             // The word-swapped form appears nowhere in the encoding.
             assert!(
