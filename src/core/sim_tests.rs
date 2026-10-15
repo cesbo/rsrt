@@ -523,9 +523,11 @@ fn clean_handshake_data_and_shutdown() {
         assert_eq!(stats.pkts_sent, 200);
         assert_eq!(stats.pkts_recv, 200);
         assert_eq!(stats.pkts_retransmitted, 0);
+        assert_eq!(stats.pkts_recv_retransmitted, 0);
         assert_eq!(stats.pkts_recv_lost, 0);
         assert_eq!(stats.pkts_recv_dropped, 0);
         assert_eq!(stats.pkts_send_dropped, 0);
+        assert!(stats.rtt_sampled);
         assert!(
             stats.rtt_us < 100_000,
             "RTT must be measured: {}",
@@ -586,6 +588,15 @@ fn five_percent_loss_recovers_everything() {
     );
     assert!(cs.pkts_recv_lost > 0, "losses must have been detected");
     assert!(ls.pkts_recv_lost > 0, "losses must have been detected");
+    // No link duplication, so received retransmissions cannot exceed sent.
+    for (rx, tx) in [(&cs, &ls), (&ls, &cs)] {
+        assert!(
+            rx.pkts_recv_retransmitted > 0 && rx.pkts_recv_retransmitted <= tx.pkts_retransmitted,
+            "received {} of {} retransmissions",
+            rx.pkts_recv_retransmitted,
+            tx.pkts_retransmitted
+        );
+    }
     assert_eq!(cs.pkts_recv_dropped, 0, "recovery must beat every deadline");
     assert_eq!(ls.pkts_recv_dropped, 0, "recovery must beat every deadline");
     assert_eq!(cs.pkts_send_dropped, 0);

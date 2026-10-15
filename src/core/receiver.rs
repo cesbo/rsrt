@@ -112,6 +112,8 @@ pub struct ReceiverConfig {
 pub struct ReceiverStats {
     pub pkts_recv: u64,
     pub bytes_recv: u64,
+    /// R-flag arrivals, including duplicates and belated (libsrt `pktRcvRetrans`).
+    pub pkts_retransmitted: u64,
     /// Gaps detected (packets that entered the loss list).
     pub pkts_lost: u64,
     /// Missing packets skipped by TSBPD deadline (never recovered), plus
@@ -125,6 +127,10 @@ pub struct ReceiverStats {
     pub pkts_oversized: u64,
     pub rtt_us: u32,
     pub rtt_var_us: u32,
+    /// False while `rtt_us`/`rtt_var_us` still hold the initial seeds.
+    pub rtt_sampled: bool,
+    /// Effective TSBPD latency, µs ([`ReceiverConfig::rcv_latency`]).
+    pub rcv_latency_us: u64,
     /// Net TSBPD drift correction applied to delivery deadlines (µs,
     /// positive = deadlines pushed later; ≈ how far the peer's clock has
     /// fallen behind ours since the connection started).
@@ -360,6 +366,9 @@ impl Receiver {
         }
         self.stats.pkts_recv += 1;
         self.stats.bytes_recv += pkt.payload.len() as u64;
+        if pkt.retransmitted {
+            self.stats.pkts_retransmitted += 1;
+        }
         self.pkt_count += 1;
 
         // Extend every observed timestamp so the extender tracks the arrival
@@ -712,6 +721,8 @@ impl Receiver {
         ReceiverStats {
             rtt_us: self.srtt_us,
             rtt_var_us: self.rtt_var_us,
+            rtt_sampled: !self.rtt_first,
+            rcv_latency_us: self.cfg.rcv_latency.as_micros() as u64,
             tsbpd_drift_us: self.drift.correction_us(),
             ..self.stats
         }
@@ -1186,6 +1197,29 @@ mod tests {
         assert_eq!(r.poll_deliver(t0 + LATENCY), None);
     }
 
+    /// R-flag arrivals count, including duplicates and belated.
+    #[test]
+    fn retransmitted_counted_on_arrival() {
+        let t0 = Instant::now();
+        let mut r = rx(t0);
+        r.handle_data(t0, data(ISN, 0));
+        r.handle_data(t0, data(ISN + 2, 2_000)); // hole: ISN+1
+        assert_eq!(r.stats().pkts_retransmitted, 0);
+
+        r.handle_data(t0 + ms(5), rexmit(ISN + 1, 1_000)); // fills the hole
+        assert_eq!(r.stats().pkts_retransmitted, 1);
+        r.handle_data(t0 + ms(6), rexmit(ISN + 1, 1_000)); // duplicate
+        assert_eq!(r.stats().pkts_retransmitted, 2);
+        r.handle_data(t0 + ms(7), data(ISN + 2, 2_000)); // duplicate, no R flag
+        assert_eq!(r.stats().pkts_retransmitted, 2);
+
+        assert_eq!(r.poll_deliver(t0 + LATENCY), Some(vec![ISN as u8].into()));
+        r.handle_data(t0 + LATENCY + ms(1), rexmit(ISN, 0)); // belated
+        assert_eq!(r.stats().pkts_belated, 1);
+        assert_eq!(r.stats().pkts_retransmitted, 3);
+        assert_eq!(r.stats().pkts_recv, 6);
+    }
+
     #[test]
     fn buffer_overflow_drops_packet_without_loss_entry() {
         let t0 = Instant::now();
@@ -1529,16 +1563,19 @@ mod tests {
         let t0 = Instant::now();
         let mut r = rx(t0);
         assert_eq!(r.rtt(), (INITIAL_RTT_US, INITIAL_RTT_VAR_US));
+        assert!(!r.stats().rtt_sampled);
 
         r.handle_data(t0, data(ISN, 0));
         r.on_timer(t0 + ms(10)); // full ACK #1 sent at t0+10ms
         assert_eq!(acks(&drain(&mut r, t0 + ms(10)))[0].0, 1);
+        assert!(!r.stats().rtt_sampled);
 
         // First sample: SRTT = rtt, RTTVar = rtt/2.
         r.handle_ackack(t0 + ms(50), 1, Timestamp(50_000)); // rtt = 40 ms
         assert_eq!(r.rtt(), (40_000, 20_000));
         assert_eq!(r.stats().rtt_us, 40_000);
         assert_eq!(r.stats().rtt_var_us, 20_000);
+        assert!(r.stats().rtt_sampled);
 
         // Second sample: RTTVar = (3·RTTVar + |rtt − SRTT|)/4 with the OLD
         // SRTT, then SRTT = (7·SRTT + rtt)/8.

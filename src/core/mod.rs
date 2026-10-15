@@ -115,43 +115,64 @@ pub enum ConnState {
 }
 
 /// Aggregated connection statistics.
+///
+/// Each field is sender (data this socket sends), receiver (data it receives)
+/// or socket (every datagram it sends). Counters never decrease, including
+/// after close. Non-exhaustive: construct with [`Stats::default`].
 #[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct Stats {
+    /// Sender: includes retransmissions (libsrt `pktSent`).
     pub pkts_sent: u64,
+    /// Receiver: includes retransmissions, duplicates and belated arrivals.
+    /// Oversized payloads are not counted (libsrt `pktRecv`).
     pub pkts_recv: u64,
+    /// Sender: payload bytes, headers excluded.
     pub bytes_sent: u64,
+    /// Receiver: payload bytes, headers excluded.
     pub bytes_recv: u64,
-    /// UDP send calls that returned an I/O error, across data, retransmission,
-    /// and control packets..
+    /// Socket: UDP sends that returned an I/O error.
     pub udp_send_errors: u64,
-    /// UDP send calls, across all packet kinds, that reported fewer bytes than
-    /// the complete datagram.
+    /// Socket: UDP sends that wrote fewer bytes than the datagram.
     pub udp_short_sends: u64,
+    /// Sender: retransmitted on NAK (libsrt `pktRetrans`).
     pub pkts_retransmitted: u64,
-    /// Sender-side too-late / overflow drops.
+    /// Receiver: arrivals with the retransmission flag, including duplicates
+    /// and belated (libsrt `pktRcvRetrans`).
+    pub pkts_recv_retransmitted: u64,
+    /// Sender: too-late or overflow drops (libsrt `pktSndDrop`).
     pub pkts_send_dropped: u64,
-    /// Receiver-side TSBPD skips (lost for good).
+    /// Receiver: TSBPD skips, plus undecryptable packets freed at play time
+    /// (libsrt `pktRcvDrop`).
     pub pkts_recv_dropped: u64,
-    /// Gaps detected on the receive path.
+    /// Receiver: sequence already delivered or skipped (libsrt `pktRcvBelated`).
+    pub pkts_recv_belated: u64,
+    /// Receiver: gaps that entered the loss list (libsrt `pktRcvLoss`).
     pub pkts_recv_lost: u64,
-    /// Data packets dropped on receive because the payload exceeded the
-    /// negotiated maximum (MSS − 44).
+    /// Receiver: payload over the negotiated maximum (MSS − 44).
     pub pkts_recv_oversized: u64,
-    /// Undecryptable data packets received (docs/spec/encryption.md §9.4):
-    /// each occupied its sequence slot and was ACKed, but is never delivered.
+    /// Receiver: undecryptable packets (docs/spec/encryption.md §9.4). Each
+    /// occupied its sequence slot and was ACKed, but is never delivered.
     pub undecrypted_pkts: u64,
-    /// Completed TX key switches (docs/spec/encryption.md §10.1): how many
-    /// times the send direction rotated to a refreshed SEK.
+    /// Sender: completed TX key switches (docs/spec/encryption.md §10.1).
     pub km_refreshes: u64,
+    /// Receiver: smoothed RTT, µs. 100 ms seed until [`Stats::rtt_sampled`].
     pub rtt_us: u32,
+    /// Receiver: RTT variance, µs. 50 ms seed until [`Stats::rtt_sampled`].
     pub rtt_var_us: u32,
-    /// Net TSBPD clock-drift correction.
+    /// Receiver: set once an ACKACK sample replaces the RTT seeds. Stays
+    /// false on a send-only socket.
+    pub rtt_sampled: bool,
+    /// Receiver: net TSBPD drift, µs (positive = deadlines later).
     pub tsbpd_drift_us: i64,
-    /// Current inter-packet send interval, µs (libsrt usPktSndPeriod).
-    /// 0 = pacing disabled (Bandwidth::Unlimited).
+    /// Receiver: negotiated latency, µs (`max(latency, peer peer_latency)`).
+    /// 0 while connecting (libsrt `msRcvTsbPdDelay`).
+    pub rcv_latency_us: u64,
+    /// Sender: inter-packet interval, µs (libsrt `usPktSndPeriod`).
+    /// 0 = pacing disabled.
     pub snd_period_us: u64,
-    /// Effective pacing ceiling, bytes/s (libsrt mbpsMaxBW analog, kept in
-    /// bytes/s to match the option units). In Estimated mode this is
+    /// Sender: effective pacing ceiling, bytes/s (libsrt mbpsMaxBW analog,
+    /// kept in bytes/s to match the option units). In Estimated mode this is
     /// max(min, measured)·(100+overhead)/100 once the estimator has closed
     /// a window; before that the fast-start grace reads the overheaded
     /// BW_INFINITE·(100+overhead)/100 (156_250_000 at the default 25 %)
@@ -159,7 +180,7 @@ pub struct Stats {
     /// plain BW_INFINITE (125_000_000) appears only until that first
     /// refresh. 0 = pacing disabled.
     pub snd_max_bw: u64,
-    /// Last measured sender input rate, bytes/s incl. +44/pkt header charge
+    /// Sender: last measured input rate, bytes/s incl. +44/pkt header charge
     /// (crate extension — libsrt 1.4.4 bstats has no such field).
     /// 0 unless Bandwidth::Estimated and at least one window has closed.
     pub snd_input_rate: u64,
@@ -1103,15 +1124,19 @@ fn merge_stats(sender: &Sender, receiver: &Receiver, crypto: Option<&Crypto>) ->
         udp_send_errors: 0,
         udp_short_sends: 0,
         pkts_retransmitted: s.pkts_retransmitted,
+        pkts_recv_retransmitted: r.pkts_retransmitted,
         pkts_send_dropped: s.pkts_dropped,
         pkts_recv_dropped: r.pkts_dropped,
+        pkts_recv_belated: r.pkts_belated,
         pkts_recv_lost: r.pkts_lost,
         pkts_recv_oversized: r.pkts_oversized,
         undecrypted_pkts: receiver.undecrypted_count(),
         km_refreshes: crypto.map_or(0, Crypto::key_switches),
         rtt_us: r.rtt_us,
         rtt_var_us: r.rtt_var_us,
+        rtt_sampled: r.rtt_sampled,
         tsbpd_drift_us: r.tsbpd_drift_us,
+        rcv_latency_us: r.rcv_latency_us,
         snd_period_us: s.snd_period_us,
         snd_max_bw: s.snd_max_bw,
         snd_input_rate: s.snd_input_rate,
@@ -2097,25 +2122,50 @@ mod tests {
     #[test]
     fn stats_merge_sender_and_receiver() {
         let t0 = Instant::now();
-        let (mut c, mut a) = establish_pair(t0, SrtOptions::default(), SrtOptions::default());
+        // Caller proposes 300 ms send latency; listener keeps defaults (120 / 0).
+        let copts = SrtOptions::default().peer_latency(Duration::from_millis(300));
+        let (mut c, mut a) = establish_pair(t0, copts, SrtOptions::default());
         drain(&mut c, t0);
         drain(&mut a, t0);
         c.send(t0, vec![7; 100]).unwrap();
         c.send(t0, vec![8; 100]).unwrap();
-        for p in drain(&mut c, t0) {
+        let sent = drain(&mut c, t0);
+        for p in sent.clone() {
             a.handle_packet(t0 + MS, p);
         }
         let cs = c.stats();
         assert_eq!(cs.pkts_sent, 2);
         assert_eq!(cs.bytes_sent, 200);
         assert_eq!(cs.pkts_recv, 0);
+        assert_eq!(cs.rcv_latency_us, 120_000, "ours, the peer proposed 0");
         let as_ = a.stats();
         assert_eq!(as_.pkts_recv, 2);
         assert_eq!(as_.bytes_recv, 200);
         assert_eq!(as_.rtt_us, 100_000, "initial RTT before any sample");
+        assert!(!as_.rtt_sampled);
+        assert_eq!(as_.rcv_latency_us, 300_000, "the peer's larger proposal");
+
+        // Retransmitted duplicate, then the original after delivery (belated).
+        let Packet::Data(first) = sent[0].clone() else {
+            panic!("expected a data packet");
+        };
+        let rexmit = DataPacket {
+            retransmitted: true,
+            ..first.clone()
+        };
+        a.handle_packet(t0 + MS * 2, Packet::Data(rexmit));
+        assert_eq!(a.stats().pkts_recv_retransmitted, 1);
+        assert_eq!(a.stats().pkts_recv_belated, 0);
+        assert!(a.poll_deliver(t0 + Duration::from_millis(400)).is_some());
+        a.handle_packet(t0 + Duration::from_millis(401), Packet::Data(first));
+        let as_ = a.stats();
+        assert_eq!(as_.pkts_recv_belated, 1);
+        assert_eq!(as_.pkts_recv_retransmitted, 1);
+        assert_eq!(as_.pkts_recv, 4);
         // The snapshot survives close.
-        a.close(t0 + MS * 2);
-        assert_eq!(a.stats().pkts_recv, 2);
+        a.close(t0 + Duration::from_millis(402));
+        assert_eq!(a.stats().pkts_recv, 4);
+        assert_eq!(a.stats().rcv_latency_us, 300_000);
     }
 
     #[test]

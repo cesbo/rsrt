@@ -146,6 +146,16 @@ async fn arq_recovers_3_percent_loss_with_reorder() {
             recv_stats.pkts_recv_dropped, 0,
             "receiver skipped packets despite recoverable loss: {recv_stats:?}"
         );
+        // Proxy does not duplicate, so received retransmissions cannot exceed sent.
+        assert!(
+            recv_stats.pkts_recv_retransmitted > 0
+                && recv_stats.pkts_recv_retransmitted <= send_stats.pkts_retransmitted,
+            "receiver counted {} of {} retransmissions",
+            recv_stats.pkts_recv_retransmitted,
+            send_stats.pkts_retransmitted
+        );
+        assert!(recv_stats.rtt_sampled, "no RTT sample: {recv_stats:?}");
+        assert_eq!(recv_stats.rcv_latency_us, 200_000);
         proxy.shutdown().await;
     })
     .await;
