@@ -14,7 +14,6 @@ mod support;
 
 use std::{
     future::Future,
-    net::SocketAddr,
     time::Duration,
 };
 
@@ -61,7 +60,7 @@ async fn lossy_pair(
     let mut listener = SrtListener::bind("127.0.0.1:0", opts.clone())
         .await
         .expect("bind listener");
-    let proxy = LossyProxy::spawn(SocketAddr::V4(listener.local_addr()), behavior, proxy_seed)
+    let proxy = LossyProxy::spawn(listener.local_addr(), behavior, proxy_seed)
         .await
         .expect("spawn lossy proxy");
     let (caller, accepted) = tokio::join!(

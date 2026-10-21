@@ -1,5 +1,5 @@
 /// A parsed `srt://host:port?key=value&...` URL. Plain `std` parsing: no
-/// percent-decoding, no IPv6 brackets (the library is IPv4-only).
+/// percent-decoding. IPv6 literals must be enclosed in brackets.
 pub struct SrtUrl {
     host: String,
     port: u16,
@@ -18,6 +18,19 @@ impl SrtUrl {
         let port: u16 = port
             .parse()
             .map_err(|_| format!("invalid port in {addr:?}"))?;
+        let host = if let Some(ipv6) = host.strip_prefix('[') {
+            let ipv6 = ipv6
+                .strip_suffix(']')
+                .ok_or_else(|| format!("invalid IPv6 brackets in {addr:?}"))?;
+            ipv6.parse::<std::net::Ipv6Addr>()
+                .map_err(|_| format!("invalid IPv6 address in {addr:?}"))?;
+            ipv6
+        } else {
+            if host.contains([':', '[', ']']) {
+                return Err(format!("IPv6 addresses require brackets in {addr:?}"));
+            }
+            host
+        };
         let params = query
             .split('&')
             .filter(|pair| !pair.is_empty())
@@ -52,9 +65,13 @@ impl SrtUrl {
         &self.params
     }
 
-    /// `0.0.0.0` means "listen here".
+    /// `0.0.0.0` or `::` means "listen here".
     pub fn is_listener(&self) -> bool {
         self.host == "0.0.0.0"
+            || self
+                .host
+                .parse::<std::net::Ipv6Addr>()
+                .is_ok_and(|addr| addr.is_unspecified())
     }
 }
 
@@ -92,6 +109,28 @@ mod tests {
                 ("flag".to_string(), String::new()),
             ]
         );
+    }
+
+    #[test]
+    fn parse_ipv6_urls() {
+        let url = SrtUrl::parse("srt://[2001:db8::1234]:9000?latency=200").unwrap();
+        assert_eq!(url.socket_addr(), ("2001:db8::1234", 9000));
+        assert!(!url.is_listener());
+        assert_eq!(url.params(), &[("latency".to_owned(), "200".to_owned())]);
+        assert!(SrtUrl::parse("srt://[::]:9000").unwrap().is_listener());
+        assert!(SrtUrl::parse("srt://[0:0:0:0:0:0:0:0]:9000")
+            .unwrap()
+            .is_listener());
+        assert!(!SrtUrl::parse("srt://[::1]:9000").unwrap().is_listener());
+        for invalid in [
+            "srt://::1:9000",
+            "srt://[::1:9000",
+            "srt://[host]:9000",
+            "srt://[::1]]:9000",
+            "srt://::]:9000",
+        ] {
+            assert!(SrtUrl::parse(invalid).is_err(), "{invalid}");
+        }
     }
 
     #[test]

@@ -20,10 +20,7 @@
 
 use std::{
     collections::HashMap,
-    net::{
-        SocketAddr,
-        SocketAddrV4,
-    },
+    net::SocketAddr,
     sync::Arc,
     time::Instant,
 };
@@ -84,34 +81,28 @@ const DEMUX_QUEUE: usize = 1024;
 /// Dropping the listener stops accepting new connections; established
 /// sockets keep running (each has its own driver and shares the UDP socket).
 pub struct SrtListener {
-    accept_rx: mpsc::Receiver<(SrtSocket, SocketAddrV4)>,
-    local_addr: SocketAddrV4,
+    accept_rx: mpsc::Receiver<(SrtSocket, SocketAddr)>,
+    local_addr: SocketAddr,
 }
 
 impl SrtListener {
-    /// Binds the UDP socket (IPv4) and starts the listener driver.
+    /// Binds an IPv4 or IPv6 UDP socket and starts the listener driver.
+    /// Uses the first resolved address. IPv6 sockets are IPv6-only; bind
+    /// separate listeners to serve both families.
     ///
     /// `opts` apply to every accepted connection (`opts.streamid` is
     /// ignored; the caller supplies it).
     ///
     /// Errors: [`SrtError::InvalidPassphrase`],
     /// [`SrtError::InvalidKmParameters`], [`SrtError::InvalidBandwidth`],
-    /// [`SrtError::NoIpv4Address`], [`SrtError::Io`].
+    /// [`SrtError::Io`].
     pub async fn bind(addr: impl ToSocketAddrs, opts: SrtOptions) -> Result<SrtListener, SrtError> {
-        // Fail fast on invalid encryption options (encryption.md §2),
-        // before any I/O: `core::Listener` re-derives this config and
-        // would otherwise silently reject every conclusion.
+        // Validate local options before DNS or socket I/O.
         opts.crypto_config()?;
-        // Same fail-fast for pacing parameters: libsrt rejects them at
-        // setsockopt; bind is this crate's earliest equivalent.
         opts.bandwidth.validate()?;
-        let addr = net::resolve_v4(addr).await?;
+        let addr = net::resolve(addr, None).await?;
         let udp = net::bind_udp(addr, opts.udp_recv_buffer)?;
-        let local_addr = match udp.local_addr()? {
-            SocketAddr::V4(a) => a,
-            // The socket is AF_INET; a V6 local address cannot happen.
-            SocketAddr::V6(_) => return Err(SrtError::NoIpv4Address),
-        };
+        let local_addr = udp.local_addr()?;
         let (accept_tx, accept_rx) = mpsc::channel(ACCEPT_BACKLOG);
         let timebase = Timebase::new(Instant::now());
         let driver = ListenerDriver {
@@ -133,8 +124,9 @@ impl SrtListener {
         })
     }
 
-    /// Waits for the next accepted connection.
-    pub async fn accept(&mut self) -> Result<(SrtSocket, SocketAddrV4), SrtError> {
+    /// Waits for the next accepted connection. Cancel-safe: dropping this
+    /// future does not lose an accepted socket.
+    pub async fn accept(&mut self) -> Result<(SrtSocket, SocketAddr), SrtError> {
         // The driver outlives the handle, so a closed queue means it died.
         self.accept_rx
             .recv()
@@ -142,7 +134,7 @@ impl SrtListener {
             .ok_or(SrtError::Closed(CloseReason::Local))
     }
 
-    pub fn local_addr(&self) -> SocketAddrV4 {
+    pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
 }
@@ -164,7 +156,7 @@ impl Drop for ReapGuard {
 struct ConnEntry {
     tx: mpsc::Sender<Vec<u8>>,
     /// `(source address, peer socket id)` — the dst-0 handshake demux key.
-    peer: (SocketAddrV4, SocketId),
+    peer: (SocketAddr, SocketId),
 }
 
 struct ListenerDriver {
@@ -172,13 +164,13 @@ struct ListenerDriver {
     core: core::Listener,
     timebase: Timebase,
     opts: SrtOptions,
-    accept_tx: mpsc::Sender<(SrtSocket, SocketAddrV4)>,
+    accept_tx: mpsc::Sender<(SrtSocket, SocketAddr)>,
     /// False once the [`SrtListener`] handle is dropped.
     accept_open: bool,
     /// Established-traffic demux: local socket id → connection.
     conns: HashMap<SocketId, ConnEntry>,
     /// Handshake demux: (peer address, peer socket id) → local socket id.
-    by_peer: HashMap<(SocketAddrV4, SocketId), SocketId>,
+    by_peer: HashMap<(SocketAddr, SocketId), SocketId>,
     /// Encode scratch buffer.
     out: Vec<u8>,
 }
@@ -193,11 +185,8 @@ impl ListenerDriver {
         loop {
             tokio::select! {
                 r = udp.recv_from(&mut buf) => match r {
-                    Ok((n, SocketAddr::V4(from))) => {
+                    Ok((n, from)) => {
                         self.on_datagram(from, &buf[..n], &reap_tx).await;
-                    }
-                    Ok((n, SocketAddr::V6(from))) => {
-                        trace!(%from, len = n, "non-IPv4 datagram dropped");
                     }
                     Err(e) => trace!(%e, "listener recv error (transient)"),
                 },
@@ -218,7 +207,7 @@ impl ListenerDriver {
 
     async fn on_datagram(
         &mut self,
-        from: SocketAddrV4,
+        from: SocketAddr,
         datagram: &[u8],
         reap_tx: &mpsc::UnboundedSender<SocketId>,
     ) {
@@ -395,7 +384,7 @@ impl ListenerDriver {
         })
     }
 
-    async fn send_packet(&mut self, packet: &Packet, to: SocketAddrV4) {
+    async fn send_packet(&mut self, packet: &Packet, to: SocketAddr) {
         self.out.clear();
         packet.encode(&mut self.out);
         if let Err(e) = self.udp.send_to(&self.out, to).await {
@@ -438,7 +427,7 @@ mod tests {
     fn shell_driver() -> (
         tokio::runtime::Runtime,
         ListenerDriver,
-        mpsc::Receiver<(SrtSocket, SocketAddrV4)>,
+        mpsc::Receiver<(SrtSocket, SocketAddr)>,
     ) {
         let timebase = Timebase::new(Instant::now());
         let (accept_tx, accept_rx) = mpsc::channel(1);
@@ -447,7 +436,7 @@ mod tests {
             .build()
             .unwrap();
         let udp = rt.block_on(async {
-            net::bind_udp(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), None).unwrap()
+            net::bind_udp(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0), None).unwrap()
         });
         let driver = ListenerDriver {
             udp: Arc::new(udp),
@@ -465,13 +454,13 @@ mod tests {
 
     /// Demux entry whose channel is closed; fine for map-manipulation tests
     /// that never send.
-    fn conn_entry(peer: (SocketAddrV4, SocketId)) -> ConnEntry {
+    fn conn_entry(peer: (SocketAddr, SocketId)) -> ConnEntry {
         let (tx, _rx) = mpsc::channel(1);
         ConnEntry { tx, peer }
     }
 
-    fn peer_key(port: u16, id: u32) -> (SocketAddrV4, SocketId) {
-        (SocketAddrV4::new(Ipv4Addr::LOCALHOST, port), SocketId(id))
+    fn peer_key(port: u16, id: u32) -> (SocketAddr, SocketId) {
+        (SocketAddr::from((Ipv4Addr::LOCALHOST, port)), SocketId(id))
     }
 
     #[test]

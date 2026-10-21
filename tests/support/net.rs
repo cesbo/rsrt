@@ -2,7 +2,9 @@
 
 use std::{
     net::{
+        IpAddr,
         Ipv4Addr,
+        Ipv6Addr,
         SocketAddr,
         SocketAddrV4,
         UdpSocket,
@@ -59,9 +61,18 @@ fn candidate_port(n: usize) -> u16 {
 /// to port 0 directly is still preferable whenever the test controls the
 /// bind itself; use this helper when a port number must be known up front.
 pub fn free_udp_port() -> std::io::Result<u16> {
+    free_udp_port_on(Ipv4Addr::LOCALHOST.into())
+}
+
+/// Reserves a free port on IPv6 loopback using the same non-repeating range.
+pub fn free_udp_port_v6() -> std::io::Result<u16> {
+    free_udp_port_on(Ipv6Addr::LOCALHOST.into())
+}
+
+fn free_udp_port_on(ip: IpAddr) -> std::io::Result<u16> {
     for _ in 0 .. RANGE_LEN {
         let port = candidate_port(NEXT_OFFSET.fetch_add(1, Ordering::Relaxed));
-        match UdpSocket::bind((Ipv4Addr::LOCALHOST, port)) {
+        match UdpSocket::bind((ip, port)) {
             // Free right now, and nothing can re-acquire it behind our back
             // (see above) — safe to hand out even though the probe socket
             // is dropped here.
@@ -97,6 +108,13 @@ mod tests {
         assert_ne!(port, 0);
         // The probe socket was dropped, so binding the same port must work.
         UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+    }
+
+    #[test]
+    fn allocated_ipv6_port_is_bindable() {
+        let port = free_udp_port_v6().unwrap();
+        assert_ne!(port, 0);
+        UdpSocket::bind((Ipv6Addr::LOCALHOST, port)).unwrap();
     }
 
     #[test]

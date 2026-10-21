@@ -23,7 +23,7 @@
 use std::{
     net::{
         Ipv4Addr,
-        SocketAddrV4,
+        SocketAddr,
     },
     time::{
         Duration,
@@ -64,12 +64,12 @@ const STEP: Duration = Duration::from_millis(1);
 /// passed through options — never logged, never asserted on.
 const PASSPHRASE: &str = "correct horse battery staple";
 
-fn caller_addr() -> SocketAddrV4 {
-    SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 50_000)
+fn caller_addr() -> SocketAddr {
+    SocketAddr::new(Ipv4Addr::new(10, 0, 0, 2).into(), 50_000)
 }
 
-fn listener_addr() -> SocketAddrV4 {
-    SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 9000)
+fn listener_addr() -> SocketAddr {
+    SocketAddr::new(Ipv4Addr::new(10, 0, 0, 1).into(), 9000)
 }
 
 /// Encrypted options with a tiny refresh cycle: `refresh = (rr, pa)` maps

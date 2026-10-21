@@ -20,7 +20,7 @@
 //! handshake puts the engine in [`Negotiated::crypto`].
 
 use std::{
-    net::SocketAddrV4,
+    net::SocketAddr,
     time::{
         Duration,
         Instant,
@@ -86,7 +86,7 @@ const UDT_DGRAM: u16 = 2;
 /// Not `Clone`: [`Negotiated::crypto`] owns key material.
 #[derive(Debug)]
 pub struct Negotiated {
-    pub remote: SocketAddrV4,
+    pub remote: SocketAddr,
     pub local_socket_id: SocketId,
     pub peer_socket_id: SocketId,
     /// First sequence number of the data we send.
@@ -127,7 +127,7 @@ enum CallerState {
 
 /// Caller-side handshake state machine.
 pub struct CallerHandshake {
-    remote: SocketAddrV4,
+    remote: SocketAddr,
     local_socket_id: SocketId,
     initial_seq: SeqNumber,
     timebase: Timebase,
@@ -156,7 +156,7 @@ impl CallerHandshake {
     /// queued immediately (returned by the first `poll_transmit`).
     pub fn new(
         now: Instant,
-        remote: SocketAddrV4,
+        remote: SocketAddr,
         local_socket_id: SocketId,
         initial_seq: SeqNumber,
         timebase: Timebase,
@@ -476,7 +476,7 @@ impl CallerHandshake {
             handshake_type: HandshakeType::Induction,
             socket_id: self.local_socket_id,
             cookie: 0,
-            peer_ip: HandshakeCif::encode_peer_ip(*self.remote.ip()),
+            peer_ip: HandshakeCif::encode_peer_ip(self.remote.ip()),
             extensions: vec![],
         }
     }
@@ -601,7 +601,7 @@ impl Listener {
     pub fn handle_handshake(
         &mut self,
         now: Instant,
-        from: SocketAddrV4,
+        from: SocketAddr,
         cif: &HandshakeCif,
         new_socket_id: SocketId,
         new_initial_seq: SeqNumber,
@@ -627,11 +627,11 @@ impl Listener {
     }
 
     /// Stateless SYN cookie for `from` at minute granularity.
-    pub fn cookie(&self, now: Instant, from: SocketAddrV4) -> u32 {
+    pub fn cookie(&self, now: Instant, from: SocketAddr) -> u32 {
         self.cookie_at(self.minute(now), from)
     }
 
-    fn on_induction(&self, now: Instant, from: SocketAddrV4, cif: &HandshakeCif) -> ListenerAction {
+    fn on_induction(&self, now: Instant, from: SocketAddr, cif: &HandshakeCif) -> ListenerAction {
         // Stateless echo of the request: only Version, the type-word halves
         // and the Cookie change (spec §5.2). In particular the CIF socket id
         // stays the *caller's* id — no libsrt caller reads it.
@@ -650,7 +650,7 @@ impl Listener {
     fn on_conclusion(
         &self,
         now: Instant,
-        from: SocketAddrV4,
+        from: SocketAddr,
         cif: &HandshakeCif,
         new_socket_id: SocketId,
     ) -> ListenerAction {
@@ -843,7 +843,7 @@ impl Listener {
             handshake_type: HandshakeType::Conclusion,
             socket_id: new_socket_id, // becomes the caller's peer id
             cookie: cif.cookie,       // echoed like libsrt; callers ignore it
-            peer_ip: HandshakeCif::encode_peer_ip(*from.ip()),
+            peer_ip: HandshakeCif::encode_peer_ip(from.ip()),
             extensions,
         };
         debug!(
@@ -872,7 +872,7 @@ impl Listener {
         ListenerAction::Reply(self.packet(now, cif.socket_id, reply))
     }
 
-    fn cookie_ok(&self, now: Instant, from: SocketAddrV4, cookie: u32) -> bool {
+    fn cookie_ok(&self, now: Instant, from: SocketAddr, cookie: u32) -> bool {
         let minute = self.minute(now);
         cookie == self.cookie_at(minute, from)
             // Accept the previous minute too: fixes libsrt 1.4.4's
@@ -887,7 +887,7 @@ impl Listener {
             / 60
     }
 
-    fn cookie_at(&self, minute: u64, from: SocketAddrV4) -> u32 {
+    fn cookie_at(&self, minute: u64, from: SocketAddr) -> u32 {
         // Any stateless-verifiable function of (ip, port, minute, secret)
         // works: the cookie is generated and checked only by this listener
         // and echoed opaquely by the caller (libsrt uses an MD5 prefix).
@@ -899,8 +899,7 @@ impl Listener {
         };
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.secret.hash(&mut hasher);
-        from.ip().octets().hash(&mut hasher);
-        from.port().hash(&mut hasher);
+        from.hash(&mut hasher);
         minute.hash(&mut hasher);
         let digest = hasher.finish();
         (digest ^ (digest >> 32)) as u32
@@ -998,12 +997,12 @@ mod tests {
     const UNUSED_ISN: SeqNumber = SeqNumber::new(42);
     const SECRET: u64 = 0xDEAD_BEEF_F00D;
 
-    fn caller_addr() -> SocketAddrV4 {
-        SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 50_000)
+    fn caller_addr() -> SocketAddr {
+        SocketAddr::new(Ipv4Addr::new(10, 0, 0, 2).into(), 50_000)
     }
 
-    fn listener_addr() -> SocketAddrV4 {
-        SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 10), 4200)
+    fn listener_addr() -> SocketAddr {
+        SocketAddr::new(Ipv4Addr::new(192, 168, 1, 10).into(), 4200)
     }
 
     fn hs_cif(pkt: &Packet) -> &HandshakeCif {
@@ -1143,7 +1142,7 @@ mod tests {
         assert_eq!(req.initial_seq, CALLER_ISN);
         assert_eq!(
             req.peer_ip,
-            HandshakeCif::encode_peer_ip(*listener_addr().ip())
+            HandshakeCif::encode_peer_ip(listener_addr().ip())
         );
         assert!(req.extensions.is_empty());
 
@@ -1247,7 +1246,7 @@ mod tests {
         );
         assert_eq!(
             rsp.peer_ip,
-            HandshakeCif::encode_peer_ip(*caller_addr().ip())
+            HandshakeCif::encode_peer_ip(caller_addr().ip())
         );
         assert!(rsp.stream_id().is_none()); // listener never sends SID back
 
@@ -1480,7 +1479,7 @@ mod tests {
             handshake_type: HandshakeType::Induction,
             socket_id: CALLER_ID, // our own id echoed back — must not be read
             cookie,
-            peer_ip: HandshakeCif::encode_peer_ip(*listener_addr().ip()),
+            peer_ip: HandshakeCif::encode_peer_ip(listener_addr().ip()),
             extensions: vec![],
         };
         let t1 = t0 + Duration::from_millis(100);
@@ -1503,7 +1502,7 @@ mod tests {
             handshake_type: HandshakeType::Conclusion,
             socket_id: ACCEPT_ID,
             cookie: 0x5EED_C00C,
-            peer_ip: HandshakeCif::encode_peer_ip(*caller_addr().ip()),
+            peer_ip: HandshakeCif::encode_peer_ip(caller_addr().ip()),
             extensions: vec![HsExtension::HsRsp(HsExtFields {
                 srt_version: SRT_VERSION,
                 flags: HsFlags::live_defaults(),
@@ -1748,7 +1747,7 @@ mod tests {
             handshake_type: HandshakeType::Conclusion,
             socket_id: CALLER_ID,
             cookie: l.cookie(now, caller_addr()),
-            peer_ip: HandshakeCif::encode_peer_ip(*listener_addr().ip()),
+            peer_ip: HandshakeCif::encode_peer_ip(listener_addr().ip()),
             extensions: vec![HsExtension::HsReq(HsExtFields {
                 srt_version: SRT_VERSION,
                 flags: HsFlags::live_defaults(),
@@ -2022,9 +2021,9 @@ mod tests {
         let l2 = Listener::new(SECRET, Timebase::new(t0), SrtOptions::default());
         assert_eq!(c1, l2.cookie(t0, caller_addr()));
         // Different port, ip, minute or secret → different cookie.
-        let other_port = SocketAddrV4::new(*caller_addr().ip(), 50_001);
+        let other_port = SocketAddr::new(caller_addr().ip(), 50_001);
         assert_ne!(c1, l.cookie(t0, other_port));
-        let other_ip = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 3), 50_000);
+        let other_ip = SocketAddr::new(Ipv4Addr::new(10, 0, 0, 3).into(), 50_000);
         assert_ne!(c1, l.cookie(t0, other_ip));
         assert_ne!(c1, l.cookie(t0 + Duration::from_secs(60), caller_addr()));
         let l3 = Listener::new(SECRET + 1, Timebase::new(t0), SrtOptions::default());
@@ -2054,6 +2053,36 @@ mod tests {
     }
 
     #[test]
+    fn ipv6_cookie_binds_every_address_word_port_and_scope() {
+        use std::net::{
+            Ipv6Addr,
+            SocketAddrV6,
+        };
+        let now = Instant::now();
+        let l = listener(now, SrtOptions::default());
+        let base = SocketAddrV6::new(
+            "2001:db8:1234:5678:90ab:cdef:102:304".parse().unwrap(),
+            50000,
+            0,
+            7,
+        );
+        let cookie = l.cookie(now, base.into());
+        assert!(l.cookie_ok(now, base.into(), cookie));
+        for word in 0 .. 4 {
+            let mut octets = base.ip().octets();
+            octets[word * 4] ^= 1;
+            let other = SocketAddrV6::new(Ipv6Addr::from(octets), base.port(), 0, base.scope_id());
+            assert!(!l.cookie_ok(now, other.into(), cookie), "word {word}");
+        }
+        let mut other = base;
+        other.set_port(base.port() + 1);
+        assert!(!l.cookie_ok(now, other.into(), cookie));
+        other = base;
+        other.set_scope_id(base.scope_id() + 1);
+        assert!(!l.cookie_ok(now, other.into(), cookie));
+    }
+
+    #[test]
     fn cookie_check_direct() {
         let t0 = Instant::now();
         let l = listener(t0, SrtOptions::default());
@@ -2064,7 +2093,7 @@ mod tests {
         assert!(!l.cookie_ok(t0 + Duration::from_secs(121), caller_addr(), cookie));
         assert!(!l.cookie_ok(t0, caller_addr(), cookie.wrapping_add(1)));
         // A cookie for peer A never validates for peer B.
-        let other = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 3), 50_000);
+        let other = SocketAddr::new(Ipv4Addr::new(10, 0, 0, 3).into(), 50_000);
         assert!(!l.cookie_ok(t0, other, cookie));
     }
 

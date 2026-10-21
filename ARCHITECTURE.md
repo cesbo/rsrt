@@ -149,16 +149,21 @@ then: drain poll_transmit -> socket.send_to, drain poll_deliver -> data mpsc
   (one SRT message, e.g. up to 1456 bytes), `async send(&[u8])`, `stats()`,
   `streamid()`, `close()`. Cloning/splitting not required in v0.
 - `SrtListener` — public handle: `bind(addr, opts)`, `async accept() ->
-  (SrtSocket, SocketAddrV4)`. The listener driver owns the UDP socket (shared
+  (SrtSocket, SocketAddr)`. The listener driver owns the UDP socket (shared
   `Arc<tokio::net::UdpSocket>` for sends), answers inductions statelessly,
   and on accepted conclusions spawns a connection driver, demuxing subsequent
   datagrams to it by (peer addr, dst socket id) via mpsc.
+- `connect` and `bind` accept IPv4 or IPv6. Public handles use
+  `SocketAddr` for `peer_addr`, `local_addr`, and the peer from `accept`.
 - UDP sockets are built via `socket2` (`src/net.rs::bind_udp`: receive buffer
   sized before `bind`, deliberately no `SO_REUSEADDR` — a duplicate bind on an
   SRT port must fail instead of hijacking traffic), then
-  `set_nonblocking(true)` → `tokio::net::UdpSocket::from_std`. IPv4 only.
+  `set_nonblocking(true)` → `tokio::net::UdpSocket::from_std`. The bind
+  address selects AF_INET or AF_INET6; IPv6 sockets set IPV6_V6ONLY.
   Callers may pin the source address (`SrtOptions::local_addr`) for
-  multi-homed / policy-routing setups.
+  multi-homed / policy-routing setups. Resolution uses the first address
+  matching the explicit source family, or the first resolved address
+  when no source is set.
 
 ## Conventions
 
@@ -194,7 +199,10 @@ then: drain poll_transmit -> socket.send_to, drain poll_deliver -> data mpsc
   ARQ test) use only the public API. Examples in `examples/` (`recv.rs`,
   `send.rs`).
 - Payload limit in live mode: 1456 bytes (MSS 1500 − 28 IPv4/UDP − 16 SRT).
-  `send()` of anything larger returns `SrtError::PayloadTooLarge`.
+  This fixed MSS allowance also applies to IPv6, matching libsrt. The
+  actual IPv6 packet has 20 additional header bytes; MSS 1480 keeps it
+  within a 1500-byte path MTU. `send()` of anything larger than the
+  negotiated limit returns `SrtError::PayloadTooLarge`.
 
 ## Interface stability rule (for implementation agents)
 

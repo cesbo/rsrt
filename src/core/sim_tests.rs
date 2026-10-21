@@ -20,7 +20,7 @@
 use std::{
     net::{
         Ipv4Addr,
-        SocketAddrV4,
+        SocketAddr,
     },
     time::{
         Duration,
@@ -63,12 +63,12 @@ const CALLER_ISN: SeqNumber = SeqNumber::new(0x0012_3456);
 const LISTENER_ISN: SeqNumber = SeqNumber::new(7);
 const STEP: Duration = Duration::from_millis(1);
 
-fn caller_addr() -> SocketAddrV4 {
-    SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 50_000)
+fn caller_addr() -> SocketAddr {
+    SocketAddr::new(Ipv4Addr::new(10, 0, 0, 2).into(), 50_000)
 }
 
-fn listener_addr() -> SocketAddrV4 {
-    SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 9000)
+fn listener_addr() -> SocketAddr {
+    SocketAddr::new(Ipv4Addr::new(10, 0, 0, 1).into(), 9000)
 }
 
 /// xorshift64* — deterministic, seedable, no dependencies.

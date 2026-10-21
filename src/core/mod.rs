@@ -28,7 +28,7 @@ mod tsbpd_stall_tests;
 
 use std::{
     collections::VecDeque,
-    net::SocketAddrV4,
+    net::SocketAddr,
     time::{
         Duration,
         Instant,
@@ -239,7 +239,7 @@ enum State {
 /// - on close (any reason): emit SHUTDOWN (best effort), drain state.
 pub struct Connection {
     state: State,
-    remote: SocketAddrV4,
+    remote: SocketAddr,
     local_socket_id: SocketId,
     /// `SocketId::HANDSHAKE` (0) until the handshake completes.
     peer_socket_id: SocketId,
@@ -272,7 +272,7 @@ impl Connection {
     /// INDUCTION request immediately.
     pub fn connect(
         now: Instant,
-        remote: SocketAddrV4,
+        remote: SocketAddr,
         local_socket_id: SocketId,
         initial_seq: SeqNumber,
         opts: SrtOptions,
@@ -291,7 +291,7 @@ impl Connection {
     /// place the timebase start close to the 32-bit µs timestamp wrap.
     pub fn connect_with_timebase(
         now: Instant,
-        remote: SocketAddrV4,
+        remote: SocketAddr,
         local_socket_id: SocketId,
         initial_seq: SeqNumber,
         opts: SrtOptions,
@@ -617,7 +617,7 @@ impl Connection {
         }
     }
 
-    pub fn remote(&self) -> SocketAddrV4 {
+    pub fn remote(&self) -> SocketAddr {
         self.remote
     }
 
@@ -1162,12 +1162,12 @@ mod tests {
     const UNUSED_ISN: SeqNumber = SeqNumber::new(9);
     const MS: Duration = Duration::from_millis(1);
 
-    fn caller_addr() -> SocketAddrV4 {
-        SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 50_000)
+    fn caller_addr() -> SocketAddr {
+        SocketAddr::new(Ipv4Addr::new(10, 0, 0, 2).into(), 50_000)
     }
 
-    fn listener_addr() -> SocketAddrV4 {
-        SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 10), 4200)
+    fn listener_addr() -> SocketAddr {
+        SocketAddr::new(Ipv4Addr::new(192, 168, 1, 10).into(), 4200)
     }
 
     fn caller(now: Instant, opts: SrtOptions) -> Connection {

@@ -2,7 +2,7 @@
 
 use std::{
     fmt,
-    net::SocketAddrV4,
+    net::SocketAddr,
     time::Duration,
 };
 
@@ -101,7 +101,9 @@ pub struct SrtOptions {
     pub peer_latency: Duration,
     /// StreamID sent by a caller (SRTO_STREAMID), max 512 bytes.
     pub streamid: Option<String>,
-    /// MTU including IP/UDP headers (SRTO_MSS). Default 1500.
+    /// SRT MSS including the fixed IPv4/UDP header allowance (SRTO_MSS).
+    /// Default 1500. Like libsrt, IPv6 uses the same payload sizing;
+    /// use 1480 to fit a 1500-byte IPv6 path MTU.
     pub mss: u32,
     /// Maximum flow window (packets in flight). Default 8192.
     pub flow_window: u32,
@@ -134,11 +136,12 @@ pub struct SrtOptions {
     /// (multi-homed hosts, policy routing): pins the source address
     /// and/or the local port — the peer then sees exactly this source.
     /// Port 0 lets the kernel pick an ephemeral port. `None` (default)
-    /// binds `0.0.0.0:0`. Binding an address the host does not own fails
+    /// binds `0.0.0.0:0` or `[::]:0` to match the target family. IPv6
+    /// scope IDs are preserved. Binding an address the host does not own fails
     /// with `SrtError::Io` (`AddrNotAvailable`); there is no silent
     /// fallback to another interface. Ignored by `SrtListener::bind`,
     /// whose bind address is the explicit argument.
-    pub local_addr: Option<SocketAddrV4>,
+    pub local_addr: Option<SocketAddr>,
     /// Encryption passphrase (SRTO_PASSPHRASE). `None` or empty =
     /// unencrypted. When set: 10..=80 bytes (libsrt's code accepts 80
     /// despite `srt.h` documenting 79; docs/spec/encryption.md §2).
@@ -265,7 +268,7 @@ impl SrtOptions {
         self
     }
 
-    pub fn local_addr(mut self, addr: SocketAddrV4) -> Self {
+    pub fn local_addr(mut self, addr: SocketAddr) -> Self {
         self.local_addr = Some(addr);
         self
     }
@@ -372,7 +375,8 @@ mod tests {
         let cfg = opts.crypto_config().unwrap().unwrap();
         assert_eq!(cfg.km_refresh_rate, 0x10_0000);
         assert_eq!(cfg.km_preannounce, (0x10_0000 - 1) / 2); // 524287, not 65536
-                                                             // An explicit pre-announce still wins over the force-set.
+                                                             // An explicit pre-announce still wins
+                                                             // over the force-set.
         opts.km_preannounce = Some(1000);
         let cfg = opts.crypto_config().unwrap().unwrap();
         assert_eq!(cfg.km_preannounce, 1000);

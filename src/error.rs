@@ -67,9 +67,6 @@ pub enum SrtError {
     PayloadTooLarge(usize),
     /// Operation on a connection that is closed.
     Closed(CloseReason),
-    /// Address did not resolve to any IPv4 address (the library is
-    /// IPv4-only).
-    NoIpv4Address,
     /// StreamID longer than 512 bytes.
     StreamIdTooLong,
     /// Passphrase set but shorter than 10 or longer than 80 bytes
@@ -102,7 +99,6 @@ impl fmt::Display for SrtError {
                 write!(f, "payload of {len} bytes exceeds live-mode maximum")
             }
             SrtError::Closed(reason) => write!(f, "connection closed: {reason}"),
-            SrtError::NoIpv4Address => write!(f, "no IPv4 address for target"),
             SrtError::StreamIdTooLong => write!(f, "stream id longer than 512 bytes"),
             SrtError::InvalidPassphrase => {
                 write!(f, "passphrase must be 10..=80 bytes")

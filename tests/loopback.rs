@@ -6,7 +6,7 @@
 use std::{
     net::{
         Ipv4Addr,
-        SocketAddrV4,
+        SocketAddr,
     },
     time::{
         Duration,
@@ -41,12 +41,12 @@ async fn pair(copts: SrtOptions, lopts: SrtOptions) -> (SrtSocket, SrtSocket, Sr
         .await
         .expect("listener bind");
     let addr = listener.local_addr();
-    assert_eq!(*addr.ip(), Ipv4Addr::LOCALHOST);
+    assert_eq!(addr.ip(), Ipv4Addr::LOCALHOST);
     assert_ne!(addr.port(), 0);
     let (caller, accepted) = tokio::join!(SrtSocket::connect(addr, copts), listener.accept());
     let caller = caller.expect("connect");
     let (accepted, peer) = accepted.expect("accept");
-    assert_eq!(*peer.ip(), Ipv4Addr::LOCALHOST);
+    assert_eq!(peer.ip(), Ipv4Addr::LOCALHOST);
     assert_eq!(peer, accepted.peer_addr());
     assert_eq!(caller.peer_addr(), addr);
     (caller, accepted, listener)
@@ -76,14 +76,14 @@ async fn connect_from_explicit_local_addr() {
         .await
         .expect("listener bind");
     let addr = listener.local_addr();
-    let copts = SrtOptions::default().local_addr(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+    let copts = SrtOptions::default().local_addr(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0));
     let handshake = async { tokio::join!(SrtSocket::connect(addr, copts), listener.accept()) };
     let (caller, accepted) = tokio::time::timeout(Duration::from_secs(5), handshake)
         .await
         .expect("handshake timed out");
     let caller = caller.expect("connect");
     let (accepted, peer) = accepted.expect("accept");
-    assert_eq!(peer.ip(), &Ipv4Addr::LOCALHOST);
+    assert_eq!(peer.ip(), Ipv4Addr::LOCALHOST);
     caller.close().await.expect("caller close");
     accepted.close().await.expect("accepted close");
 }
@@ -94,7 +94,8 @@ async fn connect_from_explicit_local_addr() {
 #[tokio::test]
 async fn connect_with_unassigned_local_addr_fails_fast() {
     // 192.0.2.0/24 is TEST-NET-1 (RFC 5737): never assigned locally.
-    let opts = SrtOptions::default().local_addr(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 0));
+    let opts =
+        SrtOptions::default().local_addr(SocketAddr::new(Ipv4Addr::new(192, 0, 2, 1).into(), 0));
     let err = SrtSocket::connect("127.0.0.1:9", opts)
         .await
         .err()
